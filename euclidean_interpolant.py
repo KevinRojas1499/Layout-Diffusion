@@ -1,0 +1,132 @@
+import torch
+from torch import Tensor
+from dataclasses import dataclass
+
+@dataclass
+class EuclideanModelPrediction:
+    clean_data: Tensor
+    mean: Tensor
+    std: Tensor
+    expected_gaps: Tensor
+
+    def __init__(
+        self,
+        clean_data: Tensor,
+        mean: Tensor,
+        std: Tensor,
+    ):
+        self.clean_data = clean_data
+        self.mean = mean
+        self.std = std
+
+@dataclass
+class JointEuclideanInterpolantResult:
+    # Joint Interpolant
+    xt: Tensor  # Shape [Batch, Length]
+    st: Tensor  # Shape [Batch, Length]
+    mask_t: Tensor # Shape [Batch, Length]
+    t: Tensor # Shape [Batch]
+    x0: Tensor
+
+
+    @property
+    def xt_length(self) -> Tensor:
+        # Calculate length of xt
+        return (self.xt != self._pad_token).sum(dim=1)
+
+    @property
+    def x1_length(self) -> Tensor:
+        # Calculate length of x1
+        return (self._x1 != self._pad_token).sum(dim=1)
+
+    @property
+    def gaps_and_mask(self) -> tuple[Tensor, Tensor]:
+        x1_len = self.x1_length
+        gaps = self.st.clone()
+
+        pad_front = gaps.new_zeros((gaps.shape[0], 1)) - 1  # -1 for the front padding
+        pad_back = gaps.new_zeros((gaps.shape[0], 1))
+        gaps = torch.cat([pad_front, gaps, pad_back], dim=1)  # Add a leading zero
+
+        gaps.scatter_(
+            1, self.xt_length.unsqueeze(1) + 1, x1_len.unsqueeze(1)
+        )  # Fill the last position with x1_len
+
+        gaps = gaps[:, 1:] - gaps[:, :-1] - 1
+        gaps = torch.clamp(gaps, min=0)
+
+        idx = torch.arange(gaps.size(1), device=self.xt.device).unsqueeze(
+            0
+        )  # shape [1, max_gap]
+        mask = idx <= self.xt_length.unsqueeze(1)
+        gaps[~mask] = 0
+
+        return gaps, mask
+
+class EuclideanInterpolant():
+    def __init__(
+        self,
+        max_length: int,
+        linear_start: float = 0.00085,
+        linear_end: float = 0.0120,
+    ):
+        super().__init__()
+        self.linear_start = linear_start
+        self.linear_end = linear_end
+
+    def beta(self, t):
+        return 500 * (self.linear_start**.5 * (1-t) + t * self.linear_end**.5)**2
+
+    def beta_int(self, t):
+        dif = self.linear_end**.5 - self.linear_start**.5
+        return 500 * ( (self.linear_start**.5 * (1-t) + t * self.linear_end**.5)**3 /(3 * dif) - self.linear_start**1.5/(3 * dif) )    
+    
+    def scale(self, t):
+        big_beta = self.beta_int(t)
+        return torch.exp(-big_beta)
+    
+    def sigma(self,t):
+        big_beta = self.beta_int(t)
+        return (1 - torch.exp(-2 * big_beta))**.5
+    
+    def deletion_time(self, t: Tensor, x0: Tensor) -> Tensor:
+        deletion_time = torch.rand_like(x0)
+        return deletion_time
+
+    def sample_interpolant(self, t: Tensor, x0: Tensor, mask_0: Tensor) -> JointEuclideanInterpolantResult:
+        full_xt = self.scale(t).view(-1, 1) * x0 + self.sigma(t).view(-1, 1) * torch.randn_like(x0)
+        deletion_time = self.deletion_time(t, x0)
+        t_shaped = t.unsqueeze(1).expand(-1, x0.shape[1])
+
+        new_mask = mask_0 & (t_shaped < deletion_time)
+        st = new_mask.argsort(dim=1, descending=True, stable=True)
+        xt = self.get_active_positions(full_xt, st)
+        mask_t = self.get_active_positions(new_mask, st) # This will reorder the mask according to the new order
+
+        return JointEuclideanInterpolantResult(
+            xt=xt, st=st, mask_t=mask_t, t=t, x0=x0
+        )
+    
+    def sample_time(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        eps = 1e-5
+        return torch.rand(batch_size, device=device) * (1 - eps) + eps
+    
+    def get_active_positions(self, xt: Tensor, st: Tensor) -> Tensor:
+        return torch.gather(xt, 1, st)
+    
+    def compute_loss(self, model, batch):
+        x0 = batch["data"]
+        mask_0 = batch["mask"]
+
+        t = self.sample_time(batch.shape[0], batch.device)
+        interpolant_sample = self.sample_interpolant(t, x0, mask_0)
+
+        prediction: EuclideanModelPrediction = model(interpolant_sample.xt, interpolant_sample.mask_t, t)
+
+
+        loss = 0
+
+        return loss
+    
+    def get_score(self, prediction: EuclideanModelPrediction, interpolant_sample: JointEuclideanInterpolantResult) -> Tensor:
+        return - prediction.clean_data - interpolant_sample.xt
