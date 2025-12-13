@@ -126,7 +126,7 @@ class EuclideanInterpolant():
         interpolant_sample = self.sample_interpolant(t, x0, mask_0)
 
         prediction: EuclideanModelPrediction = model(interpolant_sample.xt, interpolant_sample.mask_t, t)
-        
+
         lengths = interpolant_sample.mask_t.sum(dim=-1).clamp(min=1)
         x0_ordered = self.get_active_positions(x0, interpolant_sample.st)
         torch.set_printoptions(precision=2, sci_mode=False)
@@ -188,17 +188,24 @@ class EuclideanInterpolant():
 
         for i in range(steps):
             # ——— predict and convert rates ———
-            # percentage_deleted = int(xt.shape[1] * (1-t[0].item()))
-            # mask_t.fill_(False)
-            # mask_t[:, :percentage_deleted] = True
-            
             prediction: EuclideanModelPrediction = model(xt, mask_t, t)
             
+            # Add dimensions
+            # pred_rate = interpolant.to_actual_rate(xt, pred_rate, t)
+            # unmask_rate = pred_rate.unmask_rate  # (B, L, V)
+            # len_rate = pred_rate.length_rate  # (B, L+1)
+
+            # # ——— unmask step (Euler) ———
+            # mask_pos = (xt == mask).nonzero(as_tuple=True)
+            # unmask_rate[xt != mask] = 0
+            # unmask_rate[*mask_pos, mask] = 0
+            # unmask_rate[*mask_pos, mask] = -unmask_rate[*mask_pos, :].sum(dim=1)
+            # trans_prob = (unmask_rate * dt).clamp(0.0, 1.0)
+
+
             # Denoise
             score = self.get_score(prediction, xt, t)
             beta = self.beta(t).view(-1, 1)
-            
             xt = xt + beta * (xt + score) * dt
-            
             t = t - dt
         return xt
