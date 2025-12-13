@@ -11,6 +11,8 @@ from utils.datasets import get_dataset
 from utils.misc import dotdict
 from utils.optimizers import WarmUpScheduler
 from model.transformer import EuclideanTransformer
+from visualize_dataset import plot_sample
+
 # This makes training on A100s faster
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -27,14 +29,14 @@ def init_wandb(opts):
 
 @click.command()
 @click.option('--dataset',type=click.Choice(['euclidean_variable_length_toy']), default='euclidean_variable_length_toy')
-@click.option('--max_length',type=int, default=10)
+@click.option('--max_length',type=int, default=5)
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--lr', type=float, default=1e-5)
 @click.option('--batch_size', type=int, default=32)
-@click.option('--log_rate',type=int,default=1000)
+@click.option('--log_rate',type=int,default=500)
 @click.option('--num_iters',type=int,default=5000)
-@click.option('--warmup_iters',type=int,default=500)
+@click.option('--warmup_iters',type=int,default=100)
 @click.option('--num_workers',type=int,default=2)
 @click.option('--seed',type=int,default=42)
 @click.option('--dir',type=str)
@@ -145,7 +147,10 @@ def training(**opts):
                     save_ckpt(model, opt, scheduler, os.path.join(path, 'snapshot.pt'))
                 model.eval()
                 dist.barrier(device_ids=[device])
-                
+
+                samples = interpolant.euclidean_sampling(model, 100, 5, opts.max_length, device)
+                for i, sample in enumerate(samples):
+                    plot_sample(sample.cpu(), torch.ones(opts.max_length, dtype=torch.bool), os.path.join(path, f'sample_{i}.png'))
 
     if rank == 0:
         save_ckpt(model, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))

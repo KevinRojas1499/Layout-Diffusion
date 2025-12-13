@@ -128,7 +128,10 @@ class EuclideanInterpolant():
         prediction: EuclideanModelPrediction = model(interpolant_sample.xt, interpolant_sample.mask_t, t)
 
         lengths = interpolant_sample.mask_t.sum(dim=-1).clamp(min=1)
-        dsm_loss = (x0 - prediction.clean_data)**2 * interpolant_sample.mask_t
+        x0_ordered = self.get_active_positions(x0, interpolant_sample.st)
+        torch.set_printoptions(precision=2, sci_mode=False)
+        print('X0 Ordered: ', x0_ordered[0], 'Prediction: ', prediction.clean_data[0], 'Mask: ', interpolant_sample.mask_t[0], sep='\n')
+        dsm_loss = (x0_ordered - prediction.clean_data)**2 * interpolant_sample.mask_t
         dsm_loss = dsm_loss.sum(dim=-1) / lengths
         dsm_loss = dsm_loss.mean()
 
@@ -153,5 +156,46 @@ class EuclideanInterpolant():
             "rate_loss": rate_loss,
         }
     
-    def get_score(self, prediction: EuclideanModelPrediction, interpolant_sample: JointEuclideanInterpolantResult) -> Tensor:
-        return - prediction.clean_data - interpolant_sample.xt
+    def get_score(self, prediction: EuclideanModelPrediction, xt: Tensor, t: Tensor) -> Tensor:
+        return - (xt - prediction.clean_data * self.scale(t).view(-1, 1)) / self.sigma(t).view(-1, 1)**2
+    
+    @torch.no_grad()
+    def euclidean_sampling(
+        self,
+        model: torch.nn.Module,
+        steps: int,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        return_trace: bool = False,
+    ) -> Tensor:
+        # 1) Initialize all‑pad sequence and trace
+        xt = torch.randn((batch_size, max_length), device=device)
+        mask_t = torch.ones((batch_size, max_length), dtype=torch.bool, device=device)
+
+        dt = 1.0 / steps
+        t = torch.ones(batch_size, device=device)
+
+        for i in range(steps):
+            # ——— predict and convert rates ———
+            prediction: EuclideanModelPrediction = model(xt, mask_t, t)
+            
+            # Add dimensions
+            # pred_rate = interpolant.to_actual_rate(xt, pred_rate, t)
+            # unmask_rate = pred_rate.unmask_rate  # (B, L, V)
+            # len_rate = pred_rate.length_rate  # (B, L+1)
+
+            # # ——— unmask step (Euler) ———
+            # mask_pos = (xt == mask).nonzero(as_tuple=True)
+            # unmask_rate[xt != mask] = 0
+            # unmask_rate[*mask_pos, mask] = 0
+            # unmask_rate[*mask_pos, mask] = -unmask_rate[*mask_pos, :].sum(dim=1)
+            # trans_prob = (unmask_rate * dt).clamp(0.0, 1.0)
+
+
+            # Denoise
+            score = self.get_score(prediction, xt, t)
+            beta = self.beta(t).view(-1, 1)
+            xt = xt + (beta * xt + beta * score) * dt
+            t = t + dt
+        return xt

@@ -102,6 +102,21 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+class GaussianFourierProjection(nn.Module):
+    """Gaussian Fourier embeddings for continuous inputs."""
+
+    def __init__(self, embed_dim, scale=1.0):
+        super().__init__()
+        # Randomly sample weights during initialization. These weights are fixed
+        # during optimization and are not trainable.
+        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+
+    def forward(self, x):
+        # x: (B, L, 1)
+        x_proj = x * self.W[None, None, :] * 2 * math.pi
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+
 # length scalar head
 class ScalarLengthHead(nn.Module):
     def __init__(self, d_model: int, normalized_len: int, cond_dim: int | None = None):
@@ -253,7 +268,10 @@ class EuclideanTransformer(nn.Module):
         # Max length also plays the role of the dimension, although only some entries of the output are active at a time
         super().__init__()
 
-        self.embedding = nn.Linear(1, hidden_size)
+        self.embedding = nn.Sequential(
+            GaussianFourierProjection(hidden_size, scale=1.0),
+            nn.Linear(hidden_size, hidden_size),
+        )
         self.timestep_embedder = TimestepEmbedder(cond_dim)
         self.max_length = max_length
         self.rotary_emb = rotary.Rotary(
@@ -325,5 +343,3 @@ class EuclideanTransformer(nn.Module):
                 std=std.squeeze(-1),
                 rate=rate.squeeze(-1),
             )
-
-
