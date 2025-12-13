@@ -337,6 +337,7 @@ class EuclideanTransformer(nn.Module):
             x = indices
             
         x = self.embedding(x)
+        x = x * mask.unsqueeze(-1).to(x.dtype) # Zero out masked embeddings
         c = F.silu(self.timestep_embedder(t))
 
         rotary_cos_sin = self.rotary_emb(x)

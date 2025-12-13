@@ -232,7 +232,7 @@ class EuclideanInterpolant():
 
             # Add dimensions
             insertion_rate = self.get_actual_rate(prediction, mask_t, t)
-            insertion_nums = torch.distributions.poisson.Poisson(insertion_rate).sample()
+            insertion_nums = torch.distributions.poisson.Poisson(insertion_rate * dt).sample()
             insertion_nums[insertion_nums.sum(dim = -1) > 1] = 0 
             unordered_mask_t = unordered_mask_t | (insertion_nums > 0)
             st = unordered_mask_t.argsort(dim=1, descending=True, stable=True)
@@ -257,10 +257,12 @@ class EuclideanFixedSizeInterpolant():
         max_length: int,
         linear_start: float = 0.00085,
         linear_end: float = 0.0120,
+        train_only_dsm : bool = False
     ):
         super().__init__()
         self.linear_start = linear_start
         self.linear_end = linear_end
+        self.train_only_dsm = train_only_dsm
 
     def beta(self, t):
         return 500 * (self.linear_start**.5 * (1-t) + t * self.linear_end**.5)**2
@@ -303,6 +305,8 @@ class EuclideanFixedSizeInterpolant():
 
         t = self.sample_time(x0.shape[0], x0.device)
         interpolant_sample = self.sample_interpolant(t, x0, mask_0)
+        if self.train_only_dsm:
+            interpolant_sample.mask_t = mask_0
 
         prediction: EuclideanModelPrediction = model(interpolant_sample.xt, interpolant_sample.mask_t, t)
 
@@ -368,6 +372,8 @@ class EuclideanFixedSizeInterpolant():
         # 1) Initialize all‑pad sequence and trace
         xt = torch.randn((batch_size, max_length), device=device)
         mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
+        if self.train_only_dsm:
+            mask_t = torch.ones((batch_size, max_length), dtype=torch.bool, device=device)
         st = torch.arange(max_length, device=device).repeat(batch_size, 1)
 
         dt = 1.0 / steps
@@ -388,7 +394,7 @@ class EuclideanFixedSizeInterpolant():
             print('Mean prediction')
             print(prediction.mean[0])
             print('Clean data prediction')
-            print(prediction.clean_data[0])
+            print(prediction.clean_data[0] * mask_t[0])
             
             # Denoise
             score = self.get_score(prediction, xt, t)
@@ -397,8 +403,8 @@ class EuclideanFixedSizeInterpolant():
             
             # Add dimensions
             insertion_rate = self.get_actual_rate(prediction, mask_t, t)
-            insertion_nums = torch.distributions.poisson.Poisson(insertion_rate).sample()
-            insertion_nums[insertion_nums.sum(dim = -1) > 1] = 0 
+            insertion_nums = torch.distributions.poisson.Poisson(insertion_rate * dt).sample()
+            # insertion_nums[insertion_nums.sum(dim = -1) > 1] = 0 
             
 
             new_coordinate = prediction.mean * self.scale(t).view(-1,1) + (1/prediction.std.sqrt()) * torch.randn_like(xt)

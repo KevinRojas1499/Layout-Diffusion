@@ -56,6 +56,7 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.option('--seed',type=int,default=42)
 @click.option('--dir',type=str)
 @click.option('--load_checkpoint',type=str, help='Directory where we can find the desired checkpoints')
+@click.option('--train_only_dsm', is_flag=True, default=False)
 @click.option('--enable_wandb', is_flag=True, default=False)
 def training(**opts):
     opts = dotdict(opts)
@@ -93,6 +94,7 @@ def training(**opts):
     
     interpolant = EuclideanFixedSizeInterpolant(
         max_length=opts.max_length,
+        train_only_dsm=opts.train_only_dsm
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -166,13 +168,16 @@ def training(**opts):
                 model.eval()
                 dist.barrier(device_ids=[device])
 
-                samples = interpolant.euclidean_sampling(ema, 50, 5, opts.max_length, device, return_trace=True)
+                samples = interpolant.euclidean_sampling(model, 50, 5, opts.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
                     plot_sample(sample.xt.cpu(), sample.mask_t.cpu(), sample.st.cpu(), os.path.join(path, f'sample_{i}.png'))
 
                     os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
-                    for j, trajectory in tqdm(enumerate(sample.trajectory), leave=False):
+                    pbar = tqdm(enumerate(sample.trajectory), leave=False)
+
+                    for j, trajectory in pbar:
                         plot_sample(trajectory.xt.cpu(), trajectory.mask_t.cpu(), trajectory.st.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
+                        pbar.set_description(f'Saving trajectory {i} step {j}')
 
     if rank == 0:
         save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
