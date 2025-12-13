@@ -29,7 +29,7 @@ def init_wandb(opts):
 
 @click.command()
 @click.option('--dataset',type=click.Choice(['euclidean_variable_length_toy']), default='euclidean_variable_length_toy')
-@click.option('--max_length',type=int, default=5)
+@click.option('--max_length',type=int, default=3)
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--lr', type=float, default=1e-5)
@@ -172,7 +172,7 @@ def load_checkpoint(opts, rank, device, model, opt, scheduler):
 
 def save_ckpt(model, opt, scheduler, path):
     snapshot = {
-                    'model': model.state_dict(),
+                    'model': model.module.state_dict(),
                     'optimizer': opt.state_dict(),
                     'scheduler': scheduler.state_dict()
                 }

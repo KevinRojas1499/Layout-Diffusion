@@ -126,10 +126,11 @@ class EuclideanInterpolant():
         interpolant_sample = self.sample_interpolant(t, x0, mask_0)
 
         prediction: EuclideanModelPrediction = model(interpolant_sample.xt, interpolant_sample.mask_t, t)
-
+        
         lengths = interpolant_sample.mask_t.sum(dim=-1).clamp(min=1)
         x0_ordered = self.get_active_positions(x0, interpolant_sample.st)
         torch.set_printoptions(precision=2, sci_mode=False)
+        print('Active Positions: ', interpolant_sample.st[0], sep='\n')
         print('X0 Ordered: ', x0_ordered[0], 'Prediction: ', prediction.clean_data[0], 'Mask: ', interpolant_sample.mask_t[0], sep='\n')
         dsm_loss = (x0_ordered - prediction.clean_data)**2 * interpolant_sample.mask_t
         dsm_loss = dsm_loss.sum(dim=-1) / lengths
@@ -140,13 +141,22 @@ class EuclideanInterpolant():
         ci = prediction.rate
 
         
-        initial_lengths = interpolant_sample.mask_original_order.sum(dim=-1)
-        masked_lengths = (interpolant_sample.mask_t.sum(dim=-1) - initial_lengths).clamp(min=1)
-        prediction_loss = .5 * (ai * (interpolant_sample.xt_original_order - bi)**2 - ci) * (~interpolant_sample.mask_original_order)
+        # Calculate deleted particles count (masked_lengths)
+        # We need the number of particles that are currently masked (deleted) but were originally valid.
+        # mask_original_order is TRUE for ACTIVE particles, FALSE for DELETED or PADDING.
+        # mask_0 is TRUE for VALID particles (active or deleted), FALSE for PADDING.
+        
+        # Particles that are deleted but valid:
+        # (~interpolant_sample.mask_original_order) & mask_0
+        
+        valid_deleted_mask = (~interpolant_sample.mask_original_order) & mask_0
+        masked_lengths = valid_deleted_mask.sum(dim=-1).clamp(min=1)
+        
+        prediction_loss = .5 * (ai * (interpolant_sample.xt_original_order - bi)**2 - ci) * valid_deleted_mask
         prediction_loss = prediction_loss.sum(dim=-1) / masked_lengths
         prediction_loss = prediction_loss.mean()
 
-        rate_loss = torch.exp(ci) * (2 * torch.pi/ ai).sqrt()
+        rate_loss = torch.exp(ci) * (2 * torch.pi/ ai).sqrt() * valid_deleted_mask
         rate_loss = rate_loss.sum(dim=-1) / masked_lengths
         rate_loss = rate_loss.mean()
 
@@ -178,24 +188,17 @@ class EuclideanInterpolant():
 
         for i in range(steps):
             # ——— predict and convert rates ———
+            # percentage_deleted = int(xt.shape[1] * (1-t[0].item()))
+            # mask_t.fill_(False)
+            # mask_t[:, :percentage_deleted] = True
+            
             prediction: EuclideanModelPrediction = model(xt, mask_t, t)
             
-            # Add dimensions
-            # pred_rate = interpolant.to_actual_rate(xt, pred_rate, t)
-            # unmask_rate = pred_rate.unmask_rate  # (B, L, V)
-            # len_rate = pred_rate.length_rate  # (B, L+1)
-
-            # # ——— unmask step (Euler) ———
-            # mask_pos = (xt == mask).nonzero(as_tuple=True)
-            # unmask_rate[xt != mask] = 0
-            # unmask_rate[*mask_pos, mask] = 0
-            # unmask_rate[*mask_pos, mask] = -unmask_rate[*mask_pos, :].sum(dim=1)
-            # trans_prob = (unmask_rate * dt).clamp(0.0, 1.0)
-
-
             # Denoise
             score = self.get_score(prediction, xt, t)
             beta = self.beta(t).view(-1, 1)
-            xt = xt + (beta * xt + beta * score) * dt
-            t = t + dt
+            
+            xt = xt + beta * (xt + score) * dt
+            
+            t = t - dt
         return xt
