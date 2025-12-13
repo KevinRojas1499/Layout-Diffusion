@@ -278,7 +278,7 @@ class EuclideanTransformer(nn.Module):
 
         self.insertion_pred = DDitFinalLayer(
             hidden_size,
-            2, # Mean and std
+            3, # Mean, std and rate
             cond_dim,
         )
 
@@ -316,12 +316,14 @@ class EuclideanTransformer(nn.Module):
 
             # --- unmasking ---
             clean_data = self.output_layer(x, c)
-            mean, std = self.insertion_pred(x, c).chunk(2, dim=-1)
+            mean, std, rate = self.insertion_pred(x, c).chunk(3, dim=-1)
+            std = torch.nn.functional.softplus(std)
 
             return EuclideanModelPrediction(
                 clean_data=clean_data.squeeze(-1),
                 mean=mean.squeeze(-1),
                 std=std.squeeze(-1),
+                rate=rate.squeeze(-1),
             )
 
 

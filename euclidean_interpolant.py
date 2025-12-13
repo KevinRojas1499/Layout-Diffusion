@@ -7,17 +7,19 @@ class EuclideanModelPrediction:
     clean_data: Tensor
     mean: Tensor
     std: Tensor
-    expected_gaps: Tensor
+    rate: Tensor
 
     def __init__(
         self,
         clean_data: Tensor,
         mean: Tensor,
         std: Tensor,
+        rate: Tensor,
     ):
         self.clean_data = clean_data
         self.mean = mean
         self.std = std
+        self.rate = rate
 
 @dataclass
 class JointEuclideanInterpolantResult:
@@ -25,6 +27,8 @@ class JointEuclideanInterpolantResult:
     xt: Tensor  # Shape [Batch, Length]
     st: Tensor  # Shape [Batch, Length]
     mask_t: Tensor # Shape [Batch, Length]
+    xt_original_order: Tensor # Shape [Batch, Length]
+    mask_original_order: Tensor # Shape [Batch, Length]
     t: Tensor # Shape [Batch]
     x0: Tensor
 
@@ -104,7 +108,7 @@ class EuclideanInterpolant():
         mask_t = self.get_active_positions(new_mask, st) # This will reorder the mask according to the new order
 
         return JointEuclideanInterpolantResult(
-            xt=xt, st=st, mask_t=mask_t, t=t, x0=x0
+            xt=xt, st=st, mask_t=mask_t, t=t, x0=x0, xt_original_order=full_xt, mask_original_order=new_mask
         )
     
     def sample_time(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -118,15 +122,36 @@ class EuclideanInterpolant():
         x0 = batch["data"]
         mask_0 = batch["mask"]
 
-        t = self.sample_time(batch.shape[0], batch.device)
+        t = self.sample_time(x0.shape[0], x0.device)
         interpolant_sample = self.sample_interpolant(t, x0, mask_0)
 
         prediction: EuclideanModelPrediction = model(interpolant_sample.xt, interpolant_sample.mask_t, t)
 
+        lengths = interpolant_sample.mask_t.sum(dim=-1).clamp(min=1)
+        dsm_loss = (x0 - prediction.clean_data)**2 * interpolant_sample.mask_t
+        dsm_loss = dsm_loss.sum(dim=-1) / lengths
+        dsm_loss = dsm_loss.mean()
 
-        loss = 0
+        ai = prediction.std
+        bi = prediction.mean
+        ci = prediction.rate
 
-        return loss
+        
+        initial_lengths = interpolant_sample.mask_original_order.sum(dim=-1)
+        masked_lengths = (interpolant_sample.mask_t.sum(dim=-1) - initial_lengths).clamp(min=1)
+        prediction_loss = (ai * (interpolant_sample.xt_original_order - bi)**2 + ci) * (~interpolant_sample.mask_original_order)
+        prediction_loss = prediction_loss.sum(dim=-1) / masked_lengths
+        prediction_loss = prediction_loss.mean()
+
+        rate_loss = torch.exp(ci) * (2 * torch.pi/ ai).sqrt()
+        rate_loss = rate_loss.sum(dim=-1) / masked_lengths
+        rate_loss = rate_loss.mean()
+
+        return {
+            "dsm_loss": dsm_loss,
+            "prediction_loss": prediction_loss,
+            "rate_loss": rate_loss,
+        }
     
     def get_score(self, prediction: EuclideanModelPrediction, interpolant_sample: JointEuclideanInterpolantResult) -> Tensor:
         return - prediction.clean_data - interpolant_sample.xt
