@@ -139,7 +139,7 @@ class EuclideanInterpolant():
         
         initial_lengths = interpolant_sample.mask_original_order.sum(dim=-1)
         masked_lengths = (interpolant_sample.mask_t.sum(dim=-1) - initial_lengths).clamp(min=1)
-        prediction_loss = (ai * (interpolant_sample.xt_original_order - bi)**2 + ci) * (~interpolant_sample.mask_original_order)
+        prediction_loss = .5 * (ai * (interpolant_sample.xt_original_order - bi)**2 - ci) * (~interpolant_sample.mask_original_order)
         prediction_loss = prediction_loss.sum(dim=-1) / masked_lengths
         prediction_loss = prediction_loss.mean()
 
