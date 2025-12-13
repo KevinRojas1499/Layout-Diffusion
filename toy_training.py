@@ -150,11 +150,11 @@ def training(**opts):
 
                 samples = interpolant.euclidean_sampling(model, 100, 5, opts.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
-                    plot_sample(sample.xt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'))
+                    plot_sample(sample.xt.cpu(), sample.mask_t.cpu(), sample.st.cpu(), os.path.join(path, f'sample_{i}.png'))
 
                     os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
                     for j, trajectory in enumerate(sample.trajectory):
-                        plot_sample(trajectory.xt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
+                        plot_sample(trajectory.xt.cpu(), trajectory.mask_t.cpu(), trajectory.st.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
 
     if rank == 0:
         save_ckpt(model, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))

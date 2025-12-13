@@ -183,7 +183,10 @@ class EuclideanInterpolant():
         }
     
     def get_score(self, prediction: EuclideanModelPrediction, xt: Tensor, t: Tensor) -> Tensor:
-        return - (xt - prediction.clean_data * self.scale(t).view(-1, 1)) / self.sigma(t).view(-1, 1)**2
+        clean_data = prediction.clean_data 
+        # clean_data = torch.arange(clean_data.shape[1], device=clean_data.device).repeat(clean_data.shape[0], 1)
+        # Isolating score effect
+        return - (xt - clean_data * self.scale(t).view(-1, 1)) / self.sigma(t).view(-1, 1)**2
     
     def get_actual_rate(self, prediction: EuclideanModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
         ai = prediction.std
@@ -211,7 +214,7 @@ class EuclideanInterpolant():
         unordered_xt = xt.clone()
         mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
         unordered_mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
-        st = torch.arange(max_length, device=device)
+        st = torch.arange(max_length, device=device).repeat(batch_size, 1)
 
         dt = 1.0 / steps
         t = torch.ones(batch_size, device=device)
@@ -228,8 +231,10 @@ class EuclideanInterpolant():
             # Denoise
             score = self.get_score(prediction, xt, t)
             beta = self.beta(t).view(-1, 1)
-            xt = xt + beta * (xt + score) * dt
-            t = t - dt
+            xt = xt + (beta * (xt + score) * dt) * mask_t
+            
+            # Save the updated active particles back to the main memory
+            unordered_xt.scatter_(1, st, xt)
 
             # Add dimensions
             insertion_rate = self.get_actual_rate(prediction, mask_t, t)
@@ -246,6 +251,7 @@ class EuclideanInterpolant():
                 trajectory.append(SamplingTrajectoryResult(
                     xt=xt, st=st, mask_t=mask_t, t=t
                 ))
+            t = t - dt
 
         return SamplingResult(
             xt=xt, st=st, mask_t=mask_t, xt_original_order=unordered_xt, mask_original_order=unordered_mask_t, t=t, trajectory=trajectory
