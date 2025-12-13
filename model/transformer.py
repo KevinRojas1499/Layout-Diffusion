@@ -152,9 +152,16 @@ class ScalarLengthHead(nn.Module):
 #################################################################################
 
 
-def get_mask_mod(seq_len: torch.Tensor):
+def get_mask_mod_seq_len(seq_len: torch.Tensor):
     def mask_mod(b, h, q_idx, kv_idx):
         return (q_idx <= seq_len[b]) & (kv_idx <= seq_len[b])
+
+    return mask_mod
+
+
+def get_mask_mod_arbitrary(mask: torch.Tensor):
+    def mask_mod(b, h, q_idx, kv_idx):
+        return mask[b, kv_idx]
 
     return mask_mod
 
@@ -264,9 +271,10 @@ class DDitFinalLayer(nn.Module):
 
 
 class EuclideanTransformer(nn.Module):
-    def __init__(self, hidden_size, cond_dim, n_heads, n_blocks, dropout, max_length):
+    def __init__(self, hidden_size, cond_dim, n_heads, n_blocks, dropout, max_length, use_arbitrary_mask=True):
         # Max length also plays the role of the dimension, although only some entries of the output are active at a time
         super().__init__()
+        self.use_arbitrary_mask = use_arbitrary_mask
 
         self.embedding = nn.Sequential(
             GaussianFourierProjection(hidden_size, scale=1.0),
@@ -309,9 +317,14 @@ class EuclideanTransformer(nn.Module):
 
     def forward(self, indices: torch.Tensor, mask: torch.Tensor, t: torch.Tensor):
         B, L = indices.shape
-        seq_lens = (mask).sum(dim=-1)
+        if self.use_arbitrary_mask:
+            mask_mod = get_mask_mod_arbitrary(mask)
+        else:
+            seq_lens = (mask).sum(dim=-1)
+            mask_mod = get_mask_mod_seq_len(seq_lens)
+            
         block_mask = create_block_mask(
-            get_mask_mod(seq_lens),
+            mask_mod,
             B=B,
             H=None,
             Q_LEN=indices.shape[1],

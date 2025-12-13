@@ -3,10 +3,12 @@ import click
 import torch
 import torch.distributed as dist
 import wandb
+from collections import OrderedDict
+from copy import deepcopy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from euclidean_interpolant import EuclideanInterpolant
+from euclidean_interpolant import EuclideanInterpolant, EuclideanFixedSizeInterpolant
 from utils.datasets import get_dataset 
 from utils.misc import dotdict
 from utils.optimizers import WarmUpScheduler
@@ -27,11 +29,24 @@ def init_wandb(opts):
         config=opts,
     )
 
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.9999):
+    """
+    Step the EMA model towards the current model.
+    """
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
 @click.command()
 @click.option('--dataset',type=click.Choice(['euclidean_variable_length_toy']), default='euclidean_variable_length_toy')
 @click.option('--max_length',type=int, default=3)
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
+@click.option('--ema_beta',type=float, default=.999)
 @click.option('--lr', type=float, default=1e-5)
 @click.option('--batch_size', type=int, default=32)
 @click.option('--log_rate',type=int,default=500)
@@ -71,16 +86,17 @@ def training(**opts):
         dropout=0.05,
         max_length=opts.max_length
     ).to(device)
+    ema = deepcopy(model)
     opt = torch.optim.AdamW(model.parameters(),lr=opts.lr)
     scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler(device)
     
-    interpolant = EuclideanInterpolant(
+    interpolant = EuclideanFixedSizeInterpolant(
         max_length=opts.max_length,
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
-        start_iter = load_checkpoint(opts, rank, device, model, opt, scheduler)
+        start_iter = load_checkpoint(opts, rank, device, model, ema, opt, scheduler)
 
     dist.barrier(device_ids=[device])
     
@@ -113,6 +129,8 @@ def training(**opts):
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
 
+            update_ema(ema, model.module, decay=opts.ema_beta)
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
             
             for param in model.parameters():
@@ -144,39 +162,41 @@ def training(**opts):
                 path = os.path.join(opts.dir, f'itr_{training_iter}/')
                 os.makedirs(path, exist_ok=True)
                 if rank == 0:
-                    save_ckpt(model, opt, scheduler, os.path.join(path, 'snapshot.pt'))
+                    save_ckpt(model, ema, opt, scheduler, os.path.join(path, 'snapshot.pt'))
                 model.eval()
                 dist.barrier(device_ids=[device])
 
-                samples = interpolant.euclidean_sampling(model, 100, 5, opts.max_length, device, return_trace=True)
+                samples = interpolant.euclidean_sampling(ema, 50, 5, opts.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
                     plot_sample(sample.xt.cpu(), sample.mask_t.cpu(), sample.st.cpu(), os.path.join(path, f'sample_{i}.png'))
 
                     os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
-                    for j, trajectory in enumerate(sample.trajectory):
+                    for j, trajectory in tqdm(enumerate(sample.trajectory), leave=False):
                         plot_sample(trajectory.xt.cpu(), trajectory.mask_t.cpu(), trajectory.st.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
 
     if rank == 0:
-        save_ckpt(model, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
+        save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
 
     dist.barrier(device_ids=[device])
     if wandb_enabled:
         wandb.finish()
     dist.destroy_process_group()
 
-def load_checkpoint(opts, rank, device, model, opt, scheduler):
+def load_checkpoint(opts, rank, device, model, ema,opt, scheduler):
     print(f'Loading checkpoint from {opts.load_checkpoint} in rank {rank}')
     snapshot = torch.load(os.path.join(opts.load_checkpoint), weights_only=True)
     model.load_state_dict(snapshot['model'],strict=False)
+    ema.load_state_dict(snapshot['ema'], strict=False)
     opt.load_state_dict(snapshot['optimizer'])
     scheduler.load_state_dict(snapshot['scheduler'])
         
     start_iter = scheduler.last_epoch
     return start_iter
 
-def save_ckpt(model, opt, scheduler, path):
+def save_ckpt(model, ema, opt, scheduler, path):
     snapshot = {
                     'model': model.module.state_dict(),
+                    'ema': ema.state_dict(),
                     'optimizer': opt.state_dict(),
                     'scheduler': scheduler.state_dict()
                 }

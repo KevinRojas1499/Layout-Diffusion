@@ -17,9 +17,6 @@ def plot_sample(data, mask, cur_set, out_file_name):
     mask_np = mask.numpy()
     cur_set = cur_set.numpy()
     
-    print(f"Data shape: {data_np.shape}")
-    print(f"Mask shape: {mask_np.shape}")
-
     # Reshape 1D data for heatmap visualization if necessary
     if data_np.ndim == 1:
         data_viz = data_np[:, None]
@@ -29,7 +26,6 @@ def plot_sample(data, mask, cur_set, out_file_name):
     # Calculate valid length
     # Mask is False for valid tokens, True for padding
     valid_len = (~mask_np).sum()
-    print(f"Valid length: {valid_len}")
     
     # Plotting
     plt.figure(figsize=(10, 6))
@@ -67,7 +63,6 @@ def plot_sample(data, mask, cur_set, out_file_name):
     plt.tight_layout()
     plt.savefig(out_file_name)
     plt.close()
-    print(f"Plot saved to {out_file_name}")
 
 if __name__ == "__main__":
     plot_sample_from_dataset()
