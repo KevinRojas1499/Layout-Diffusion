@@ -148,9 +148,13 @@ def training(**opts):
                 model.eval()
                 dist.barrier(device_ids=[device])
 
-                samples = interpolant.euclidean_sampling(model, 100, 5, opts.max_length, device)
+                samples = interpolant.euclidean_sampling(model, 100, 5, opts.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
-                    plot_sample(sample.cpu(), torch.ones(opts.max_length, dtype=torch.bool), os.path.join(path, f'sample_{i}.png'))
+                    plot_sample(sample.xt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'))
+
+                    os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
+                    for j, trajectory in enumerate(sample.trajectory):
+                        plot_sample(trajectory.xt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
 
     if rank == 0:
         save_ckpt(model, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
