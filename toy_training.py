@@ -11,6 +11,7 @@ from tqdm import tqdm
 from euclidean_interpolant import EuclideanInterpolant, EuclideanFixedSizeInterpolant
 from utils.datasets import get_dataset 
 from utils.misc import dotdict
+from utils.tokenizer import IntervalTokenizer
 from utils.optimizers import WarmUpScheduler
 from model.transformer import EuclideanTransformer
 from visualize_dataset import plot_sample
@@ -44,6 +45,7 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.command()
 @click.option('--dataset',type=click.Choice(['euclidean_variable_length_toy']), default='euclidean_variable_length_toy')
 @click.option('--max_length',type=int, default=3)
+@click.option('--num_bins',type=int, default=100)
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--ema_beta',type=float, default=.999)
@@ -85,16 +87,19 @@ def training(**opts):
         n_heads=6,
         n_blocks=6,
         dropout=0.05,
-        max_length=opts.max_length
+        max_length=opts.max_length + 2,
+        vocabulary_size=opts.num_bins
     ).to(device)
     ema = deepcopy(model)
     opt = torch.optim.AdamW(model.parameters(),lr=opts.lr)
     scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler(device)
     
-    interpolant = EuclideanFixedSizeInterpolant(
+    tokenizer = IntervalTokenizer(left_endpoint=-2, right_endpoint=opts.max_length + 2, num_bins=opts.num_bins)   
+    interpolant = EuclideanInterpolant(
         max_length=opts.max_length,
-        train_only_dsm=opts.train_only_dsm
+        train_only_dsm=opts.train_only_dsm,
+        interval_tokenizer=tokenizer,
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -126,7 +131,7 @@ def training(**opts):
             opt.zero_grad()
             
             losses = interpolant.compute_loss(model, data_)
-            loss = losses["dsm_loss"] + losses["prediction_loss"] + losses["rate_loss"]
+            loss = losses["dsm_loss"] + losses["tokens_loss"]
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -150,7 +155,7 @@ def training(**opts):
             
             
             if rank == 0:
-                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Prediction Loss: {losses["prediction_loss"] :6.4f}, Rate Loss: {losses["rate_loss"] :6.4f}')
+                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Tokens Loss: {losses["tokens_loss"] :6.4f}')
             if wandb_enabled:
                 wandb.log({
                 'loss': loss/world_size,

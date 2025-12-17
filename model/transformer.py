@@ -271,7 +271,7 @@ class DDitFinalLayer(nn.Module):
 
 
 class EuclideanTransformer(nn.Module):
-    def __init__(self, hidden_size, cond_dim, n_heads, n_blocks, dropout, max_length, use_arbitrary_mask=True):
+    def __init__(self, hidden_size, cond_dim, n_heads, n_blocks, dropout, max_length, vocabulary_size, use_arbitrary_mask=True):
         # Max length also plays the role of the dimension, although only some entries of the output are active at a time
         super().__init__()
         self.use_arbitrary_mask = use_arbitrary_mask
@@ -302,10 +302,10 @@ class EuclideanTransformer(nn.Module):
             hidden_size, 1, cond_dim
         )
 
-        self.insertion_pred = DDitFinalLayer(
+        self.logits_pred = DDitFinalLayer(
             hidden_size,
-            3, # Mean, std and rate
-            cond_dim,
+            vocabulary_size,
+            cond_dim
         )
 
     def _get_bias_dropout_scale(self):
@@ -348,12 +348,9 @@ class EuclideanTransformer(nn.Module):
 
             # --- unmasking ---
             clean_data = self.output_layer(x, c)
-            mean, std, rate = self.insertion_pred(x, c).chunk(3, dim=-1)
-            std = torch.nn.functional.softplus(std)
+            logits = self.logits_pred(x, c)
 
             return EuclideanModelPrediction(
                 clean_data=clean_data.squeeze(-1),
-                mean=mean.squeeze(-1),
-                std=std.squeeze(-1),
-                rate=rate.squeeze(-1),
+                logits=logits.squeeze(-1),
             )

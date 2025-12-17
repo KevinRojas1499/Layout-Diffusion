@@ -46,6 +46,7 @@ class EuclideanVariableLengthToyDataset(Dataset):
         mask = torch.ones(self.max_length, dtype=torch.bool)
         mask[length:] = False
         data = torch.arange(self.max_length, dtype=torch.float32) + torch.randn(self.max_length) * .01
+        data = data * mask
         return {"data": data, "mask": mask}
     def __len__(self):
         return 10000
