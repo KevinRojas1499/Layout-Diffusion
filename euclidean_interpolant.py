@@ -23,14 +23,12 @@ class EuclideanModelPrediction:
 @dataclass
 class SamplingTrajectoryResult:
     xt: Tensor # Shape [Batch, Length]
-    st: Tensor # Shape [Batch, Length]
     mask_t: Tensor # Shape [Batch, Length]
     t: Tensor # Shape [Batch]
 
 @dataclass
 class SamplingResult:
     xt: Tensor # Shape [Batch, Length]
-    st: Tensor # Shape [Batch, Length]
     mask_t: Tensor # Shape [Batch, Length]
     trajectory: List[SamplingTrajectoryResult]
 
@@ -39,14 +37,12 @@ class SamplingResult:
         for step in self.trajectory:
              trajectory_slice.append(SamplingTrajectoryResult(
                 xt=step.xt[index],
-                st=step.st[index],
                 mask_t=step.mask_t[index],
                 t=step.t[index]
              ))
 
         return SamplingResult(
             xt=self.xt[index],
-            st=self.st[index],
             mask_t=self.mask_t[index],
             trajectory=trajectory_slice
         )
@@ -113,7 +109,7 @@ class EuclideanInterpolant():
         x = torch.where(mask, x, torch.zeros_like(x)) # This is to represent the end of the sequence with zeros
         # Add at the start of the sequence
         x = torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
-        mask = torch.cat([torch.zeros_like(mask[:, :1]), mask], dim=1)
+        mask = torch.cat([torch.ones_like(mask[:, :1]), mask], dim=1)
 
         # Add at the end of the sequence
         x = torch.cat([x, torch.zeros_like(x[:, :1])], dim=1)
@@ -132,7 +128,7 @@ class EuclideanInterpolant():
         new_mask = mask_0 & (t_shaped < deletion_time)
         new_mask = new_mask | eos_bos_mask
 
-        st = new_mask.argsort(dim=1, descending=True, stable=True)
+        st = self.get_st(new_mask)
         xt = self.get_active_positions(full_xt, st)
         mask_t = self.get_active_positions(new_mask, st) # This will reorder the mask according to the new order
         x0_ordered = self.get_active_positions(x0, st)
@@ -145,6 +141,9 @@ class EuclideanInterpolant():
     def sample_time(self, batch_size: int, device: torch.device) -> torch.Tensor:
         eps = 1e-5
         return torch.rand(batch_size, device=device) * (1 - eps) + eps
+    
+    def get_st(self, mask_t: Tensor) -> Tensor:
+        return mask_t.argsort(dim=1, descending=True, stable=True)
     
     def get_active_positions(self, xt: Tensor, st: Tensor) -> Tensor:
         return torch.gather(xt, 1, st)
@@ -211,9 +210,8 @@ class EuclideanInterpolant():
 
         prediction: EuclideanModelPrediction = model(interpolant_sample.xt, interpolant_sample.mask_t, t)
 
-        # This might be wrong
-        lengths = (interpolant_sample.mask_t.sum(dim=-1) - 1).clamp(min=1) # Subtracting 1 because we are not considering the end of sequence token
-        dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * interpolant_sample.mask_t
+        lengths = (interpolant_sample.mask_t.sum(dim=-1) - 2).clamp(min=1) # Subtracting 2 because we are not considering the end of sequence token and the start of sequence token
+        dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * interpolant_sample.mask_t * ~eos_bos_mask
         dsm_loss = dsm_loss.sum(dim=-1) / lengths
         dsm_loss = dsm_loss.mean()
         
@@ -248,14 +246,12 @@ class EuclideanInterpolant():
         # Isolating score effect
         return - (xt - clean_data * self.scale(t).view(-1, 1)) / self.sigma(t).view(-1, 1)**2
     
-    def get_actual_rate(self, prediction: EuclideanModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
-        ai = prediction.std
-        # bi = prediction.mean
-        ci = prediction.rate
-
+    def get_rate(self, prediction: EuclideanModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
         lambda_t = self.beta(t).view(-1, 1)
 
-        rate = ci.exp() * (2 * torch.pi/ ai).sqrt() * lambda_t / mask_t.sum(dim=-1, keepdim=True).clamp(min=1)
+        # Subtracting 2 because we are not considering the end of sequence token and the start of sequence token
+        rate = lambda_t / (mask_t.sum(dim=-1, keepdim=True) - 2).clamp(min=1)
+        rate = rate * torch.ones_like(mask_t, device=mask_t.device)
 
         return rate
     
@@ -270,51 +266,59 @@ class EuclideanInterpolant():
         return_trace: bool = False,
     ) -> SamplingTrajectoryResult:
         # 1) Initialize all‑pad sequence and trace
-        xt = torch.randn((batch_size, max_length), device=device)
-        unordered_xt = xt.clone()
-        mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
-        unordered_mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
-        st = torch.arange(max_length, device=device).repeat(batch_size, 1)
-
+        xt = torch.randn((batch_size, max_length + 1), device=device)
+        xt, mask_t, eos_bos_mask = self.pad_sequence(xt, torch.zeros((batch_size, max_length + 1), dtype=torch.bool, device=device))
+        mask_t = mask_t | eos_bos_mask
+        
         dt = 1.0 / steps
         t = torch.ones(batch_size, device=device)
 
         trajectory = []
         if return_trace:
             trajectory.append(SamplingTrajectoryResult(
-                xt=xt, st=st, mask_t=mask_t, t=t
+                xt=xt, mask_t=mask_t.clone(), t=t
             ))
         for i in range(steps):
-            # ——— predict and convert rates ———
             prediction: EuclideanModelPrediction = model(xt, mask_t, t)
-            
             # Denoise
             score = self.get_score(prediction, xt, t)
             beta = self.beta(t).view(-1, 1)
-            xt = xt + (beta * (xt + score) * dt) * mask_t
-            
-            # Save the updated active particles back to the main memory
-            unordered_xt.scatter_(1, st, xt)
+            xt = xt + (beta * (xt + score) * dt) * mask_t * ~eos_bos_mask
 
-            # Add dimensions
-            insertion_rate = self.get_actual_rate(prediction, mask_t, t)
-            insertion_nums = torch.distributions.poisson.Poisson(insertion_rate * dt).sample()
-            insertion_nums[insertion_nums.sum(dim = -1) > 1] = 0 
-            unordered_mask_t = unordered_mask_t | (insertion_nums > 0)
-            st = unordered_mask_t.argsort(dim=1, descending=True, stable=True)
-            new_coordinate = prediction.mean + (1/prediction.std**.5) * torch.randn_like(xt)
-            unordered_xt[insertion_nums > 0] = new_coordinate[insertion_nums > 0]
-            xt = self.get_active_positions(unordered_xt, st)
-            mask_t = self.get_active_positions(unordered_mask_t, st)
+            insertion_rate = self.get_rate(prediction, mask_t, t)
+            # Need to cheeck if I need to multiply by dt here
+            ext = torch.bernoulli((insertion_rate * dt).clamp(0.0, 1.0)).long()  # (B, L+1)
+
+            probabilities = F.softmax(prediction.logits, dim=-1)
+            if i != steps - 1:
+                for j in range(batch_size):
+                    # Add dimensions
+                    new_xt_j = []
+                    for k in range(max_length + 1):
+                        if not mask_t[j, k]:
+                            break
+                        if ext[j,k] == 1 and k != 0:
+                            new_sample = torch.multinomial(probabilities[j, k], 1).float()
+                            new_sample = self.tokenizer.decode(new_sample)
+                            new_xt_j.append(new_sample)
+                        new_xt_j.append(xt[j, k])
+                    xt[j, :len(new_xt_j)] = torch.tensor(new_xt_j, device=device)
+                    xt[j, len(new_xt_j)-1] = 0.
+                    mask_t[j, :len(new_xt_j)] = True
+                    eos_bos_mask[j,:] = False
+                    eos_bos_mask[j, 0] = True
+                    eos_bos_mask[j, len(new_xt_j)-1] = True
+            
+                    
 
             if return_trace:
                 trajectory.append(SamplingTrajectoryResult(
-                    xt=xt, st=st, mask_t=mask_t, t=t
+                    xt=xt, mask_t=mask_t.clone(), t=t
                 ))
             t = t - dt
 
         return SamplingResult(
-            xt=xt, st=st, mask_t=mask_t, trajectory=trajectory
+            xt=xt, mask_t=mask_t, trajectory=trajectory
         )
 
 class EuclideanFixedSizeInterpolant():

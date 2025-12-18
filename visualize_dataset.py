@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from utils.datasets import get_dataset
@@ -11,36 +12,36 @@ def plot_sample_from_dataset():
     mask = sample["mask"]
     plot_sample(data, mask, 'dataset_visualization.png')
 
-def plot_sample(data, mask, cur_set, out_file_name):
+def plot_sample(data, mask, out_file_name):
     # Convert to numpy for plotting
     data_np = data.numpy()
     mask_np = mask.numpy()
-    cur_set = cur_set.numpy()
     
     # Reshape 1D data for heatmap visualization if necessary
     if data_np.ndim == 1:
         data_viz = data_np[:, None]
+        mask_viz = mask_np[:, None]
     else:
         data_viz = data_np
+        mask_viz = mask_np
+        if mask_viz.ndim == 1:
+             mask_viz = np.tile(mask_viz[:, None], (1, data_viz.shape[1]))
     
     # Calculate valid length
-    # Mask is False for valid tokens, True for padding
-    valid_len = (~mask_np).sum()
+    # Mask is True for valid tokens, False for padding
+    valid_len = mask_np.sum()
     
     # Plotting
     plt.figure(figsize=(10, 6))
     
     max_len = data_np.shape[0]
     
-    # Plot the ordered set (indices) - simple grayscale
-    plt.subplot(1, 3 ,1)
-    sns.heatmap(cur_set[:,None], annot=True, cbar=False, cmap="Greys", fmt='.0f')
-    plt.title(f'Ordered Set')
-
-
-    plt.subplot(1, 3, 2)
+    plt.subplot(1, 2, 1)
     # Fixed scale from -1 to max_len + 1
-    sns.heatmap(data_viz, cmap='viridis', cbar=True, annot=True, fmt='.2f', vmin=-1, vmax=max_len + 1)
+    # We want to hide the padding. Dataset mask is True for Valid, False for Padding.
+    # sns.heatmap hides values where mask is True.
+    # So we pass ~mask_viz (True for Padding) to hide it.
+    sns.heatmap(data_viz, cmap='viridis', cbar=True, annot=True, fmt='.2f', vmin=-1, vmax=max_len + 1, mask=~mask_viz)
     plt.title(f'Data Vector (Valid Length: {valid_len})')
     plt.xlabel('Feature Dimension (1)')
     plt.ylabel('Sequence Length')
@@ -49,11 +50,11 @@ def plot_sample(data, mask, cur_set, out_file_name):
     plt.axhline(y=valid_len, color='r', linestyle='--', linewidth=2)
     
     # Plot the mask
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 2, 2)
     # Reshape mask to be (max_length, 1) for heatmap visualization
-    # Use custom colormap: 0 (Valid) -> Blue, 1 (Pad) -> Red
+    # Use custom colormap: 0 (Pad) -> Red, 1 (Valid) -> Blue
     from matplotlib.colors import ListedColormap
-    cmap_mask = ListedColormap(['#ADD8E6', '#FFB6C1']) # Light Blue and Light Red for better visibility with text
+    cmap_mask = ListedColormap(['#FFB6C1', '#ADD8E6']) # Light Red (Pad) and Light Blue (Valid)
     sns.heatmap(mask_np[:, None], cmap=cmap_mask, cbar=False, annot=True, vmin=0, vmax=1)
 
     plt.title('Mask (Blue=Valid, Red=Pad)')
