@@ -307,6 +307,9 @@ class EuclideanTransformer(nn.Module):
             vocabulary_size,
             cond_dim
         )
+        self.rate_pred = DDitFinalLayer(
+            hidden_size, 1, cond_dim
+        )
 
     def _get_bias_dropout_scale(self):
         return (
@@ -349,8 +352,10 @@ class EuclideanTransformer(nn.Module):
             # --- unmasking ---
             clean_data = self.output_layer(x, c)
             logits = self.logits_pred(x, c)
+            rate = F.softplus(self.rate_pred(x,c))
 
             return EuclideanModelPrediction(
                 clean_data=clean_data.squeeze(-1),
                 logits=logits.squeeze(-1),
+                rate=rate.squeeze(-1)
             )

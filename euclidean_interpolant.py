@@ -11,14 +11,17 @@ import torch.nn.functional as F
 class EuclideanModelPrediction:
     clean_data: Tensor
     logits: Tensor
+    rate: Tensor
 
     def __init__(
         self,
         clean_data: Tensor,
         logits: Tensor,
+        rate: Tensor,
     ):
         self.clean_data = clean_data
         self.logits = logits
+        self.rate = rate
 
 @dataclass
 class SamplingTrajectoryResult:
@@ -231,7 +234,10 @@ class EuclideanInterpolant():
         # print('ST' , interpolant_sample.st[k])
         # print('Mixture prob' , mixture_prob[k])
         # print('Mixture prob shape' , mixture_prob.shape)
-        tokens_loss = -(mixture_prob * prediction.logits.log_softmax(dim=-1)).mean(dim=-1)
+        rate = prediction.rate
+        logits = prediction.logits.log_softmax(dim=-1)
+        tokens_loss = rate - (mixture_prob * (logits + rate.log().unsqueeze(-1))).sum(dim=-1)
+
         tokens_loss = tokens_loss.sum(dim=-1) / lengths
         tokens_loss = tokens_loss.mean()
         
@@ -248,10 +254,11 @@ class EuclideanInterpolant():
     
     def get_rate(self, prediction: EuclideanModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
         lambda_t = self.beta(t).view(-1, 1)
+        predicted_rate = prediction.rate
 
         # Subtracting 2 because we are not considering the end of sequence token and the start of sequence token
         rate = lambda_t / (mask_t.sum(dim=-1, keepdim=True) - 2).clamp(min=1)
-        rate = rate * torch.ones_like(mask_t, device=mask_t.device)
+        rate = rate * predicted_rate
 
         return rate
     
