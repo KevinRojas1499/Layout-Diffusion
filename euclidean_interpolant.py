@@ -221,19 +221,15 @@ class EuclideanInterpolant():
         means = (self.scale(t).view(-1, 1) * interpolant_sample.x0).unsqueeze(-1)
         variances = self.sigma(t).view(-1,1,1) ** 2
 
-        grid_points = torch.linspace(self.tokenizer.left_endpoint, self.tokenizer.right_endpoint, self.tokenizer.num_bins, device=x0.device).view(1,1,-1)
+        grid_points = torch.linspace(
+            self.tokenizer.left_endpoint, 
+            self.tokenizer.right_endpoint, 
+            self.tokenizer.num_bins, device=x0.device
+        ).view(1,1,-1)
         potentials = -.5 * (grid_points - means)**2 / variances
         probs = 1 / (variances * 2 * torch.pi).sqrt() * torch.exp(potentials)
 
         mixture_prob = self.interval_mixture(probs, interpolant_sample.st)
-        # torch.set_printoptions(precision=2, sci_mode=False)
-        # k = 4
-        # print('Time' , t[k])
-        # print('X0' , interpolant_sample.x0[k])
-        # print('XT' , interpolant_sample.xt[k])
-        # print('ST' , interpolant_sample.st[k])
-        # print('Mixture prob' , mixture_prob[k])
-        # print('Mixture prob shape' , mixture_prob.shape)
         rate = prediction.rate
         logits = prediction.logits.log_softmax(dim=-1)
         tokens_loss = rate - (mixture_prob * (logits + rate.log().unsqueeze(-1))).sum(dim=-1)
