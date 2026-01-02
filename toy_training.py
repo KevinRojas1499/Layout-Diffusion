@@ -8,12 +8,13 @@ from copy import deepcopy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from euclidean_interpolant import EuclideanInterpolant, EuclideanFixedSizeInterpolant
+from multimodal_interpolant import MultimodalInterpolant
 from utils.datasets import get_dataset 
 from utils.misc import dotdict
-from utils.tokenizer import IntervalTokenizer
+from utils.tokenizer import IntervalTokenizer, CharacterTokenizer
 from utils.optimizers import WarmUpScheduler
 from model.transformer import EuclideanTransformer
+from models.mmdit import MMDiTModel, MMDiTModelNoImage
 from visualize_dataset import plot_sample
 
 # This makes training on A100s faster
@@ -43,8 +44,8 @@ def update_ema(ema_model, model, decay=0.9999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 @click.command()
-@click.option('--dataset',type=click.Choice(['euclidean_variable_length_toy']), default='euclidean_variable_length_toy')
-@click.option('--max_length',type=int, default=3)
+@click.option('--dataset',type=click.Choice(['multimodal_variable_length_toy']), default='multimodal_variable_length_toy')
+@click.option('--max_length',type=int, default=5)
 @click.option('--num_bins',type=int, default=100)
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
@@ -74,21 +75,25 @@ def training(**opts):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
-    dataset = get_dataset(opts.dataset, max_length=opts.max_length) 
+    character_tokenizer = CharacterTokenizer(characters='ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    dataset = get_dataset(opts.dataset, max_length=opts.max_length, tokenizer=character_tokenizer) 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=opts.num_workers, drop_last=True)
     
     wandb_enabled = opts.enable_wandb and rank == 0 # We only want to log once
     if wandb_enabled:
         init_wandb(opts)
     
-    model = EuclideanTransformer(
-        hidden_size=384,
-        cond_dim=384,
-        n_heads=6,
-        n_blocks=6,
-        dropout=0.05,
-        max_length=opts.max_length + 2,
-        vocabulary_size=opts.num_bins
+    model = MMDiTModelNoImage(
+        euclidean_dim=opts.max_length + 2,
+        text_vocab_size=dataset.text_vocab_size + 4,
+        euclidean_vocab_size=dataset.vocab_size,
+        context_len=opts.max_length + 2,
+        text_depth=4,
+        image_depth=4,
+        depth=4,
+        dim_joint_attn=384,
+        dim_modalities=[384, 384],
+        dim_conds=[384, 384]
     ).to(device)
     ema = deepcopy(model)
     opt = torch.optim.AdamW(model.parameters(),lr=opts.lr)
@@ -96,10 +101,12 @@ def training(**opts):
     scaler = torch.amp.GradScaler(device)
     
     tokenizer = IntervalTokenizer(left_endpoint=-2, right_endpoint=opts.max_length + 2, num_bins=opts.num_bins)   
-    interpolant = EuclideanInterpolant(
+    interpolant = MultimodalInterpolant(
         max_length=opts.max_length,
-        train_only_dsm=opts.train_only_dsm,
         interval_tokenizer=tokenizer,
+        vocab_size=dataset.text_vocab_size,
+        mask_token=dataset.text_vocab_size + 1,
+        pad_token=dataset.text_vocab_size + 2,
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -108,7 +115,7 @@ def training(**opts):
     dist.barrier(device_ids=[device])
     
     model.train()
-    model = DDP(model)
+    model = DDP(model, find_unused_parameters=True)
     
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)//1e6} M")
@@ -131,7 +138,7 @@ def training(**opts):
             opt.zero_grad()
             
             losses = interpolant.compute_loss(model, data_)
-            loss = losses["dsm_loss"] + losses["tokens_loss"]
+            loss = losses["dsm_loss"] + losses["tokens_loss"] + losses["euclidean_insertion_loss"]
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -155,13 +162,14 @@ def training(**opts):
             
             
             if rank == 0:
-                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Tokens Loss: {losses["tokens_loss"] :6.4f}')
+                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Tokens Loss: {losses["tokens_loss"] :6.4f}, Euclidean Insertion Loss: {losses["euclidean_insertion_loss"] :6.4f}')
             if wandb_enabled:
                 wandb.log({
                 'loss': loss/world_size,
                 'dsm_loss': losses["dsm_loss"]/world_size,
                 'prediction_loss': losses["prediction_loss"]/world_size,
-                'rate_loss': losses["rate_loss"]/world_size
+                'rate_loss': losses["rate_loss"]/world_size,
+                'euclidean_insertion_loss': losses["euclidean_insertion_loss"]/world_size
             })
             dist.barrier(device_ids=[device])
             # Evaluate sample accuracy

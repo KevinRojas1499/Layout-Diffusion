@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import Dataset
-
+from utils.tokenizer import CharacterTokenizer
             
 class ShakespeareDataset(Dataset):
     def __init__(self, context_len=30, data_path='shakespeare.txt'):
@@ -51,11 +51,45 @@ class EuclideanVariableLengthToyDataset(Dataset):
     def __len__(self):
         return 10000
 
-def get_dataset(name, context_len=30, data_path='shakespeare.txt', max_length=30):
+class MultimodalVariableLengthToyDataset(Dataset):
+    def __init__(self, max_length=30, tokenizer: CharacterTokenizer = None):
+        self.max_length = max_length
+        self.vocab_size = 100
+        self.labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        self.tokenizer = tokenizer
+        self.text_vocab_size = len(self.labels)
+
+    def __getitem__(self, index):
+        length = torch.randint(1, self.max_length + 1, (1,))
+        mask = torch.ones(self.max_length, dtype=torch.bool)
+        mask[length:] = False
+        data = torch.arange(self.max_length, dtype=torch.float32) + torch.randn(self.max_length) * .01
+        data = data * mask
+        
+        # Get labels for the valid length
+        current_len = length.item()
+        labels_str = self.labels[:current_len]
+        label_tokens = self.tokenizer.tokenize(labels_str)
+        
+        # Pad the rest
+        if current_len < self.max_length:
+            pad_id = self.tokenizer.char_to_idx['<pad>']
+            padding = torch.full((self.max_length - current_len,), pad_id, dtype=torch.long)
+            label = torch.cat((label_tokens, padding))
+        else:
+            label = label_tokens
+            
+        return {"data": data, "mask": mask, "label": label}
+    def __len__(self):
+        return 10000
+
+def get_dataset(name, context_len=30, data_path='shakespeare.txt', max_length=30, tokenizer: CharacterTokenizer = None):
     if name == 'shakespeare':
         return ShakespeareDataset(context_len=context_len, data_path=data_path)
     elif name == 'euclidean_variable_length_toy':
         return EuclideanVariableLengthToyDataset(max_length=max_length)
+    elif name == 'multimodal_variable_length_toy':
+        return MultimodalVariableLengthToyDataset(max_length=max_length, tokenizer=tokenizer)
     else:
         print('Dataset is not implemented')
         return None
