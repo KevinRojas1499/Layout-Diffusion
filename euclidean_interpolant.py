@@ -289,7 +289,6 @@ class EuclideanInterpolant():
             xt = xt + (beta * (xt + score) * dt) * mask_t * ~eos_bos_mask
 
             insertion_rate = self.get_rate(prediction, mask_t, t)
-            # Need to cheeck if I need to multiply by dt here
             ext = torch.bernoulli((insertion_rate * dt).clamp(0.0, 1.0)).long()  # (B, L+1)
 
             probabilities = F.softmax(prediction.logits, dim=-1)

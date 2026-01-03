@@ -328,7 +328,7 @@ class MultimodalInterpolant():
         trajectory = []
         if return_trace:
             trajectory.append(SamplingTrajectoryResult(
-                xt=xt, yt=yt, mask_t=mask_t.clone(), t=t
+                xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
             ))
         for i in range(steps):
             prediction: MultimodalModelPrediction = model(
@@ -344,15 +344,21 @@ class MultimodalInterpolant():
             beta = self.beta(t).view(-1, 1)
             xt = xt + (beta * (xt + score) * dt) * mask_t * ~eos_bos_mask
 
-            insertion_rate = self.get_insertion_rate(prediction, mask_t, t)
-            ext = torch.bernoulli((insertion_rate * dt).clamp(0.0, 1.0)).long()  # (B, L+1)
-
             unmasking_rate = self.get_unmasking_rate(prediction, mask_t, t)
+            # Expand unmasking_rate to match sequence length: [batch, 1] -> [batch, seq_len]
+            seq_len = mask_t.shape[1]
+            unmasking_rate = unmasking_rate.expand(-1, seq_len)
             unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
             new_sample = sample_categorical(prediction.label_logits.softmax(dim=-1), method="hard")  # [batch, seq_len]
 
-            change_pos = (unmasking_nums > 0) & ~mask_t
+            change_pos = (unmasking_nums > 0) & (mask_t == True) & (yt == self.mask_token)
+
             yt[change_pos] = new_sample[change_pos]
+
+
+            # Perform insertions
+            insertion_rate = self.get_insertion_rate(prediction, mask_t, t)
+            ext = torch.bernoulli((insertion_rate * dt).clamp(0.0, 1.0)).long()  # (B, L) where L is seq_len after padding
 
             probabilities = F.softmax(prediction.label_logits, dim=-1)
             seq_len = xt.shape[1]  # After padding, this is max_length + 2
@@ -360,33 +366,39 @@ class MultimodalInterpolant():
                 for j in range(batch_size):
                     # Add dimensions
                     new_xt_j = []
+                    new_yt_j = []
                     for k in range(seq_len):
                         if not mask_t[j, k]:
                             break
-                        if ext[j,k] == 1 and k != 0:
+                        # Insert new token before position k if ext[j, k-1] == 1 (for k > 0)
+                        # insertion_rate[:, k-1] represents the rate for inserting before position k
+                        if k > 0 and ext[j, k-1] == 1:
                             new_sample = torch.multinomial(probabilities[j, k], 1).float()
                             new_sample = self.tokenizer.decode(new_sample)
-                            new_xt_j.append(new_sample.item() if isinstance(new_sample, torch.Tensor) else new_sample)
-                        new_xt_j.append(xt[j, k].item() if isinstance(xt[j, k], torch.Tensor) else xt[j, k])
+                            new_xt_j.append(new_sample.item())
+                            new_yt_j.append(self.mask_token)
+                        # Always append the current token at position k
+                        new_xt_j.append(xt[j, k].item())
+                        new_yt_j.append(yt[j, k].item())
                     
                     # Ensure we don't exceed the tensor size
                     new_len = min(len(new_xt_j), seq_len)
                     new_xt_tensor = torch.tensor(new_xt_j[:new_len], device=device, dtype=xt.dtype)
+                    new_yt_tensor = torch.tensor(new_yt_j[:new_len], device=device, dtype=yt.dtype)
                     xt[j, :new_len] = new_xt_tensor
-                    if new_len > 0:
-                        xt[j, new_len-1] = 0.
+                    yt[j, :new_len] = new_yt_tensor
+                    xt[j, new_len-1] = 0.
+                    yt[j, new_len-1] = self.pad_token
                     mask_t[j, :new_len] = True
                     mask_t[j, new_len:] = False
                     eos_bos_mask[j,:] = False
                     if new_len > 0:
                         eos_bos_mask[j, 0] = True
                         eos_bos_mask[j, new_len-1] = True
-            
-                    
 
             if return_trace:
                 trajectory.append(SamplingTrajectoryResult(
-                    xt=xt, yt=yt, mask_t=mask_t.clone(), t=t
+                    xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
                 ))
             t = t - dt
 

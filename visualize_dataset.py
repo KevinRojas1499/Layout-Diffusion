@@ -10,11 +10,14 @@ def plot_sample_from_dataset():
     sample = next(iterator)
     data = sample["data"]
     mask = sample["mask"]
-    plot_sample(data, mask, 'dataset_visualization.png')
+    # Create dummy yt if not present (for euclidean dataset)
+    yt = sample.get("label", torch.zeros_like(mask, dtype=torch.long))
+    plot_sample(data, yt, mask, 'dataset_visualization.png')
 
-def plot_sample(data, mask, out_file_name):
+def plot_sample(data, yt, mask, out_file_name, max_category=100):
     # Convert to numpy for plotting
     data_np = data.numpy()
+    yt_np = yt.numpy() if isinstance(yt, torch.Tensor) else np.array(yt)
     mask_np = mask.numpy()
     
     # Reshape 1D data for heatmap visualization if necessary
@@ -31,12 +34,13 @@ def plot_sample(data, mask, out_file_name):
     # Mask is True for valid tokens, False for padding
     valid_len = mask_np.sum()
     
-    # Plotting
-    plt.figure(figsize=(10, 6))
+    # Plotting - now with 3 subplots
+    plt.figure(figsize=(15, 6))
     
     max_len = data_np.shape[0]
     
-    plt.subplot(1, 2, 1)
+    # Plot 1: Euclidean data
+    plt.subplot(1, 3, 1)
     # Fixed scale from -1 to max_len + 1
     # We want to hide the padding. Dataset mask is True for Valid, False for Padding.
     # sns.heatmap hides values where mask is True.
@@ -49,8 +53,30 @@ def plot_sample(data, mask, out_file_name):
     # Add a red line to show where padding starts
     plt.axhline(y=valid_len, color='r', linestyle='--', linewidth=2)
     
-    # Plot the mask
-    plt.subplot(1, 2, 2)
+    # Plot 2: Categorical values (yt)
+    plt.subplot(1, 3, 2)
+    # Reshape yt for heatmap visualization
+    yt_viz = yt_np[:, None] if yt_np.ndim == 1 else yt_np
+    # Mask out padding positions
+    yt_mask_viz = ~mask_np[:, None] if yt_viz.ndim == 2 else ~mask_np
+    if yt_viz.ndim == 1:
+        yt_mask_viz = yt_mask_viz[:, None]
+    
+    # Use integer formatting for categorical values
+    # Use fixed range for consistent colors across different plots
+    vmin_cat = 0
+    vmax_cat = max_category
+    
+    sns.heatmap(yt_viz, cmap='Set3', cbar=True, annot=True, fmt='d', 
+                vmin=vmin_cat, vmax=vmax_cat, mask=yt_mask_viz, 
+                cbar_kws={'label': 'Category'})
+    plt.title('Categorical Values (yt)')
+    plt.xlabel('Feature Dimension (1)')
+    plt.ylabel('Sequence Length')
+    plt.axhline(y=valid_len, color='r', linestyle='--', linewidth=2)
+    
+    # Plot 3: Mask
+    plt.subplot(1, 3, 3)
     # Reshape mask to be (max_length, 1) for heatmap visualization
     # Use custom colormap: 0 (Pad) -> Red, 1 (Valid) -> Blue
     from matplotlib.colors import ListedColormap

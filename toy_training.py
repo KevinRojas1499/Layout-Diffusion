@@ -115,7 +115,7 @@ def training(**opts):
     dist.barrier(device_ids=[device])
     
     model.train()
-    model = DDP(model, find_unused_parameters=True)
+    model = DDP(model)
     
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)//1e6} M")
@@ -183,13 +183,13 @@ def training(**opts):
 
                 samples = interpolant.euclidean_sampling(model, 50, 5, opts.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
-                    plot_sample(sample.xt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'))
+                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'))
 
                     os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
                     pbar = tqdm(enumerate(sample.trajectory), leave=False)
 
                     for j, trajectory in pbar:
-                        plot_sample(trajectory.xt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
+                        plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
                         pbar.set_description(f'Saving trajectory {i} step {j}')
 
     if rank == 0:
