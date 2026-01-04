@@ -83,6 +83,8 @@ class MultimodalInterpolant():
         vocab_size: int = 10000,
         mask_token: int = 10000,
         pad_token: int = 10001,
+        bos_token: int = 10002,
+        eos_token: int = 10003,
     ):
         super().__init__()
         self.linear_start = linear_start
@@ -92,7 +94,8 @@ class MultimodalInterpolant():
         self.vocab_size = vocab_size
         self.mask_token = mask_token
         self.pad_token = pad_token
-
+        self.bos_token = bos_token
+        self.eos_token = eos_token
     def beta(self, t):
         return 500 * (self.linear_start**.5 * (1-t) + t * self.linear_end**.5)**2
 
@@ -119,9 +122,10 @@ class MultimodalInterpolant():
 
     def pad_sequence(self, x: Tensor, y: Tensor, mask: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         x = torch.where(mask, x, torch.zeros_like(x)) # This is to represent the end of the sequence with zeros
+        y = torch.where(mask, y, torch.full_like(y, self.pad_token))
         # Add at the start of the sequence
         x = torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
-        y = torch.cat([torch.full_like(y[:, :1], self.pad_token), y], dim=1)
+        y = torch.cat([torch.full_like(y[:, :1], self.bos_token), y], dim=1)
         mask = torch.cat([torch.ones_like(mask[:, :1]), mask], dim=1)
 
         # Add at the end of the sequence
@@ -131,6 +135,9 @@ class MultimodalInterpolant():
         eos_bos_mask = (mask[:, :-1] != mask[:, 1:])
         mask[:,1:] = mask[:, 1:] | eos_bos_mask
         eos_bos_mask = torch.cat([torch.ones_like(mask[:, :1]), eos_bos_mask], dim=1)
+        y = torch.where(eos_bos_mask, torch.full_like(y, self.eos_token), y)
+        y[:,0] = self.bos_token
+
         return x, y, mask, eos_bos_mask
 
     def sample_interpolant(self, t: Tensor, x0: Tensor, y0: Tensor,mask_0: Tensor, eos_bos_mask: Tensor) -> JointMultimodalInterpolantResult:
@@ -263,6 +270,7 @@ class MultimodalInterpolant():
         insertion_rate = prediction.insertion_rate
         insertion_logits = prediction.insertion_logits.log_softmax(dim=-1)
         euclidean_insertion_loss = insertion_rate - (mixture_prob * (insertion_logits + insertion_rate.log().unsqueeze(-1))).sum(dim=-1)
+        euclidean_insertion_loss = euclidean_insertion_loss * interpolant_sample.mask_t
 
         euclidean_insertion_loss = euclidean_insertion_loss.sum(dim=-1) / lengths
         euclidean_insertion_loss = euclidean_insertion_loss.mean()
@@ -295,7 +303,7 @@ class MultimodalInterpolant():
         lambda_t = self.beta(t).view(-1, 1)
         predicted_rate = prediction.insertion_rate
 
-        # Subtracting 2 because we are not considering the end of sequence token and the start of sequence token
+        # Subtracting 2 because we are not considering the start and end of sequence tokens
         rate = lambda_t / (mask_t.sum(dim=-1, keepdim=True) - 2).clamp(min=1)
         rate = rate * predicted_rate
 
@@ -305,6 +313,17 @@ class MultimodalInterpolant():
         lambda_t = self.beta(t).view(-1, 1)
         big_beta = self.beta_int(t).view(-1, 1)
         return 1/(torch.exp(big_beta) - 1) * lambda_t
+    
+    def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tensor:
+        xt = torch.zeros((batch_size, max_length + 2), device=device)
+        yt = torch.cat([
+            torch.ones((batch_size, 1), device=device, dtype=torch.long) * self.bos_token, 
+            torch.ones((batch_size, 1), device=device, dtype=torch.long) * self.eos_token], dim=1)
+        yt = torch.cat([yt, torch.ones((batch_size, max_length), device=device, dtype=torch.long) * self.pad_token], dim=1)
+        mask_t = torch.zeros((batch_size, max_length + 2), dtype=torch.bool, device=device)
+        mask_t[:, :2] = True
+        eos_bos_mask = (yt == self.eos_token) | (yt == self.bos_token)
+        return xt, yt, mask_t, eos_bos_mask
     
     @torch.no_grad()
     def euclidean_sampling(
@@ -317,10 +336,7 @@ class MultimodalInterpolant():
         return_trace: bool = False,
     ) -> SamplingTrajectoryResult:
         # 1) Initialize all‑pad sequence and trace
-        xt = torch.randn((batch_size, max_length), device=device)
-        yt = torch.full((batch_size, max_length), self.pad_token, device=device)
-        xt, yt, mask_t, eos_bos_mask = self.pad_sequence(xt, yt, torch.zeros((batch_size, max_length), dtype=torch.bool, device=device))
-        mask_t = mask_t | eos_bos_mask
+        xt, yt, mask_t, eos_bos_mask = self.get_prior_distribution(batch_size, max_length, device)
         
         dt = 1.0 / steps
         t = torch.ones(batch_size, device=device)
@@ -349,7 +365,10 @@ class MultimodalInterpolant():
             seq_len = mask_t.shape[1]
             unmasking_rate = unmasking_rate.expand(-1, seq_len)
             unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
-            new_sample = sample_categorical(prediction.label_logits.softmax(dim=-1), method="hard")  # [batch, seq_len]
+
+            # Extract the valid tokens
+            dist = prediction.label_logits[:, :, :self.vocab_size]
+            new_sample = sample_categorical(dist.softmax(dim=-1), method="hard")  # [batch, seq_len]
 
             change_pos = (unmasking_nums > 0) & (mask_t == True) & (yt == self.mask_token)
 
@@ -387,14 +406,15 @@ class MultimodalInterpolant():
                     new_yt_tensor = torch.tensor(new_yt_j[:new_len], device=device, dtype=yt.dtype)
                     xt[j, :new_len] = new_xt_tensor
                     yt[j, :new_len] = new_yt_tensor
+                    xt[j, 0] = 0.
                     xt[j, new_len-1] = 0.
-                    yt[j, new_len-1] = self.pad_token
+                    yt[j, 0] = self.bos_token
+                    yt[j, new_len-1] = self.eos_token
                     mask_t[j, :new_len] = True
                     mask_t[j, new_len:] = False
                     eos_bos_mask[j,:] = False
-                    if new_len > 0:
-                        eos_bos_mask[j, 0] = True
-                        eos_bos_mask[j, new_len-1] = True
+                    eos_bos_mask[j, 0] = True
+                    eos_bos_mask[j, new_len-1] = True
 
             if return_trace:
                 trajectory.append(SamplingTrajectoryResult(

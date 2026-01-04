@@ -85,8 +85,8 @@ def training(**opts):
     
     model = MMDiTModelNoImage(
         euclidean_dim=opts.max_length + 2,
-        text_vocab_size=dataset.text_vocab_size + 4,
-        euclidean_vocab_size=dataset.vocab_size,
+        text_vocab_size=dataset.text_vocab_size + 5,
+        euclidean_vocab_size=opts.num_bins,
         context_len=opts.max_length + 2,
         text_depth=4,
         image_depth=4,
@@ -107,6 +107,8 @@ def training(**opts):
         vocab_size=dataset.text_vocab_size,
         mask_token=dataset.text_vocab_size + 1,
         pad_token=dataset.text_vocab_size + 2,
+        bos_token=dataset.text_vocab_size + 3,
+        eos_token=dataset.text_vocab_size + 4,
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
