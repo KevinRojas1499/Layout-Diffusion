@@ -42,9 +42,11 @@ class CharacterTokenizer():
 
 class VocabTokenizer():
     def __init__(self, vocab: set):
+        # Sort vocab to ensure deterministic ordering
         self.vocab = vocab
+        self.sorted_vocab = sorted(vocab)
         self.vocab_size = len(self.vocab)
-        self.atom_to_idx = {atom: idx for idx, atom in enumerate(self.vocab)}
+        self.atom_to_idx = {atom: idx for idx, atom in enumerate(self.sorted_vocab)}
         self.idx_to_atom = {idx: atom for atom, idx in self.atom_to_idx.items()}
         # Pattern to match special tokens in <token> format
         self.special_token_pattern = re.compile(r'<[^>]+>')
