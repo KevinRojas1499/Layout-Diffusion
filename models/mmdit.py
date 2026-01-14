@@ -797,7 +797,7 @@ class MMDiTModelNoImage(nn.Module):
 
 
 class MMDiTQM9(nn.Module):
-    def __init__(self, euclidean_dim, text_vocab_size, euclidean_vocab_size, context_len, text_depth, image_depth, project_hidden=False, **kwargs):
+    def __init__(self, euclidean_dim, text_vocab_size, context_len, text_depth, image_depth, project_hidden=False, **kwargs):
         super().__init__()
         self.euclidean_dim = euclidean_dim
         self.dim_modalities = kwargs['dim_modalities']

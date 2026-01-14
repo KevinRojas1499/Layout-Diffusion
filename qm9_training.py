@@ -11,11 +11,10 @@ from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
 from custom_datasets.qm9 import QM9Dataset
 from utils.misc import dotdict
-from utils.tokenizer import IntervalTokenizer, VocabTokenizer
+from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler
-from model.transformer import EuclideanTransformer
 from models.mmdit import MMDiTQM9
-from visualize_dataset import plot_sample
+from visualize_dataset import plot_sample, plot_molecule
 
 # This makes training on A100s faster
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -24,9 +23,9 @@ torch.backends.cudnn.allow_tf32 = True
 def init_wandb(opts):
     wandb.init(
         # set the wandb project where this run will be logged
-        project='Euclidean Interpolant',
-        name= f'{opts.model}-{opts.dataset}-{opts.max_length}',
-        tags= ['training',opts.dataset],
+        project='MMDiT-QM9',
+        name= f'{opts.model}-qm9',
+        tags= ['training'],
         # # track hyperparameters and run metadata
         config=opts,
     )
@@ -44,9 +43,6 @@ def update_ema(ema_model, model, decay=0.9999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 @click.command()
-@click.option('--dataset',type=click.Choice(['multimodal_variable_length_toy']), default='multimodal_variable_length_toy')
-@click.option('--max_length',type=int, default=5)
-@click.option('--num_bins',type=int, default=100)
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--ema_beta',type=float, default=.999)
@@ -76,6 +72,11 @@ def training(**opts):
     print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
     character_tokenizer = VocabTokenizer(vocab={'H', 'C', 'N', 'O', 'F'})
+    print('Vocab')
+    print('--------------------------------')
+    for token, id in character_tokenizer.atom_to_idx.items():
+        print(f'{token}: {id}')
+    print('--------------------------------')
     dataset = QM9Dataset(character_tokenizer)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=opts.num_workers, drop_last=True)
     
@@ -86,7 +87,6 @@ def training(**opts):
     model = MMDiTQM9(
         euclidean_dim=3,
         text_vocab_size=character_tokenizer.vocab_size + 2,
-        euclidean_vocab_size=opts.num_bins,
         context_len=dataset.max_length + 3,
         text_depth=4,
         image_depth=4,
@@ -100,15 +100,14 @@ def training(**opts):
     scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler(device)
     
-    tokenizer = IntervalTokenizer(left_endpoint=-2, right_endpoint=opts.max_length + 2, num_bins=opts.num_bins)   
     interpolant = MultimodalInterpolant(
-        max_length=opts.max_length,
-        interval_tokenizer=tokenizer,
+        max_length=dataset.max_length,
         vocab_size=character_tokenizer.vocab_size,
         mask_token=character_tokenizer.mask_token_id,
         pad_token=character_tokenizer.pad_token_id, 
         bos_token=character_tokenizer.bos_token_id,
         eos_token=character_tokenizer.eos_token_id,
+        euclidean_dim=3,
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -183,15 +182,20 @@ def training(**opts):
                 model.eval()
                 dist.barrier(device_ids=[device])
 
-                samples = interpolant.euclidean_sampling(model, 50, 5, opts.max_length, device, return_trace=True)
+                samples = interpolant.euclidean_sampling(model, 50, 5, dataset.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
-                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'))
-
+                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                    symbols = character_tokenizer.decode(sample.yt.cpu())
+                    positions = sample.xt.cpu()[1:len(symbols)+1, :]
+                    print(symbols)
+                    print(positions)
+                    plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
+                    
                     os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
                     pbar = tqdm(enumerate(sample.trajectory), leave=False)
 
                     for j, trajectory in pbar:
-                        plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'))
+                        plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
                         pbar.set_description(f'Saving trajectory {i} step {j}')
 
     if rank == 0:
