@@ -78,6 +78,7 @@ class JointAttention(Module):
 
         num_inputs = len(dim_inputs)
         self.num_inputs = num_inputs
+        self.heads = heads
 
         self.to_qkv = ModuleList([nn.Linear(dim_input, dim_inner * 3, bias = False) for dim_input in dim_inputs])
 
@@ -108,7 +109,8 @@ class JointAttention(Module):
         self,
         inputs: Tuple[Tensor],
         masks: Tuple[Tensor | None] | None = None,
-        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None,
+        attn_bias: Tuple[Tensor | None, ...] | None = None
     ):
 
         device = self.dummy.device
@@ -117,6 +119,7 @@ class JointAttention(Module):
 
         masks = default(masks, (None,) * self.num_inputs)
         rotary_pos_emb = default(rotary_pos_emb, (None,) * self.num_inputs)
+        attn_bias = default(attn_bias, (None,) * self.num_inputs)
 
         # project each modality separately for qkv
         # also handle masks, assume None means attend to all tokens
@@ -162,12 +165,49 @@ class JointAttention(Module):
 
         all_qkvs, packed_shape = pack(all_qkvs, 'qkv b h * d')
         all_masks, _ = pack(all_masks, 'b *')
+        
+        combined_attn_bias = None
+        if any(exists(bias) for bias in attn_bias):
+            if isinstance(attn_bias, torch.Tensor):
+                combined_attn_bias = attn_bias
+            else:
+                seq_lens = [x.shape[1] for x in inputs]  # List of sequence lengths per modality
+                total_seq_len = sum(seq_lens)
+                B = inputs[0].shape[0]
+                
+                H = self.heads
+                
+                combined_attn_bias = torch.zeros(
+                    (B, H, total_seq_len, total_seq_len),
+                    device=device,
+                    dtype=inputs[0].dtype
+                )
+                
+                start_idx = 0
+                for modality_idx, bias in enumerate(attn_bias):
+                    if exists(bias):
+                        end_idx = start_idx + seq_lens[modality_idx]
+                        combined_attn_bias[:, :, start_idx:end_idx, start_idx:end_idx] = bias
+                    start_idx += seq_lens[modality_idx]
 
         # attention
 
         q, k, v = all_qkvs
 
-        outs, *_ = self.attend(q, k, v, mask = all_masks)
+        if exists(combined_attn_bias):
+            # Manually compute attention with bias
+            scale = q.shape[-1] ** -0.5
+            attn_scores = torch.einsum('b h i d, b h j d -> b h i j', q, k) * scale
+            attn_scores = attn_scores + combined_attn_bias
+            
+            if exists(all_masks):
+                mask_expanded = (~all_masks).unsqueeze(1).unsqueeze(2)
+                attn_scores = attn_scores.masked_fill(mask_expanded, float('-inf'))
+            
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            outs = torch.einsum('b h i j, b h j d -> b h i d', attn_weights, v)
+        else:
+            outs, *_ = self.attend(q, k, v, mask = all_masks)
 
         # merge heads and then separate by modality for combine heads projection
 
@@ -298,11 +338,13 @@ class MMDiTBlock(Module):
         modality_tokens: Tuple[Tensor, ...],
         modality_masks: Tuple[Tensor | None, ...] | None = None,
         time_cond = Tuple[Tensor | None, ...],
-        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None,
+        attn_bias: Tuple[Tensor | None, ...] | None = None
     ):
         assert len(modality_tokens) == self.num_modalities and len(time_cond) == self.num_modalities
 
         rotary_pos_emb = default(rotary_pos_emb, (None,) * self.num_modalities)
+        attn_bias = default(attn_bias, (None,) * self.num_modalities)
 
         attn_gammas = [1.] * len(time_cond) # Default to 1. if no condition
         ff_gammas = [1.] * len(time_cond) # Default to 1. if no condition
@@ -318,7 +360,8 @@ class MMDiTBlock(Module):
         modality_tokens = self.joint_attn(
             inputs = modality_tokens, 
             masks = modality_masks,
-            rotary_pos_emb = rotary_pos_emb
+            rotary_pos_emb = rotary_pos_emb,
+            attn_bias = attn_bias
         )
 
         # post attention gammas
@@ -366,14 +409,55 @@ class MMDiT(Module):
         modality_tokens: Tuple[Tensor, ...],
         modality_masks: Tuple[Tensor | None, ...] | None = None,
         time_cond = Tuple[Tensor | None, ...],
-        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None,
+        attn_bias: Tuple[Tensor | None, ...] | None = None
     ):
-        for block in self.blocks:
+        # We precompute the attention biases for each layer to avoid recomputing them
+        precomputed_biases = None
+        if exists(attn_bias) and len(attn_bias) > 0:
+            seq_lens = [tokens.shape[1] for tokens in modality_tokens]
+            total_seq_len = sum(seq_lens)
+            B = modality_tokens[0].shape[0]
+            
+            # Get number of heads from the first block
+            H = self.blocks[0].joint_attn.heads
+            
+            device = modality_tokens[0].device
+            dtype = modality_tokens[0].dtype
+            
+            # Pre-compute combined bias for each layer
+            precomputed_biases = []
+            for layer_idx, layer_bias in enumerate(attn_bias):
+                if exists(layer_bias) and any(exists(b) for b in layer_bias if isinstance(layer_bias, (list, tuple))):
+                    # Create full-size bias matrix for this layer
+                    combined_bias = torch.zeros(
+                        (B, H, total_seq_len, total_seq_len),
+                        device=device,
+                        dtype=dtype
+                    )
+                    
+                    # Fill in biases for each modality
+                    start_idx = 0
+                    for modality_idx, bias in enumerate(layer_bias if isinstance(layer_bias, (list, tuple)) else [layer_bias]):
+                        if exists(bias):
+                            end_idx = start_idx + seq_lens[modality_idx]
+                            combined_bias[:, :, start_idx:end_idx, start_idx:end_idx] = bias
+                        start_idx += seq_lens[modality_idx]
+                    
+                    precomputed_biases.append(combined_bias)
+                else:
+                    precomputed_biases.append(None)
+        
+        for layer_idx, block in enumerate(self.blocks):
+            # Use pre-computed combined bias if available
+            layer_attn_bias = precomputed_biases[layer_idx] if precomputed_biases else None
+            
             modality_tokens = block(
                 time_cond = time_cond,
                 modality_tokens = modality_tokens,
                 modality_masks = modality_masks,
-                rotary_pos_emb = rotary_pos_emb
+                rotary_pos_emb = rotary_pos_emb,
+                attn_bias = layer_attn_bias
             )
 
         modality_tokens = [norm(tokens) for tokens, norm in zip(modality_tokens, self.norms)]

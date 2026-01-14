@@ -78,6 +78,97 @@ class GaussianFourierProjection(nn.Module):
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
+class PairwiseSpatialBias(nn.Module):
+    """
+    Computes learnable, layer-specific, head-specific attention biases
+    from pairwise spatial features (distances between atoms).
+    """
+    def __init__(self, num_heads, num_layers, spatial_feat_dim=32, max_distance=10.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.spatial_feat_dim = spatial_feat_dim
+        self.max_distance = max_distance
+        
+        # Learnable MLP to convert pairwise distances to attention biases
+        # Different for each layer and head
+        self.bias_mlps = nn.ModuleList([
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(1, spatial_feat_dim),
+                    nn.SiLU(),
+                    nn.Linear(spatial_feat_dim, 1)
+                )
+                for _ in range(num_heads)
+            ])
+            for _ in range(num_layers)
+        ])
+        
+    def compute_pairwise_distances(self, positions, mask=None):
+        """
+        Compute pairwise Euclidean distances between atom positions.
+        
+        Args:
+            positions: (B, L, D) - atom positions
+            mask: (B, L) - optional mask for valid positions
+            
+        Returns:
+            distances: (B, L, L) - pairwise distance matrix
+        """
+        # Compute squared distances: ||p_i - p_j||^2
+        # positions: (B, L, D)
+        pos_i = positions.unsqueeze(2)  # (B, L, 1, D)
+        pos_j = positions.unsqueeze(1)  # (B, 1, L, D)
+        squared_dist = torch.sum((pos_i - pos_j) ** 2, dim=-1)  # (B, L, L)
+        distances = torch.sqrt(squared_dist + 1e-8)  # (B, L, L) - add small epsilon for stability
+        
+        # Apply mask if provided (set masked distances to a large value)
+        if mask is not None:
+            # mask: (B, L) -> (B, L, 1) and (B, 1, L)
+            mask_i = mask.unsqueeze(-1)  # (B, L, 1)
+            mask_j = mask.unsqueeze(1)   # (B, 1, L)
+            valid_mask = mask_i & mask_j  # (B, L, L)
+            distances = torch.where(valid_mask, distances, torch.full_like(distances, self.max_distance * 2))
+        
+        return distances
+    
+    def forward(self, positions, layer_idx, mask=None):
+        """
+        Compute attention biases from pairwise spatial features.
+        
+        Args:
+            positions: (B, L, D) - atom positions
+            layer_idx: int - which layer this is (0-indexed)
+            mask: (B, L) - optional mask for valid positions
+            
+        Returns:
+            biases: (B, H, L, L) - attention biases for each head
+        """
+        B, L, D = positions.shape
+        
+        # Compute pairwise distances: (B, L, L)
+        distances = self.compute_pairwise_distances(positions, mask)
+        
+        # Normalize/clamp distances
+        distances = torch.clamp(distances / self.max_distance, 0, 1)
+        
+        # Reshape for MLP: (B, L, L, 1)
+        distances = distances.unsqueeze(-1)
+        
+        # Compute biases for each head: (B, H, L, L)
+        biases = []
+        for head_idx in range(self.num_heads):
+            # Apply layer-specific, head-specific MLP
+            head_biases = self.bias_mlps[layer_idx][head_idx](distances)  # (B, L, L, 1)
+            head_biases = head_biases.squeeze(-1)  # (B, L, L)
+            biases.append(head_biases)
+        
+        # Stack: (H, B, L, L) -> (B, H, L, L)
+        biases = torch.stack(biases, dim=1)
+        
+        return biases
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -138,8 +229,7 @@ class MMDiTQM9(nn.Module):
         # Text Embeddings
         self.text_embedder = nn.Embedding(text_vocab_size, self.dim_text)
 
-        # Euclidean Embeddings
-        # Handle multi-dimensional coordinates [B, L, D] where D is the feature dimension
+        # Euclidean Embeddings        # Handle multi-dimensional coordinates [B, L, D] where D is the feature dimension
         # Each dimension is embedded separately using GaussianFourierProjection
         # Then combined and projected to dim_image
         # Each dimension gets embedded_dim features, so total is euclidean_dim * embedded_dim
@@ -156,6 +246,17 @@ class MMDiTQM9(nn.Module):
         # Rotary Positional Embeddings
         self.text_rotary = Rotary(dim=self.dim_head, base=10_000)
         self.image_rotary = Rotary(dim=self.dim_head, base=10_000)
+
+        # Pairwise spatial attention biases (layer-specific, head-specific)
+        # We'll get depth from kwargs
+        depth = kwargs.get('depth', 4)
+        heads = kwargs.get('heads', 8)
+        self.spatial_bias = PairwiseSpatialBias(
+            num_heads=heads,
+            num_layers=depth,
+            spatial_feat_dim=32,
+            max_distance=10.0
+        )
 
         # Joint Embedding
         self.joint_embedding = MMDiT(**kwargs)
@@ -246,6 +347,9 @@ class MMDiTQM9(nn.Module):
         D = euclidean_tokens.shape[-1]
         assert D == self.euclidean_dim, f"Expected euclidean_tokens to have {self.euclidean_dim} dimensions, got {D}"
         
+        # Store original positions for computing pairwise spatial biases
+        atom_positions = euclidean_tokens  # [B, L, D]
+        
         # Embed each dimension separately
         dim_embeddings = []
         for d in range(D):
@@ -269,11 +373,25 @@ class MMDiTQM9(nn.Module):
         image_cos, image_sin = get_rotary_emb(self.image_rotary, euclidean_tokens)
         rotary_pos_emb = ((text_cos, text_sin), (image_cos, image_sin))
 
+        # Compute pairwise spatial attention biases for each layer
+        # Only apply to the euclidean/image modality
+        # Get depth from joint_embedding
+        depth = len(self.joint_embedding.blocks)
+        spatial_biases = []
+        for layer_idx in range(depth):
+            # Compute spatial bias for this layer: (B, H, L, L)
+            spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=image_mask)
+            spatial_biases.append(spatial_bias)
+        
+        # Format: (None for text, spatial_bias for image) for each layer
+        attn_biases = [(None, spatial_biases[layer_idx]) for layer_idx in range(depth)]
+
         text_tokens_hidden, euclidean_tokens_hidden = self.joint_embedding(
             modality_tokens = (cat_tokens, euclidean_tokens),
             modality_masks = (text_mask, image_mask),
             time_cond = (text_time_cond, image_time_cond),
             rotary_pos_emb = rotary_pos_emb,
+            attn_bias = attn_biases,
         )
         if detach_hidden[0]:
             text_tokens_hidden = text_tokens_hidden.detach()
