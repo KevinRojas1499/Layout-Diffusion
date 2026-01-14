@@ -9,12 +9,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
-from utils.datasets import get_dataset 
+from custom_datasets.qm9 import QM9Dataset
 from utils.misc import dotdict
 from utils.tokenizer import IntervalTokenizer, VocabTokenizer
 from utils.optimizers import WarmUpScheduler
 from model.transformer import EuclideanTransformer
-from models.mmdit import MMDiTModel, MMDiTModelNoImage
+from models.mmdit import MMDiTQM9
 from visualize_dataset import plot_sample
 
 # This makes training on A100s faster
@@ -76,23 +76,23 @@ def training(**opts):
     print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
     character_tokenizer = VocabTokenizer(vocab={'H', 'C', 'N', 'O', 'F'})
-    dataset = get_dataset(opts.dataset, max_length=opts.max_length, tokenizer=character_tokenizer) 
+    dataset = QM9Dataset(character_tokenizer)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=opts.num_workers, drop_last=True)
     
     wandb_enabled = opts.enable_wandb and rank == 0 # We only want to log once
     if wandb_enabled:
         init_wandb(opts)
     
-    model = MMDiTModelNoImage(
-        euclidean_dim=opts.max_length + 2,
-        text_vocab_size=dataset.text_vocab_size + 5,
+    model = MMDiTQM9(
+        euclidean_dim=3,
+        text_vocab_size=character_tokenizer.vocab_size + 2,
         euclidean_vocab_size=opts.num_bins,
-        context_len=opts.max_length + 2,
+        context_len=dataset.max_length + 3,
         text_depth=4,
         image_depth=4,
         depth=4,
-        dim_joint_attn=384,
         dim_modalities=[384, 384],
+        dim_joint_attn=384,
         dim_conds=[384, 384]
     ).to(device)
     ema = deepcopy(model)
@@ -104,11 +104,11 @@ def training(**opts):
     interpolant = MultimodalInterpolant(
         max_length=opts.max_length,
         interval_tokenizer=tokenizer,
-        vocab_size=dataset.text_vocab_size,
-        mask_token=dataset.text_vocab_size + 1,
-        pad_token=dataset.text_vocab_size + 2,
-        bos_token=dataset.text_vocab_size + 3,
-        eos_token=dataset.text_vocab_size + 4,
+        vocab_size=character_tokenizer.vocab_size,
+        mask_token=character_tokenizer.mask_token_id,
+        pad_token=character_tokenizer.pad_token_id, 
+        bos_token=character_tokenizer.bos_token_id,
+        eos_token=character_tokenizer.eos_token_id,
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -140,7 +140,7 @@ def training(**opts):
             opt.zero_grad()
             
             losses = interpolant.compute_loss(model, data_)
-            loss = losses["dsm_loss"] + losses["tokens_loss"] + losses["euclidean_insertion_loss"]
+            loss = losses["dsm_loss"] + losses["tokens_loss"] + losses["insertion_loss"]
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -164,7 +164,7 @@ def training(**opts):
             
             
             if rank == 0:
-                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Tokens Loss: {losses["tokens_loss"] :6.4f}, Euclidean Insertion Loss: {losses["euclidean_insertion_loss"] :6.4f}')
+                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Tokens Loss: {losses["tokens_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
             if wandb_enabled:
                 wandb.log({
                 'loss': loss/world_size,

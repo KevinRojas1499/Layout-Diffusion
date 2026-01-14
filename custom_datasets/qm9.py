@@ -72,6 +72,7 @@ class QM9Dataset(Dataset):
         # Pad the atomic symbols and pos to the max length
         original_length = len(pos)
         pos = pos + [[0, 0, 0]] * (self.max_length - len(pos))
+        pos = torch.tensor(pos, dtype=torch.float32)
 
         # Tokenize and pad the atomic symbols
         atomic_symbols = self.tokenizer.pad_tokenize(atomic_symbols, self.max_length)
