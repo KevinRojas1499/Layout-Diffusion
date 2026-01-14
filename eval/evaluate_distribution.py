@@ -12,9 +12,12 @@ import os
 try:
     from rdkit import Chem
     from rdkit.Chem import AllChem
+    from rdkit import RDLogger
     import warnings
     # Suppress deprecation warnings for GetMorganFingerprintAsBitVect
     warnings.filterwarnings("ignore", message=".*GetMorganFingerprintAsBitVect.*", category=DeprecationWarning)
+    # Suppress RDKit error/warning messages (they're too verbose for invalid molecules)
+    RDLogger.DisableLog('rdApp.*')
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
@@ -99,7 +102,7 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
 def _positions_to_molecule(symbols: List[str], positions: np.ndarray):
     """
     Convert atomic symbols and positions to RDKit molecule object.
-    Uses distance-based bond detection.
+    Uses distance-based bond detection with strict valency checking.
     
     Args:
         symbols: List of atomic symbols
@@ -136,15 +139,17 @@ def _positions_to_molecule(symbols: List[str], positions: np.ndarray):
                 conf.SetAtomPosition(i, tuple(pos))
         mol.AddConformer(conf)
         
-        # Try to add bonds based on distance
-        # Use a more sophisticated approach: find bonds greedily
-        num_atoms = len(symbols)
-        bonded_pairs = []
+        # Get maximum valencies for each atom
+        valencies = {
+            'H': 1, 'C': 4, 'N': 3, 'O': 2, 'F': 1,
+            'S': 2, 'Cl': 1, 'P': 3, 'Br': 1
+        }
+        max_valencies = [valencies.get(sym, 4) for sym in symbols]
         
         # Get all potential bonds sorted by distance
         potential_bonds = []
-        for i in range(num_atoms):
-            for j in range(i + 1, num_atoms):
+        for i in range(len(symbols)):
+            for j in range(i + 1, len(symbols)):
                 dist = np.linalg.norm(positions[i] - positions[j])
                 if _is_bonded(symbols[i], symbols[j], dist):
                     potential_bonds.append((i, j, dist))
@@ -152,43 +157,34 @@ def _positions_to_molecule(symbols: List[str], positions: np.ndarray):
         # Sort by distance (shorter bonds first)
         potential_bonds.sort(key=lambda x: x[2])
         
-        # Add bonds greedily, avoiding cycles (simple check)
+        # Add bonds greedily with strict valency checking
         added_bonds = set()
-        atom_degrees = {i: 0 for i in range(num_atoms)}
+        atom_degrees = [0] * len(symbols)
         
         for i, j, dist in potential_bonds:
-            # Check if adding this bond would exceed reasonable valency
-            max_valency = _get_max_valency(symbols[i], symbols[j])
-            if atom_degrees[i] < max_valency and atom_degrees[j] < max_valency:
-                # Simple cycle check: don't add if both atoms already have bonds
-                # (this is a heuristic, not perfect)
-                if atom_degrees[i] == 0 or atom_degrees[j] == 0 or len(added_bonds) < num_atoms - 1:
+            # Strict check: both atoms must have available valency
+            if atom_degrees[i] < max_valencies[i] and atom_degrees[j] < max_valencies[j]:
+                # Check if adding this bond would create a reasonable structure
+                # (avoid creating too many bonds to the same atom)
                     try:
                         mol.AddBond(i, j, Chem.BondType.SINGLE)
                         added_bonds.add((i, j))
                         atom_degrees[i] += 1
                         atom_degrees[j] += 1
                     except:
+                    # Bond addition failed, skip it
                         pass
         
-        # If no bonds were added, try a simpler approach: just add all potential bonds
+        # If no bonds were added, the molecule is likely invalid
         if len(added_bonds) == 0:
-            for i, j, dist in potential_bonds[:num_atoms * 2]:  # Limit to avoid too many bonds
-                try:
-                    mol.AddBond(i, j, Chem.BondType.SINGLE)
-                except:
-                    pass
+            return None
         
-        # Try to sanitize molecule
+        # Try to sanitize molecule - this will fail if valencies are invalid
         try:
             Chem.SanitizeMol(mol)
             return mol.GetMol()
         except:
-            # If sanitization fails, try to return unsanitized molecule
-            # Some fingerprint functions might still work
-            try:
-                return mol.GetMol()
-            except:
+            # Sanitization failed - molecule has invalid structure
                 return None
             
     except Exception as e:
@@ -252,7 +248,9 @@ def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2,
 
 
 def plot_distribution_comparison(real_embedding: np.ndarray, generated_embedding: np.ndarray,
-                                out_file: str, title: str = "Molecule Distribution Comparison"):
+                                out_file: str, title: str = "Molecule Distribution Comparison",
+                                real_num_atoms: Optional[List[int]] = None,
+                                gen_num_atoms: Optional[List[int]] = None):
     """
     Plot UMAP embeddings comparing real vs generated molecule distributions.
     
@@ -261,23 +259,62 @@ def plot_distribution_comparison(real_embedding: np.ndarray, generated_embedding
         generated_embedding: UMAP embedding of generated molecules, shape (M, 2)
         out_file: Output file path for the plot
         title: Plot title
+        real_num_atoms: Optional list of number of atoms for real molecules (for coloring)
+        gen_num_atoms: Optional list of number of atoms for generated molecules (for coloring)
     """
-    fig, ax = plt.subplots(figsize=(12, 10))
+    # Create side-by-side comparison plot
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
     
-    # Plot real molecules
-    ax.scatter(real_embedding[:, 0], real_embedding[:, 1], 
-              alpha=0.5, s=20, label='Real (QM9)', color='blue', edgecolors='none')
+    # Left: Real (QM9) only
+    if real_num_atoms is not None and len(real_num_atoms) == len(real_embedding):
+        scatter1 = ax1.scatter(
+            real_embedding[:, 0], real_embedding[:, 1], 
+            alpha=0.6, s=25, 
+            c=real_num_atoms,
+            cmap='Blues', edgecolors='none'
+        )
+        cbar1 = plt.colorbar(scatter1, ax=ax1)
+        cbar1.set_label('# Atoms', fontsize=10)
+    else:
+        ax1.scatter(real_embedding[:, 0], real_embedding[:, 1], 
+                   alpha=0.6, s=25, color='#2E86AB', edgecolors='none')
+    ax1.set_xlabel('UMAP Dimension 1', fontsize=11)
+    ax1.set_ylabel('UMAP Dimension 2', fontsize=11)
+    ax1.set_title(f'Real (QM9) (n={len(real_embedding)})', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
     
-    # Plot generated molecules
-    ax.scatter(generated_embedding[:, 0], generated_embedding[:, 1], 
-              alpha=0.5, s=20, label='Generated', color='red', edgecolors='none')
+    # Middle: Generated only
+    if gen_num_atoms is not None and len(gen_num_atoms) == len(generated_embedding):
+        scatter2 = ax2.scatter(
+            generated_embedding[:, 0], generated_embedding[:, 1], 
+            alpha=0.6, s=25,
+            c=gen_num_atoms,
+            cmap='Reds', edgecolors='none'
+        )
+        cbar2 = plt.colorbar(scatter2, ax=ax2)
+        cbar2.set_label('# Atoms', fontsize=10)
+    else:
+        ax2.scatter(generated_embedding[:, 0], generated_embedding[:, 1], 
+                   alpha=0.6, s=25, color='#A23B72', edgecolors='none')
+    ax2.set_xlabel('UMAP Dimension 1', fontsize=11)
+    ax2.set_ylabel('UMAP Dimension 2', fontsize=11)
+    ax2.set_title(f'Generated (n={len(generated_embedding)})', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
     
-    ax.set_xlabel('UMAP Dimension 1', fontsize=12)
-    ax.set_ylabel('UMAP Dimension 2', fontsize=12)
-    ax.set_title(title, fontsize=14, fontweight='bold')
-    ax.legend(fontsize=11, loc='best')
-    ax.grid(True, alpha=0.3)
+    # Right: Overlay comparison
+    ax3.scatter(real_embedding[:, 0], real_embedding[:, 1], 
+               alpha=0.4, s=20, label=f'Real (n={len(real_embedding)})', 
+               color='#2E86AB', edgecolors='none', marker='o')
+    ax3.scatter(generated_embedding[:, 0], generated_embedding[:, 1], 
+               alpha=0.5, s=20, label=f'Generated (n={len(generated_embedding)})', 
+               color='#A23B72', edgecolors='none', marker='^')
+    ax3.set_xlabel('UMAP Dimension 1', fontsize=11)
+    ax3.set_ylabel('UMAP Dimension 2', fontsize=11)
+    ax3.set_title('Overlay Comparison', fontsize=12, fontweight='bold')
+    ax3.legend(fontsize=10, loc='best', framealpha=0.9)
+    ax3.grid(True, alpha=0.3)
     
+    plt.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig(out_file, dpi=150, bbox_inches='tight')
     plt.close()
@@ -358,7 +395,10 @@ def evaluate_molecule_distributions(
     
     # Plot comparison
     output_file = os.path.join(output_dir, 'distribution_comparison_umap.png')
-    plot_distribution_comparison(real_embedding, generated_embedding, output_file)
+    real_num_atoms = [len(s) for s in real_symbols]
+    gen_num_atoms = [len(s) for s in generated_symbols]
+    plot_distribution_comparison(real_embedding, generated_embedding, output_file,
+                                real_num_atoms=real_num_atoms, gen_num_atoms=gen_num_atoms)
     
     # Compute some statistics
     print("\n" + "="*50)
@@ -424,6 +464,21 @@ def extract_molecules_from_samples(samples, tokenizer):
                 positions_list.append(positions)
     
     return symbols_list, positions_list
+
+
+def save_samples_to_json(samples, tokenizer, json_file: str):
+    """
+    Extract molecules from SamplingResult objects and save to JSON file.
+    
+    Convenience function that combines extract_molecules_from_samples and save_molecules_to_json.
+    
+    Args:
+        samples: List of SamplingResult objects from euclidean_sampling, or a single SamplingResult
+        tokenizer: VocabTokenizer for decoding atomic symbols
+        json_file: Output JSON file path
+    """
+    symbols_list, positions_list = extract_molecules_from_samples(samples, tokenizer)
+    save_molecules_to_json(symbols_list, positions_list, json_file)
 
 
 def _extract_single_molecule(yt, mask_t, xt, tokenizer):
@@ -525,6 +580,90 @@ def extract_molecules_from_qm9_dataset(dataset, n_samples: int = 10000):
                 smiles_list.append(smiles)
     
     return symbols_list, positions_list, smiles_list
+
+
+def load_molecules_from_json(json_file: str):
+    """
+    Load molecules from a JSON file.
+    
+    Expected JSON format:
+    {
+        "molecules": [
+            {
+                "symbols": ["C", "H", "H", "H", "H"],
+                "positions": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], ...]
+            },
+            ...
+        ]
+    }
+    
+    Args:
+        json_file: Path to JSON file containing molecules
+    
+    Returns:
+        symbols_list: List of lists of atomic symbols
+        positions_list: List of numpy arrays of positions
+    """
+    import json
+    
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+    
+    if 'molecules' not in data:
+        raise ValueError(f"JSON file must contain a 'molecules' key. Got keys: {list(data.keys())}")
+    
+    symbols_list = []
+    positions_list = []
+    
+    for i, mol in enumerate(data['molecules']):
+        if 'symbols' not in mol or 'positions' not in mol:
+            print(f"Warning: Skipping molecule {i} - missing 'symbols' or 'positions'")
+            continue
+        
+        symbols = mol['symbols']
+        positions = np.array(mol['positions'])
+        
+        # Validate shapes
+        if len(symbols) != len(positions):
+            print(f"Warning: Skipping molecule {i} - symbols length ({len(symbols)}) != positions length ({len(positions)})")
+            continue
+        
+        if positions.shape[1] != 3:
+            print(f"Warning: Skipping molecule {i} - positions must be (N, 3), got {positions.shape}")
+            continue
+        
+        symbols_list.append(symbols)
+        positions_list.append(positions)
+    
+    print(f"Loaded {len(symbols_list)} molecules from {json_file}")
+    return symbols_list, positions_list
+
+
+def save_molecules_to_json(symbols_list: List[List[str]], positions_list: List[np.ndarray], 
+                           json_file: str):
+    """
+    Save molecules to a JSON file.
+    
+    Args:
+        symbols_list: List of lists of atomic symbols
+        positions_list: List of numpy arrays of positions
+        json_file: Output JSON file path
+    """
+    import json
+    
+    molecules = []
+    for symbols, positions in zip(symbols_list, positions_list):
+        molecules.append({
+            'symbols': symbols,
+            'positions': positions.tolist()  # Convert numpy array to list
+        })
+    
+    data = {'molecules': molecules}
+    
+    with open(json_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"Saved {len(molecules)} molecules to {json_file}")
 
 
 # Example usage:
