@@ -46,8 +46,8 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--ema_beta',type=float, default=.999)
-@click.option('--lr', type=float, default=1e-5)
-@click.option('--batch_size', type=int, default=32)
+@click.option('--lr', type=float, default=1e-4)
+@click.option('--batch_size', type=int, default=128)
 @click.option('--log_rate',type=int,default=500)
 @click.option('--num_iters',type=int,default=5000)
 @click.option('--warmup_iters',type=int,default=100)
@@ -189,12 +189,12 @@ def training(**opts):
                     positions = sample.xt.cpu()[1:len(symbols)+1, :]
                     plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
                     
-                    os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
-                    pbar = tqdm(enumerate(sample.trajectory), leave=False)
+                    # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
+                    # pbar = tqdm(enumerate(sample.trajectory), leave=False)
 
-                    for j, trajectory in pbar:
-                        plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
-                        pbar.set_description(f'Saving trajectory {i} step {j}')
+                    # for j, trajectory in pbar:
+                    #     plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
+                    #     pbar.set_description(f'Saving trajectory {i} step {j}')
 
     if rank == 0:
         save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
