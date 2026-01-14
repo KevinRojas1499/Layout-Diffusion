@@ -187,8 +187,6 @@ def training(**opts):
                     plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
                     symbols = character_tokenizer.decode(sample.yt.cpu())
                     positions = sample.xt.cpu()[1:len(symbols)+1, :]
-                    print(symbols)
-                    print(positions)
                     plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
                     
                     os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
