@@ -67,6 +67,7 @@ class JointMultimodalInterpolantResult:
     x0_ordered: Tensor
     y0_ordered: Tensor
     yt_original_order: Tensor
+    eos_bos_mask_t: Tensor
 
     @property
     def gaps_and_mask(self) -> tuple[Tensor, Tensor]:
@@ -172,35 +173,43 @@ class MultimodalInterpolant():
         return x, y, mask, eos_bos_mask
 
     def sample_interpolant(self, t: Tensor, x0: Tensor, y0: Tensor,mask_0: Tensor, eos_bos_mask: Tensor) -> JointMultimodalInterpolantResult:
-        t = t.view(-1,1)
+        t = t.view(-1,1,1)
+        # Add noise to euclidean data
         full_xt = self.scale(t) * x0 + self.sigma(t) * torch.randn_like(x0)
         mask_shaped = mask_0.unsqueeze(-1).expand(-1, -1, full_xt.shape[-1])
         full_xt = full_xt * mask_shaped
         eos_bos_mask_shaped = eos_bos_mask.unsqueeze(-1).expand(-1, -1, full_xt.shape[-1])
         full_xt = torch.where(eos_bos_mask_shaped, torch.zeros_like(full_xt), full_xt)
 
-        masking_time = self.masking_time(t, y0) # This is for the text modality, but I am using y0 for dtype 
-        yt = torch.where(t < masking_time, y0, self.mask_token) # Change to mask id
-        t_shaped = t.expand(-1, full_xt.shape[1])
+        # Masking data
+        masking_time = self.masking_time(t, y0) 
+        t_shaped = t.view(-1,1).expand(-1, full_xt.shape[1])
+        yt = torch.where(t_shaped >= masking_time, y0, self.mask_token) # Change to mask id
         deletion_time = self.deletion_time(t, y0, masking_time)
         new_mask = mask_0 & (t_shaped < deletion_time) & ((t_shaped < deletion_time) | (t_shaped >= masking_time))
         new_mask = new_mask | eos_bos_mask
 
+        t_big = t.view(-1,1,1).expand(-1, full_xt.shape[1], full_xt.shape[2])
+        masking_time_big = masking_time.unsqueeze(-1).expand(-1, -1, full_xt.shape[2])
+        full_xt = torch.where(t_big >= masking_time_big, full_xt, 0.) # Change to mask id
+
+        # Reorder the data according to the active positions
         st = self.get_st(new_mask)
         xt = self.get_active_positions(full_xt, st)
         yt = self.get_active_positions(yt, st)
         y0_reordered = self.get_active_positions(y0, st)
         mask_t = self.get_active_positions(new_mask, st) # This will reorder the mask according to the new order
         x0_ordered = self.get_active_positions(x0, st)
+        eos_bos_mask_ordered = self.get_active_positions(eos_bos_mask, st)
         st[:,0] = -1 # Small hack to make the cum sums work nicely
-
         return JointMultimodalInterpolantResult(
             xt=xt, yt=yt, st=st, mask_t=mask_t, t=t, x0=x0, 
             x0_ordered=x0_ordered, 
             xt_original_order=full_xt, 
             mask_original_order=new_mask, 
             y0_ordered=y0_reordered,
-            yt_original_order=yt
+            yt_original_order=yt,
+            eos_bos_mask_t=eos_bos_mask_ordered
         )
 
     # TODO: check if this formulation is correct
@@ -238,6 +247,7 @@ class MultimodalInterpolant():
         x0, y0, mask_0, eos_bos_mask = self.pad_sequence(_x0, _y0, _mask_0)
         t = self.sample_time(_x0.shape[0], _x0.device)
         interpolant_sample = self.sample_interpolant(t, x0, y0, mask_0, eos_bos_mask)
+        eos_bos_mask_t = interpolant_sample.eos_bos_mask_t
 
         prediction: MultimodalModelPrediction = model(
             euclidean_tokens=interpolant_sample.xt,
@@ -248,8 +258,8 @@ class MultimodalInterpolant():
             image_time_cond=t
         )
         mask_t_shaped = interpolant_sample.mask_t.unsqueeze(-1)
-        eos_bos_mask_shaped = eos_bos_mask.unsqueeze(-1)
-        lengths = (interpolant_sample.mask_t.sum(dim=-1) - 2).clamp(min=1) # Subtracting 2 because we are not considering the end of sequence token and the start of sequence token
+        eos_bos_mask_shaped = eos_bos_mask_t.unsqueeze(-1)
+        lengths = interpolant_sample.mask_t.sum(dim=-1, keepdim=True).clamp(min=1)
         
         # Euclidean loss
         dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * mask_t_shaped * ~eos_bos_mask_shaped
@@ -258,13 +268,11 @@ class MultimodalInterpolant():
         
 
         # Insertion loss
-        scale_factor = x0.shape[0] * self.max_length
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
         insertion_loss = self.jump_kernel_elbo(
             gaps[gaps_mask], prediction.insertion_rate[gaps_mask]
         )
-        insertion_loss = insertion_loss.sum() / scale_factor
-
+        insertion_loss = insertion_loss.sum(dim=-1) / lengths.sum()
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
@@ -277,7 +285,7 @@ class MultimodalInterpolant():
         tokens_loss = tokens_loss * interpolant_sample.mask_t # Only consider the valid tokens
         tokens_loss = tokens_loss.sum(dim=-1) / lengths
         tokens_loss = tokens_loss.mean()
-        
+
         return {
             "dsm_loss": dsm_loss,
             "tokens_loss": tokens_loss,
@@ -295,8 +303,7 @@ class MultimodalInterpolant():
         predicted_rate = prediction.insertion_rate
 
         # Subtracting 2 because we are not considering the start and end of sequence tokens
-        rate = lambda_t / (mask_t.sum(dim=-1, keepdim=True) - 2).clamp(min=1)
-        rate = rate * predicted_rate
+        rate = lambda_t * predicted_rate
 
         return rate
     
@@ -360,7 +367,7 @@ class MultimodalInterpolant():
             unmasking_rate = unmasking_rate.expand(-1, seq_len)
             unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
 
-            # Extract the valid tokens
+            # Unmasking
             dist = prediction.label_logits[:, :, :self.vocab_size]
             new_sample = sample_categorical(dist.softmax(dim=-1), method="hard")  # [batch, seq_len]
 
@@ -375,7 +382,6 @@ class MultimodalInterpolant():
             insertion_rate = self.get_insertion_rate(prediction, mask_t, t)
             ext = torch.bernoulli((insertion_rate * dt).clamp(0.0, 1.0)).long()  # (B, L) where L is seq_len after padding
 
-            probabilities = F.softmax(prediction.label_logits, dim=-1)
             seq_len = xt.shape[1]  # After padding, this is max_length + 2
             if i != steps - 1:
                 for j in range(batch_size):

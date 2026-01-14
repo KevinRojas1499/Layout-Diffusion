@@ -3,6 +3,7 @@ import datasets
 import numpy as np
 from torch.utils.data import Dataset
 from utils.tokenizer import VocabTokenizer
+from rdkit import Chem
 
 class QM9Dataset(Dataset):
     def __init__(self, tokenizer: VocabTokenizer, max_length=30, canonical_order=True):
@@ -22,40 +23,88 @@ class QM9Dataset(Dataset):
             'S': 16, 'Cl': 17, 'Ar': 18
         }
 
-    def _canonical_order_atoms(self, atomic_symbols, pos):
+    def _smiles_based_order_atoms(self, atomic_symbols, pos, smiles):
         """
-        Order atoms in a canonical way:
-        1. By atomic number
-        2. By distance from centroid (for same atomic number)
-        3. By x, y, z coordinates (for same atomic number and distance)
+        Order atoms to match canonical SMILES string ordering.
+        Heavy atoms come first (in SMILES order), then hydrogens.
+        This matches the paper's approach.
         """
         if len(atomic_symbols) == 0:
             return atomic_symbols, pos
         
-        # Convert to numpy arrays for easier manipulation
+        # Parse SMILES to get heavy atom order
+        mol = Chem.MolFromSmiles(smiles)
+        # Get heavy atom symbols in SMILES order
+        smiles_heavy_atoms = [mol.GetAtomWithIdx(i).GetSymbol() for i in range(mol.GetNumAtoms())]
+        
+        # Separate heavy atoms and hydrogens from the actual molecule
         atomic_symbols = list(atomic_symbols)
         pos = np.array(pos)
         
-        # Calculate centroid
-        centroid = np.mean(pos, axis=0)
+        heavy_indices = []
+        heavy_symbols = []
+        heavy_positions = []
+        hydrogen_indices = []
+        hydrogen_symbols = []
+        hydrogen_positions = []
         
-        # Calculate distances from centroid
-        distances = np.linalg.norm(pos - centroid, axis=1)
+        for i, symbol in enumerate(atomic_symbols):
+            if symbol == 'H':
+                hydrogen_indices.append(i)
+                hydrogen_symbols.append(symbol)
+                hydrogen_positions.append(pos[i])
+            else:
+                heavy_indices.append(i)
+                heavy_symbols.append(symbol)
+                heavy_positions.append(pos[i])
         
-        # Create list of tuples for sorting: (atomic_number, distance, x, y, z, original_index)
-        sort_keys = []
-        for i, (symbol, dist, p) in enumerate(zip(atomic_symbols, distances, pos)):
-            atomic_num = self.atomic_numbers.get(symbol, 99)  # Default to 99 for unknown elements
-            sort_keys.append((atomic_num, dist, p[0], p[1], p[2], i))
+        # Match heavy atoms from SMILES order to actual heavy atoms
+        # We need to match by type, handling duplicates
+        ordered_heavy_indices = []
+        heavy_atom_counts = {}
+        for symbol in heavy_symbols:
+            heavy_atom_counts[symbol] = heavy_atom_counts.get(symbol, 0) + 1
         
-        # Sort by the keys
-        sorted_indices = sorted(range(len(sort_keys)), key=lambda i: sort_keys[i])
+        smiles_atom_counts = {}
+        for symbol in smiles_heavy_atoms:
+            smiles_atom_counts[symbol] = smiles_atom_counts.get(symbol, 0) + 1
         
-        # Reorder atomic_symbols and pos
-        ordered_symbols = [atomic_symbols[i] for i in sorted_indices]
-        ordered_pos = pos[sorted_indices].tolist()
+        # Match SMILES order to actual atoms
+        used_indices = set()
+        for smiles_symbol in smiles_heavy_atoms:
+            # Find matching atom of this type that hasn't been used
+            best_match = None
+            best_distance = float('inf')
+            
+            for idx in heavy_indices:
+                if idx in used_indices:
+                    continue
+                if atomic_symbols[idx] == smiles_symbol:
+                    # If there are multiple of the same type, we could use distance
+                    # For now, just take the first match
+                    best_match = idx
+                    break
+            
+            if best_match is not None:
+                ordered_heavy_indices.append(best_match)
+                used_indices.add(best_match)
+        
+        # Add any remaining heavy atoms that weren't matched (shouldn't happen, but safety)
+        for idx in heavy_indices:
+            if idx not in used_indices:
+                ordered_heavy_indices.append(idx)
+        
+        # Combine: heavy atoms (in SMILES order) + hydrogens
+        ordered_indices = ordered_heavy_indices + hydrogen_indices
+        
+        # Reorder
+        ordered_symbols = [atomic_symbols[i] for i in ordered_indices]
+        ordered_pos = pos[ordered_indices].tolist()
         
         return ordered_symbols, ordered_pos
+            
+    def _canonical_order_atoms(self, atomic_symbols, pos, smiles=None):
+        return self._smiles_based_order_atoms(atomic_symbols, pos, smiles)
 
     def __len__(self):
         return len(self.qm9_dataset)
@@ -64,10 +113,11 @@ class QM9Dataset(Dataset):
         data = self.qm9_dataset[index]
         atomic_symbols = data['atomic_symbols']
         pos = data['pos']
+        smiles = data.get('canonical_smiles') or data.get('smiles')  # Prefer canonical_smiles
         
         # Apply canonical ordering if requested
         if self.canonical_order:
-            atomic_symbols, pos = self._canonical_order_atoms(atomic_symbols, pos)
+            atomic_symbols, pos = self._canonical_order_atoms(atomic_symbols, pos, smiles)
         
         # Pad the atomic symbols and pos to the max length
         original_length = len(pos)
