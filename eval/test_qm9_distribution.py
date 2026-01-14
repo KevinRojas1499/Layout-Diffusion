@@ -45,7 +45,10 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
     
     # Extract QM9 molecules
     print(f"\n2. Extracting {n_samples} molecules from QM9 dataset...")
-    real_symbols, real_positions, real_smiles = extract_molecules_from_qm9_dataset(dataset, n_samples=n_samples)
+    # Use fixed random seed for reproducibility
+    real_symbols, real_positions, real_smiles = extract_molecules_from_qm9_dataset(
+        dataset, n_samples=n_samples, random_seed=42
+    )
     print(f"   Successfully extracted {len(real_symbols)} valid molecules")
     print(f"   SMILES available for {sum(1 for s in real_smiles if s is not None)} molecules")
     
@@ -90,16 +93,24 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
     
     # If comparison mode, use evaluate_molecule_distributions
     if generated_file and comparison_output:
-        print(f"\n5. Running full distribution comparison...")
+        print(f"\n5. Running full distribution comparison (paper methodology)...")
         try:
             results = evaluate_molecule_distributions(
                 real_symbols, real_positions,
                 gen_symbols, gen_positions,
                 output_dir=comparison_output,
                 n_samples=min(n_samples, len(gen_symbols)),
-                real_smiles=real_smiles
+                real_smiles=real_smiles,
+                fingerprint_type='morgan',  # Can change to 'rdkit' to match paper exactly
+                random_seed=42  # Fixed seed for reproducibility
             )
-            print(f"\n   Comparison plot saved to: {comparison_output}/distribution_comparison_umap.png")
+            print(f"\n   Comparison plots saved to:")
+            print(f"     - {comparison_output}/distribution_comparison_umap.png")
+            print(f"     - {comparison_output}/atom_count_distributions.png")
+            print(f"\n   Kolmogorov-Smirnov statistics (1-KSD):")
+            if 'ks_statistics' in results:
+                for atom_type, ks_val in results['ks_statistics'].items():
+                    print(f"     {atom_type:>5}: {ks_val:.4f}")
         except Exception as e:
             print(f"   ERROR in comparison: {e}")
             import traceback

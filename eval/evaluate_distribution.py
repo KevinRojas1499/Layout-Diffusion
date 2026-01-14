@@ -5,9 +5,13 @@ Based on the paper's evaluation methodology using molecular fingerprints.
 
 import torch
 import numpy as np
+import matplotlib
+# Use non-interactive backend to avoid tkinter issues in headless environments
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
 import os
+import warnings
 
 try:
     from rdkit import Chem
@@ -33,9 +37,10 @@ except ImportError:
 
 def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list: List[np.ndarray], 
                                    smiles_list: Optional[List[str]] = None,
-                                   radius: int = 2, n_bits: int = 2048) -> np.ndarray:
+                                   radius: int = 2, n_bits: int = 2048,
+                                   fingerprint_type: str = 'morgan') -> np.ndarray:
     """
-    Compute Morgan fingerprints for molecules.
+    Compute molecular fingerprints for molecules.
     
     Args:
         symbols_list: List of lists, where each inner list contains atomic symbols
@@ -43,6 +48,7 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
         smiles_list: Optional list of SMILES strings (preferred over position-based conversion)
         radius: Radius for Morgan fingerprint (default 2)
         n_bits: Number of bits in fingerprint (default 2048)
+        fingerprint_type: Type of fingerprint ('morgan' or 'rdkit')
     
     Returns:
         numpy array of shape (num_molecules, n_bits) with binary fingerprints
@@ -80,8 +86,15 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
                 failed_count += 1
                 continue
             
-            # Compute Morgan fingerprint
-            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+            # Compute fingerprint based on type
+            if fingerprint_type.lower() == 'rdkit':
+                # RDKit fingerprint (standard RDKit topological fingerprint)
+                # This is the standard RDKit fingerprint used in the paper
+                fp = Chem.RDKFingerprint(mol, maxPath=7, fpSize=n_bits)
+            else:
+                # Morgan fingerprint (default)
+                fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+            
             fingerprints.append(np.array(fp))
             valid_indices.append(idx)
         except Exception as e:
@@ -222,6 +235,16 @@ def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2,
     """
     Compute UMAP embedding of molecular fingerprints.
     
+    Note: UMAP embeddings are deterministic when:
+    - random_state is set (as done here)
+    - The same fingerprints are provided in the same order
+    - The same UMAP parameters are used
+    
+    However, if different molecules are sampled or fingerprints fail for different
+    molecules between runs, the embeddings will differ. Use fixed random seeds
+    in extract_molecules_from_qm9_dataset and evaluate_molecule_distributions
+    for full reproducibility.
+    
     Args:
         fingerprints: numpy array of shape (N, n_bits) with binary fingerprints
         n_components: Number of dimensions for embedding (default 2)
@@ -235,16 +258,176 @@ def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2,
     if not UMAP_AVAILABLE:
         raise ImportError("UMAP is required for embedding computation")
     
-    reducer = umap.UMAP(
-        n_components=n_components,
-        n_neighbors=n_neighbors,
-        min_dist=min_dist,
-        random_state=random_state,
-        metric='jaccard'  # Jaccard distance is good for binary fingerprints
-    )
+    # Set numpy random seed for additional reproducibility
+    # (UMAP uses numpy random internally)
+    np.random.seed(random_state)
     
-    embedding = reducer.fit_transform(fingerprints)
+    # Suppress UMAP warnings about Jaccard metric and n_jobs
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='.*gradient function is not yet implemented.*')
+        warnings.filterwarnings('ignore', message='.*n_jobs value.*overridden.*')
+        
+        reducer = umap.UMAP(
+            n_components=n_components,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            random_state=random_state,
+            metric='jaccard',  # Jaccard distance is good for binary fingerprints
+            verbose=False,  # Suppress UMAP output for cleaner logs
+            n_jobs=1  # Explicitly set to avoid warning when random_state is set
+        )
+        
+        embedding = reducer.fit_transform(fingerprints)
+    
     return embedding
+
+
+def compute_atom_counts(symbols_list: List[List[str]]) -> dict:
+    """
+    Compute atom counts for each molecule.
+    
+    Args:
+        symbols_list: List of lists of atomic symbols
+    
+    Returns:
+        Dictionary with keys: 'total', 'C', 'N', 'O', 'F', 'H'
+        Each value is a list of counts for each molecule
+    """
+    counts = {
+        'total': [],
+        'C': [],
+        'N': [],
+        'O': [],
+        'F': [],
+        'H': []
+    }
+    
+    for symbols in symbols_list:
+        total = len(symbols)
+        counts['total'].append(total)
+        counts['C'].append(symbols.count('C'))
+        counts['N'].append(symbols.count('N'))
+        counts['O'].append(symbols.count('O'))
+        counts['F'].append(symbols.count('F'))
+        counts['H'].append(symbols.count('H'))
+    
+    return counts
+
+
+def compute_empirical_cdf(data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute empirical cumulative distribution function.
+    
+    Args:
+        data: 1D numpy array of values
+    
+    Returns:
+        x: Sorted unique values
+        cdf: Cumulative probabilities at each x value
+    """
+    sorted_data = np.sort(data)
+    x = np.unique(sorted_data)
+    cdf = np.array([np.mean(sorted_data <= val) for val in x])
+    return x, cdf
+
+
+def compute_ks_statistic(real_data: np.ndarray, generated_data: np.ndarray) -> float:
+    """
+    Compute Kolmogorov-Smirnov-like statistic: 1 - KSD
+    
+    KSD = max_x |F_Y(x) - F_QM9(x)|
+    Returns 1 - KSD, which is 1 when distributions agree perfectly, 0 when they don't overlap.
+    
+    Args:
+        real_data: 1D numpy array of real molecule values
+        generated_data: 1D numpy array of generated molecule values
+    
+    Returns:
+        1 - KSD statistic (higher is better, range [0, 1])
+    """
+    # Compute empirical CDFs
+    x_real, cdf_real = compute_empirical_cdf(real_data)
+    x_gen, cdf_gen = compute_empirical_cdf(generated_data)
+    
+    # Combine all x values and sort
+    all_x = np.unique(np.concatenate([x_real, x_gen]))
+    all_x = np.sort(all_x)
+    
+    # Interpolate CDFs at all x values
+    cdf_real_interp = np.array([np.mean(real_data <= x_val) for x_val in all_x])
+    cdf_gen_interp = np.array([np.mean(generated_data <= x_val) for x_val in all_x])
+    
+    # Compute maximum difference
+    ksd = np.max(np.abs(cdf_real_interp - cdf_gen_interp))
+    
+    return 1.0 - ksd
+
+
+def plot_atom_count_distributions(real_counts: dict, gen_counts: dict, 
+                                  output_dir: str, ks_stats: Optional[dict] = None):
+    """
+    Plot marginal distributions of atom counts with CDFs.
+    
+    Args:
+        real_counts: Dictionary of atom counts for real molecules
+        gen_counts: Dictionary of atom counts for generated molecules
+        output_dir: Directory to save plots
+        ks_stats: Optional dictionary of KS statistics for each atom type
+    """
+    atom_types = ['total', 'C', 'N', 'O', 'F', 'H']
+    atom_labels = {
+        'total': 'Total Atoms',
+        'C': 'Carbon',
+        'N': 'Nitrogen',
+        'O': 'Oxygen',
+        'F': 'Fluorine',
+        'H': 'Hydrogen'
+    }
+    
+    # Create figure with subplots: 2 rows, 3 columns
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+    
+    for idx, atom_type in enumerate(atom_types):
+        ax = axes[idx]
+        
+        real_data = np.array(real_counts[atom_type])
+        gen_data = np.array(gen_counts[atom_type])
+        
+        # Compute CDFs
+        x_real, cdf_real = compute_empirical_cdf(real_data)
+        x_gen, cdf_gen = compute_empirical_cdf(gen_data)
+        
+        # Plot CDFs
+        ax.plot(x_real, cdf_real, label=f'QM9 (n={len(real_data)})', 
+               linewidth=2, color='#2E86AB', alpha=0.8)
+        ax.plot(x_gen, cdf_gen, label=f'Generated (n={len(gen_data)})', 
+               linewidth=2, color='#A23B72', alpha=0.8, linestyle='--')
+        
+        # Add KS statistic if provided
+        if ks_stats and atom_type in ks_stats:
+            ks_val = ks_stats[atom_type]
+            ax.text(0.05, 0.95, f'1-KSD = {ks_val:.3f}', 
+                   transform=ax.transAxes, fontsize=11,
+                   verticalalignment='top', bbox=dict(boxstyle='round', 
+                   facecolor='wheat', alpha=0.5))
+        
+        ax.set_xlabel(f'Number of {atom_labels[atom_type]}', fontsize=11)
+        ax.set_ylabel('Cumulative Probability', fontsize=11)
+        ax.set_title(f'{atom_labels[atom_type]} Count Distribution', 
+                     fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10, loc='lower right')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+    
+    plt.suptitle('Atom Count Marginal Distributions (CDFs)', 
+                fontsize=14, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    
+    output_file = os.path.join(output_dir, 'atom_count_distributions.png')
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved atom count distribution plot to {output_file}")
 
 
 def plot_distribution_comparison(real_embedding: np.ndarray, generated_embedding: np.ndarray,
@@ -331,10 +514,13 @@ def evaluate_molecule_distributions(
     fingerprint_radius: int = 2,
     fingerprint_bits: int = 2048,
     real_smiles: Optional[List[str]] = None,
-    generated_smiles: Optional[List[str]] = None
+    generated_smiles: Optional[List[str]] = None,
+    fingerprint_type: str = 'morgan',
+    random_seed: int = 42
 ):
     """
     Main evaluation function: Compare real vs generated molecule distributions.
+    Based on the paper's evaluation methodology.
     
     Args:
         real_symbols: List of lists of atomic symbols for real molecules
@@ -347,6 +533,11 @@ def evaluate_molecule_distributions(
         fingerprint_bits: Number of bits in fingerprint
         real_smiles: Optional list of SMILES strings for real molecules
         generated_smiles: Optional list of SMILES strings for generated molecules
+        fingerprint_type: Type of fingerprint ('morgan' or 'rdkit')
+        random_seed: Random seed for reproducible sampling and UMAP (default 42)
+    
+    Returns:
+        Dictionary containing evaluation results including fingerprints, embeddings, KS statistics
     """
     if not RDKIT_AVAILABLE:
         raise ImportError("RDKit is required for evaluation")
@@ -355,67 +546,114 @@ def evaluate_molecule_distributions(
     
     os.makedirs(output_dir, exist_ok=True)
     
+    # Set random seed for reproducible sampling
+    rng = np.random.RandomState(random_seed)
+    
     # Sample if we have more than n_samples
     if len(real_symbols) > n_samples:
-        indices = np.random.choice(len(real_symbols), n_samples, replace=False)
+        indices = rng.choice(len(real_symbols), n_samples, replace=False)
+        indices = np.sort(indices)  # Sort for consistent ordering
         real_symbols = [real_symbols[i] for i in indices]
         real_positions = [real_positions[i] for i in indices]
         if real_smiles:
             real_smiles = [real_smiles[i] for i in indices]
     
     if len(generated_symbols) > n_samples:
-        indices = np.random.choice(len(generated_symbols), n_samples, replace=False)
+        indices = rng.choice(len(generated_symbols), n_samples, replace=False)
+        indices = np.sort(indices)  # Sort for consistent ordering
         generated_symbols = [generated_symbols[i] for i in indices]
         generated_positions = [generated_positions[i] for i in indices]
         if generated_smiles:
             generated_smiles = [generated_smiles[i] for i in indices]
     
+    # 1. Compute atom count distributions
+    print("\n" + "="*50)
+    print("1. Computing atom count distributions...")
+    print("="*50)
+    real_atom_counts = compute_atom_counts(real_symbols)
+    gen_atom_counts = compute_atom_counts(generated_symbols)
+    
+    # Compute Kolmogorov-Smirnov statistics for each atom type
+    print("\nComputing Kolmogorov-Smirnov statistics (1-KSD)...")
+    ks_stats = {}
+    atom_types = ['total', 'C', 'N', 'O', 'F', 'H']
+    for atom_type in atom_types:
+        real_data = np.array(real_atom_counts[atom_type])
+        gen_data = np.array(gen_atom_counts[atom_type])
+        ks_val = compute_ks_statistic(real_data, gen_data)
+        ks_stats[atom_type] = ks_val
+        print(f"  {atom_type:>5}: 1-KSD = {ks_val:.4f}")
+    
+    # Plot atom count distributions
+    print("\nPlotting atom count marginal distributions...")
+    plot_atom_count_distributions(real_atom_counts, gen_atom_counts, output_dir, ks_stats)
+    
+    # 2. Compute fingerprints and UMAP
+    print("\n" + "="*50)
+    print("2. Computing molecular fingerprints and UMAP embedding...")
+    print("="*50)
+    print(f"Using {fingerprint_type} fingerprints...")
     print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
     real_fps, real_valid = compute_molecular_fingerprints(
         real_symbols, real_positions, smiles_list=real_smiles, 
-        radius=fingerprint_radius, n_bits=fingerprint_bits
+        radius=fingerprint_radius, n_bits=fingerprint_bits,
+        fingerprint_type=fingerprint_type
     )
     print(f"Valid real molecules: {len(real_fps)}")
     
     print(f"Computing fingerprints for {len(generated_symbols)} generated molecules...")
     generated_fps, gen_valid = compute_molecular_fingerprints(
         generated_symbols, generated_positions, smiles_list=generated_smiles,
-        radius=fingerprint_radius, n_bits=fingerprint_bits
+        radius=fingerprint_radius, n_bits=fingerprint_bits,
+        fingerprint_type=fingerprint_type
     )
     print(f"Valid generated molecules: {len(generated_fps)}")
     
     # Combine for joint UMAP fitting (better comparison)
     print("Computing UMAP embedding...")
     all_fps = np.vstack([real_fps, generated_fps])
-    all_embedding = compute_umap_embedding(all_fps)
+    # Use the same random seed for UMAP to ensure reproducibility
+    all_embedding = compute_umap_embedding(all_fps, random_state=random_seed)
     
     # Split back
     real_embedding = all_embedding[:len(real_fps)]
     generated_embedding = all_embedding[len(real_fps):]
     
-    # Plot comparison
+    # Plot UMAP comparison
     output_file = os.path.join(output_dir, 'distribution_comparison_umap.png')
     real_num_atoms = [len(s) for s in real_symbols]
     gen_num_atoms = [len(s) for s in generated_symbols]
     plot_distribution_comparison(real_embedding, generated_embedding, output_file,
                                 real_num_atoms=real_num_atoms, gen_num_atoms=gen_num_atoms)
     
-    # Compute some statistics
+    # Print summary statistics
     print("\n" + "="*50)
-    print("Distribution Statistics:")
+    print("Summary Statistics:")
     print("="*50)
     print(f"Real molecules: {len(real_fps)} valid out of {len(real_symbols)}")
     print(f"Generated molecules: {len(generated_fps)} valid out of {len(generated_symbols)}")
-    print(f"Real embedding range: X=[{real_embedding[:, 0].min():.2f}, {real_embedding[:, 0].max():.2f}], "
+    print(f"\nReal embedding range: X=[{real_embedding[:, 0].min():.2f}, {real_embedding[:, 0].max():.2f}], "
           f"Y=[{real_embedding[:, 1].min():.2f}, {real_embedding[:, 1].max():.2f}]")
     print(f"Generated embedding range: X=[{generated_embedding[:, 0].min():.2f}, {generated_embedding[:, 0].max():.2f}], "
           f"Y=[{generated_embedding[:, 1].min():.2f}, {generated_embedding[:, 1].max():.2f}]")
+    
+    print("\n" + "="*50)
+    print("Kolmogorov-Smirnov Statistics (1-KSD):")
+    print("="*50)
+    print("Higher values indicate better distribution match (range: 0-1)")
+    for atom_type in atom_types:
+        print(f"  {atom_type:>5}: {ks_stats[atom_type]:.4f}")
+    avg_ks = np.mean(list(ks_stats.values()))
+    print(f"\n  Average: {avg_ks:.4f}")
     
     return {
         'real_fingerprints': real_fps,
         'generated_fingerprints': generated_fps,
         'real_embedding': real_embedding,
-        'generated_embedding': generated_embedding
+        'generated_embedding': generated_embedding,
+        'ks_statistics': ks_stats,
+        'real_atom_counts': real_atom_counts,
+        'generated_atom_counts': gen_atom_counts
     }
 
 
@@ -517,13 +755,14 @@ def _extract_single_molecule(yt, mask_t, xt, tokenizer):
     return None, None
 
 
-def extract_molecules_from_qm9_dataset(dataset, n_samples: int = 10000):
+def extract_molecules_from_qm9_dataset(dataset, n_samples: int = 10000, random_seed: int = 42):
     """
     Extract molecules from QM9 dataset.
     
     Args:
         dataset: QM9Dataset instance
         n_samples: Number of samples to extract
+        random_seed: Random seed for reproducible sampling (default 42)
     
     Returns:
         symbols_list: List of lists of atomic symbols
@@ -535,7 +774,11 @@ def extract_molecules_from_qm9_dataset(dataset, n_samples: int = 10000):
     smiles_list = []
     
     n_samples = min(n_samples, len(dataset))
-    indices = np.random.choice(len(dataset), n_samples, replace=False)
+    # Set random seed for reproducible sampling
+    rng = np.random.RandomState(random_seed)
+    indices = rng.choice(len(dataset), n_samples, replace=False)
+    # Sort indices to ensure consistent ordering
+    indices = np.sort(indices)
     
     for idx in indices:
         # Get raw data from underlying dataset to access SMILES
