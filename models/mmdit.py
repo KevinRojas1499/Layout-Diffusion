@@ -16,6 +16,8 @@ from x_transformers import (
     FeedForward
 )
 
+from model.rotary import rotate_half, apply_rotary_pos_emb as apply_rotary_pos_emb_original
+
 # mlp 
 def mlp(dim, dim_hidden, dim_out):
     return nn.Sequential(
@@ -105,7 +107,8 @@ class JointAttention(Module):
     def forward(
         self,
         inputs: Tuple[Tensor],
-        masks: Tuple[Tensor | None] | None = None
+        masks: Tuple[Tensor | None] | None = None,
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None
     ):
 
         device = self.dummy.device
@@ -113,6 +116,7 @@ class JointAttention(Module):
         assert len(inputs) == self.num_inputs
 
         masks = default(masks, (None,) * self.num_inputs)
+        rotary_pos_emb = default(rotary_pos_emb, (None,) * self.num_inputs)
 
         # project each modality separately for qkv
         # also handle masks, assume None means attend to all tokens
@@ -120,18 +124,30 @@ class JointAttention(Module):
         all_qkvs = []
         all_masks = []
 
-        for x, mask, to_qkv, q_rmsnorm, k_rmsnorm in zip(inputs, masks, self.to_qkv, self.q_rmsnorms, self.k_rmsnorms):
+        for x, mask, to_qkv, q_rmsnorm, k_rmsnorm, rotary_emb in zip(
+            inputs, masks, self.to_qkv, self.q_rmsnorms, self.k_rmsnorms, rotary_pos_emb
+        ):
 
             qkv = to_qkv(x)
-            qkv = self.split_heads(qkv)
+            qkv = self.split_heads(qkv)  # (qkv, b, h, n, d)
+
+            # extract q, k, v for potential modifications
+            q, k, v = qkv
 
             # optional qk rmsnorm per modality
-
             if self.qk_rmsnorm:
-                q, k, v = qkv
                 q = q_rmsnorm(q)
                 k = k_rmsnorm(k)
-                qkv = torch.stack((q, k, v))
+
+            if exists(rotary_emb):
+                cos, sin = rotary_emb
+                qkv_stacked = torch.stack((q, k, v), dim=0)  # (3, b, h, n, d)
+                qkv_reshaped = rearrange(qkv_stacked, 'qkv b h n d -> b n qkv h d')
+                qkv_rotated = apply_rotary_pos_emb_original(qkv_reshaped, cos, sin)
+                qkv_rotated = rearrange(qkv_rotated, 'b n qkv h d -> qkv b h n d')
+                q, k, v = qkv_rotated
+
+            qkv = torch.stack((q, k, v))
 
             all_qkvs.append(qkv)
 
@@ -281,9 +297,12 @@ class MMDiTBlock(Module):
         *,
         modality_tokens: Tuple[Tensor, ...],
         modality_masks: Tuple[Tensor | None, ...] | None = None,
-        time_cond = Tuple[Tensor | None, ...]
+        time_cond = Tuple[Tensor | None, ...],
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None
     ):
         assert len(modality_tokens) == self.num_modalities and len(time_cond) == self.num_modalities
+
+        rotary_pos_emb = default(rotary_pos_emb, (None,) * self.num_modalities)
 
         attn_gammas = [1.] * len(time_cond) # Default to 1. if no condition
         ff_gammas = [1.] * len(time_cond) # Default to 1. if no condition
@@ -296,7 +315,11 @@ class MMDiTBlock(Module):
         modality_tokens = [ln(tokens, cond) for tokens, cond, ln in zip(modality_tokens, time_cond, self.attn_layernorms)]
 
         # attention
-        modality_tokens = self.joint_attn(inputs = modality_tokens, masks = modality_masks)
+        modality_tokens = self.joint_attn(
+            inputs = modality_tokens, 
+            masks = modality_masks,
+            rotary_pos_emb = rotary_pos_emb
+        )
 
         # post attention gammas
         modality_tokens = [tokens * gamma for tokens, gamma in zip(modality_tokens, attn_gammas)]
@@ -342,13 +365,15 @@ class MMDiT(Module):
         *,
         modality_tokens: Tuple[Tensor, ...],
         modality_masks: Tuple[Tensor | None, ...] | None = None,
-        time_cond = Tuple[Tensor | None, ...]
+        time_cond = Tuple[Tensor | None, ...],
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None
     ):
         for block in self.blocks:
             modality_tokens = block(
                 time_cond = time_cond,
                 modality_tokens = modality_tokens,
-                modality_masks = modality_masks
+                modality_masks = modality_masks,
+                rotary_pos_emb = rotary_pos_emb
             )
 
         modality_tokens = [norm(tokens) for tokens, norm in zip(modality_tokens, self.norms)]

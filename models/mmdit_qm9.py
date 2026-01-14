@@ -20,8 +20,10 @@ from x_transformers import (
     FeedForward
 )
 
-from model.transformer import GaussianFourierProjection
+from models.mmdit import MMDiT, FinalLayer
 from multimodal_interpolant import MultimodalModelPrediction
+from model.rotary import Rotary
+
 
 # mlp 
 def mlp(dim, dim_hidden, dim_out):
@@ -41,6 +43,39 @@ def default(v, d):
 
 def softclamp(t, value):
     return (t / value).tanh() * value
+
+# rotary positional embedding helper
+def get_rotary_emb(rotary_module, x):
+    """
+    Get rotary positional embeddings from the Rotary module.
+    
+    Args:
+        rotary_module: Rotary module instance
+        x: input tensor of shape (b, n, d) to determine sequence length
+    
+    Returns:
+        cos, sin: tensors of shape (1, n, 3, 1, dim_head)
+                 This format matches what apply_rotary_pos_emb expects
+    """
+    # The Rotary class generates embeddings with shape (1, seq_len, 3, 1, dim_head)
+    # This is the exact format needed by apply_rotary_pos_emb from model.rotary
+    cos, sin = rotary_module(x, seq_dim=1)
+    return cos, sin
+
+
+class GaussianFourierProjection(nn.Module):
+    """Gaussian Fourier embeddings for continuous inputs."""
+
+    def __init__(self, embed_dim, scale=1.0):
+        super().__init__()
+        # Randomly sample weights during initialization. These weights are fixed
+        # during optimization and are not trainable.
+        self.W = nn.Parameter(torch.randn(embed_dim // 2) * scale, requires_grad=False)
+
+    def forward(self, x):
+        # x: (B, L, 1)
+        x_proj = x * self.W[None, None, :] * 2 * math.pi
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
 class TimestepEmbedder(nn.Module):
@@ -83,55 +118,6 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
-
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
-
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
-
 class MMDiTQM9(nn.Module):
     def __init__(self, euclidean_dim, text_vocab_size, context_len, text_depth, image_depth, project_hidden=False, **kwargs):
         super().__init__()
@@ -141,22 +127,35 @@ class MMDiTQM9(nn.Module):
         self.dim_text = self.dim_modalities[0]
         self.dim_image = self.dim_modalities[1]
 
+        # Extract attention parameters for rotary embeddings
+        self.dim_head = kwargs.get('dim_head', 64)
+        self.heads = kwargs.get('heads', 8)
+
         # Time Encoders
         self.text_time_encoder = TimestepEmbedder(self.dim_text)
         self.image_time_encoder = TimestepEmbedder(self.dim_image)
 
         # Text Embeddings
         self.text_embedder = nn.Embedding(text_vocab_size, self.dim_text)
-        self.text_pos_embed = nn.Embedding(context_len, self.dim_text)
-        nn.init.normal_(self.text_pos_embed.weight, std=0.02)
 
-        # Image Embeddings
-        grid = np.arange(context_len)
-        self.register_buffer('pos_embed', torch.from_numpy(get_1d_sincos_pos_embed_from_grid(self.dim_image, grid)).float().unsqueeze(0))
-        self.euclidean_embedding = nn.Sequential(
-            GaussianFourierProjection(self.dim_image, scale=1.0),
-            nn.Linear(self.dim_image, self.dim_image),
-        )
+        # Euclidean Embeddings
+        # Handle multi-dimensional coordinates [B, L, D] where D is the feature dimension
+        # Each dimension is embedded separately using GaussianFourierProjection
+        # Then combined and projected to dim_image
+        # Each dimension gets embedded_dim features, so total is euclidean_dim * embedded_dim
+        self.embedded_dim_per_feature = self.dim_image // euclidean_dim
+        self.gaussian_fourier_projs = nn.ModuleList([
+            GaussianFourierProjection(self.embedded_dim_per_feature, scale=1.0)
+            for _ in range(euclidean_dim)
+        ])
+        # Project the concatenated embeddings to dim_image
+        # Total embedding size after concatenation: euclidean_dim * embedded_dim_per_feature
+        total_embed_dim = euclidean_dim * self.embedded_dim_per_feature
+        self.euclidean_proj = nn.Linear(total_embed_dim, self.dim_image)
+
+        # Rotary Positional Embeddings
+        self.text_rotary = Rotary(dim=self.dim_head, base=10_000)
+        self.image_rotary = Rotary(dim=self.dim_head, base=10_000)
 
         # Joint Embedding
         self.joint_embedding = MMDiT(**kwargs)
@@ -198,7 +197,7 @@ class MMDiTQM9(nn.Module):
             param.requires_grad = False
     
     def freeze_joint(self):
-        layers_to_freeze = [self.text_embedder, self.text_pos_embed, self.text_time_encoder, 
+        layers_to_freeze = [self.text_embedder, self.text_time_encoder, 
                             self.image_embedder, self.image_time_encoder,
                             self.joint_embedding]
         for layer in layers_to_freeze:
@@ -212,7 +211,7 @@ class MMDiTQM9(nn.Module):
                 param.requires_grad = False
     
     def freeze_text(self):
-        layers_to_freeze = [self.text_embedder, self.text_pos_embed, self.text_time_encoder, self.text_dit, self.text_final_layer]
+        layers_to_freeze = [self.text_embedder, self.text_time_encoder, self.text_dit, self.text_final_layer]
         for layer in layers_to_freeze:
             for param in layer.parameters():
                 param.requires_grad = False
@@ -235,52 +234,46 @@ class MMDiTQM9(nn.Module):
         # image_mask: [B, L]
         # text_time_cond: [B] - scalar timesteps per batch element
         # image_time_cond: [B] - scalar timesteps per batch element
-        # Create position indices based on sequence length
-        B, L = cat_tokens.shape[:2]
-        positions = torch.arange(L, device=cat_tokens.device)
-        positions = positions.unsqueeze(0).expand(B, -1) # [batch, seq_len]
+
+        # Handle euclidean_tokens: [B, L, D] where D is the feature dimension
+        # Embed each dimension separately and concatenate
+        B, L = euclidean_tokens.shape[:2]
         
-        # Handle euclidean_tokens: if 2D [B, L], add feature dim; if 3D [B, L, D], embed each dimension
         if euclidean_tokens.dim() == 2:
+            # If 2D [B, L], treat as single dimension and add feature dim
             euclidean_tokens = euclidean_tokens.unsqueeze(-1)  # [B, L] -> [B, L, 1]
-            euclidean_tokens = self.euclidean_embedding(euclidean_tokens)  # [B, L, dim_image]
-        elif euclidean_tokens.dim() == 3:
-            D = euclidean_tokens.shape[-1]
-            if D == 1:
-                # Already correct shape [B, L, 1]
-                euclidean_tokens = self.euclidean_embedding(euclidean_tokens)  # [B, L, dim_image]
-            else:
-                # For multi-dimensional coordinates (e.g., 3D: x, y, z), embed each dimension separately
-                # and then combine using a linear projection
-                # Split into individual dimensions: [B, L, D] -> D x [B, L, 1]
-                dim_embeddings = []
-                for d in range(D):
-                    dim_token = euclidean_tokens[..., d:d+1]  # [B, L, 1]
-                    dim_emb = self.euclidean_embedding(dim_token)  # [B, L, dim_image]
-                    dim_embeddings.append(dim_emb)
-                # Sum the embeddings from all dimensions (alternative: could concatenate and project)
-                euclidean_tokens = sum(dim_embeddings) / D  # [B, L, dim_image] - average of embeddings
-        else:
-            raise ValueError(f"euclidean_tokens must be 2D or 3D, got {euclidean_tokens.dim()}D")
         
-        # Slice or pad positional embedding to match actual sequence length
-        pos_embed_len = self.pos_embed.shape[1]
-        if L <= pos_embed_len:
-            pos_embed_sliced = self.pos_embed[:, :L, :]  # [1, L, dim_image]
-        else:
-            # If sequence is longer than pos_embed, pad by repeating the last position
-            padding = self.pos_embed[:, -1:, :].expand(1, L - pos_embed_len, -1)  # [1, L - pos_embed_len, dim_image]
-            pos_embed_sliced = torch.cat([self.pos_embed, padding], dim=1)  # [1, L, dim_image]
-        euclidean_tokens = euclidean_tokens + pos_embed_sliced
+        D = euclidean_tokens.shape[-1]
+        assert D == self.euclidean_dim, f"Expected euclidean_tokens to have {self.euclidean_dim} dimensions, got {D}"
         
-        cat_tokens = self.text_embedder(cat_tokens) + self.text_pos_embed(positions)
+        # Embed each dimension separately
+        dim_embeddings = []
+        for d in range(D):
+            dim_token = euclidean_tokens[..., d:d+1]  # [B, L, 1]
+            dim_emb = self.gaussian_fourier_projs[d](dim_token)  # [B, L, embedded_dim_per_feature]
+            dim_embeddings.append(dim_emb)
+        
+        # Concatenate all dimension embeddings
+        euclidean_tokens = torch.cat(dim_embeddings, dim=-1)  # [B, L, euclidean_dim * embedded_dim_per_feature]
+        
+        # Project to final embedding dimension
+        euclidean_tokens = self.euclidean_proj(euclidean_tokens)  # [B, L, dim_image]
+        
+        cat_tokens = self.text_embedder(cat_tokens)
         text_time_cond = self.text_time_encoder(text_time_cond)  # [B] -> [B, dim_text]
         image_time_cond = self.image_time_encoder(image_time_cond)  # [B] -> [B, dim_image]
+
+        # Generate rotary positional embeddings for each modality
+        # The Rotary class returns (1, seq_len, 3, 1, dim_head) which is what we need
+        text_cos, text_sin = get_rotary_emb(self.text_rotary, cat_tokens)
+        image_cos, image_sin = get_rotary_emb(self.image_rotary, euclidean_tokens)
+        rotary_pos_emb = ((text_cos, text_sin), (image_cos, image_sin))
 
         text_tokens_hidden, euclidean_tokens_hidden = self.joint_embedding(
             modality_tokens = (cat_tokens, euclidean_tokens),
             modality_masks = (text_mask, image_mask),
             time_cond = (text_time_cond, image_time_cond),
+            rotary_pos_emb = rotary_pos_emb,
         )
         if detach_hidden[0]:
             text_tokens_hidden = text_tokens_hidden.detach()
@@ -292,6 +285,7 @@ class MMDiTQM9(nn.Module):
                 modality_tokens = (text_tokens_hidden,),
                 modality_masks = (text_mask,),
                 time_cond = (text_time_cond,),
+                rotary_pos_emb = ((text_cos, text_sin),),
             )[0]
             cat_tokens = self.text_final_layer(cat_tokens, text_time_cond)
             cat_tokens[:, :, :-1] = cat_tokens[:, :, :-1].log_softmax(dim=-1)
@@ -301,6 +295,7 @@ class MMDiTQM9(nn.Module):
                 modality_tokens = (euclidean_tokens_hidden,),
                 modality_masks = (image_mask,),
                 time_cond = (image_time_cond,),
+                rotary_pos_emb = ((image_cos, image_sin),),
             )[0]
             clean_data_pred = self.image_final_layer(euclidean_tokens, image_time_cond)
             insertion_rate = self.rate_pred(euclidean_tokens, image_time_cond).squeeze(-1)

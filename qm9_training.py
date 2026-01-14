@@ -13,7 +13,7 @@ from custom_datasets.qm9 import QM9Dataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler
-from models.mmdit import MMDiTQM9
+from models.mmdit_qm9 import MMDiTQM9
 from visualize_dataset import plot_sample, plot_molecule
 
 # This makes training on A100s faster
@@ -24,7 +24,7 @@ def init_wandb(opts):
     wandb.init(
         # set the wandb project where this run will be logged
         project='MMDiT-QM9',
-        name= f'{opts.model}-qm9',
+        name= f'qm9-{opts.run_name}',
         tags= ['training'],
         # # track hyperparameters and run metadata
         config=opts,
@@ -57,6 +57,7 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.option('--load_checkpoint',type=str, help='Directory where we can find the desired checkpoints')
 @click.option('--train_only_dsm', is_flag=True, default=False)
 @click.option('--enable_wandb', is_flag=True, default=False)
+@click.option('--run_name', type=str, default='')
 def training(**opts):
     opts = dotdict(opts)
     batch_size = opts.batch_size
@@ -168,9 +169,8 @@ def training(**opts):
                 wandb.log({
                 'loss': loss/world_size,
                 'dsm_loss': losses["dsm_loss"]/world_size,
-                'prediction_loss': losses["prediction_loss"]/world_size,
-                'rate_loss': losses["rate_loss"]/world_size,
-                'euclidean_insertion_loss': losses["euclidean_insertion_loss"]/world_size
+                'tokens_loss': losses["tokens_loss"]/world_size,
+                'insertion_loss': losses["insertion_loss"]/world_size
             })
             dist.barrier(device_ids=[device])
             # Evaluate sample accuracy
