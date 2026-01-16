@@ -8,10 +8,13 @@ import torch.nn.functional as F
 
 @dataclass
 class MultimodalModelPrediction:
+    # This handles denoising
     clean_data: Tensor
-    insertion_logits: Tensor
-    insertion_rate: Tensor
+    # This handles the unmasking
     label_logits: Tensor
+    clean_data_unmasking: Tensor
+    # This handles the insertions
+    insertion_rate: Tensor
 
 @dataclass
 class SamplingTrajectoryResult:
@@ -278,9 +281,16 @@ class MultimodalInterpolant():
         mask_t_shaped = interpolant_sample.mask_t.unsqueeze(-1)
         eos_bos_mask_shaped = eos_bos_mask_t.unsqueeze(-1)
         lengths = interpolant_sample.mask_t.sum(dim=-1, keepdim=True).clamp(min=1)
+
+        masked_positions = (interpolant_sample.yt == self.mask_token)
         
         # Euclidean loss
+        # We must only compute the loss for positions that are:
+        # not deleted: mask_t_shaped
+        # not masked: masked_positions.unsqueeze(-1)
+        # Not padding: ~eos_bos_mask_shaped
         dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * mask_t_shaped * ~eos_bos_mask_shaped
+        dsm_loss = dsm_loss * ~masked_positions.unsqueeze(-1)
         dsm_loss = dsm_loss.sum(dim=-1) / lengths
         dsm_loss = dsm_loss.mean()
         
