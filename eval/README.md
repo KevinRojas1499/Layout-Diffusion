@@ -41,6 +41,24 @@ python eval/test_qm9_distribution.py \
     --output comparison.png \
     --comparison_output results/
 ```
+# Use 20k QM9 samples for stable reference, use all generated samples
+python eval/test_qm9_distribution.py \
+    --n_real_samples 20000 \
+    --generated samples.json \
+    --comparison_output results/
+
+# Use 20k QM9 samples, limit generated to 5k
+python eval/test_qm9_distribution.py \
+    --n_real_samples 20000 \
+    --n_gen_samples 5000 \
+    --generated samples.json \
+    --comparison_output results/
+
+# Backward compatible: use 10k for both
+python eval/test_qm9_distribution.py \
+    --n_samples 10000 \
+    --generated samples.json \
+    --comparison_output results/
 
 #### Arguments
 

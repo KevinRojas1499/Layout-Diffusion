@@ -4,3 +4,4 @@ wandb/
 experiments/
 *.png
 *.json
+results/

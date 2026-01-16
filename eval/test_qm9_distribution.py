@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import matplotlib.pyplot as plt
+from typing import Optional
 from eval.evaluate_distribution import (
     extract_molecules_from_qm9_dataset,
     compute_molecular_fingerprints,
@@ -22,13 +23,18 @@ from custom_datasets.qm9 import QM9Dataset
 from utils.tokenizer import VocabTokenizer
 
 def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distribution_test.png',
-                          generated_file: str = None, comparison_output: str = None):
+                          generated_file: str = None, comparison_output: str = None,
+                          n_real_samples: Optional[int] = None, n_gen_samples: Optional[int] = None):
     """
     Plot QM9 dataset distribution using UMAP.
     
     Args:
-        n_samples: Number of samples to use (default 5000 for quick test)
+        n_samples: Number of samples to use for both (default 10000, used if n_real_samples/n_gen_samples not set)
         output_file: Output file path for the plot
+        generated_file: Path to JSON file with generated molecules (optional)
+        comparison_output: Directory to save full comparison results (optional)
+        n_real_samples: Number of QM9 samples to use (default None = use n_samples, or all if n_samples not set)
+        n_gen_samples: Number of generated samples to use (default None = use all available)
     """
     print("="*60)
     if generated_file:
@@ -43,11 +49,14 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
     dataset = QM9Dataset(tokenizer, max_length=30, canonical_order=True)
     print(f"   Dataset size: {len(dataset)}")
     
+    # Determine how many QM9 samples to use
+    qm9_n_samples = n_real_samples if n_real_samples is not None else n_samples
+    
     # Extract QM9 molecules
-    print(f"\n2. Extracting {n_samples} molecules from QM9 dataset...")
+    print(f"\n2. Extracting {qm9_n_samples} molecules from QM9 dataset...")
     # Use fixed random seed for reproducibility
     real_symbols, real_positions, real_smiles = extract_molecules_from_qm9_dataset(
-        dataset, n_samples=n_samples, random_seed=42
+        dataset, n_samples=qm9_n_samples, random_seed=42
     )
     print(f"   Successfully extracted {len(real_symbols)} valid molecules")
     print(f"   SMILES available for {sum(1 for s in real_smiles if s is not None)} molecules")
@@ -95,11 +104,15 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
     if generated_file and comparison_output:
         print(f"\n5. Running full distribution comparison (paper methodology)...")
         try:
+            # Determine sample counts: use all QM9 we extracted, limit generated if specified
+            gen_n_samples = n_gen_samples if n_gen_samples is not None else len(gen_symbols)
+            
             results = evaluate_molecule_distributions(
                 real_symbols, real_positions,
                 gen_symbols, gen_positions,
                 output_dir=comparison_output,
-                n_samples=min(n_samples, len(gen_symbols)),
+                n_real_samples=None,  # Use all QM9 samples we extracted (already sampled above)
+                n_gen_samples=gen_n_samples,  # Use specified or all generated samples
                 real_smiles=real_smiles,
                 fingerprint_type='morgan',  # Can change to 'rdkit' to match paper exactly
                 random_seed=42  # Fixed seed for reproducibility
@@ -291,12 +304,19 @@ Example usage:
   # Plot QM9 only
   python test_qm9_distribution.py --n_samples 5000
   
-  # Compare generated vs QM9
+  # Compare generated vs QM9 (use same number for both)
   python test_qm9_distribution.py --n_samples 5000 --generated generated_molecules.json --comparison_output results/
+  
+  # Use more QM9 samples for stable reference, fewer generated samples
+  python test_qm9_distribution.py --n_real_samples 20000 --n_gen_samples 5000 --generated generated_molecules.json --comparison_output results/
         """
     )
     parser.add_argument('--n_samples', type=int, default=5000,
-                       help='Number of QM9 samples to use (default: 5000)')
+                       help='Number of samples to use for both QM9 and generated (default: 5000, overridden by --n_real_samples/--n_gen_samples)')
+    parser.add_argument('--n_real_samples', type=int, default=None,
+                       help='Number of QM9 samples to use (default: None = use --n_samples, or all available if not set)')
+    parser.add_argument('--n_gen_samples', type=int, default=None,
+                       help='Number of generated samples to use (default: None = use all available)')
     parser.add_argument('--output', type=str, default='qm9_distribution_test.png',
                        help='Output file path for plot (default: qm9_distribution_test.png)')
     parser.add_argument('--generated', type=str, default=None,
@@ -310,5 +330,7 @@ Example usage:
         n_samples=args.n_samples, 
         output_file=args.output,
         generated_file=args.generated,
-        comparison_output=args.comparison_output
+        comparison_output=args.comparison_output,
+        n_real_samples=args.n_real_samples,
+        n_gen_samples=args.n_gen_samples
     )

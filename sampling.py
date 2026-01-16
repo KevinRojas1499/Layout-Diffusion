@@ -11,11 +11,23 @@ from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from models.mmdit_qm9 import MMDiTQM9
 
+import json
+from json import JSONEncoder
+import re
 
+class MarkedList:
+    _list = None
+    def __init__(self, l):
+        self._list = l
+
+class CustomJSONEncoder(JSONEncoder):
+    def default(self, o):
+        if isinstance(o, MarkedList):
+            return "##<{}>##".format(o._list)
 
 @click.command()
 @click.option('--num_samples', type=int, default=50)
-@click.option('--num_steps', type=int, default=250)
+@click.option('--num_steps', type=int, default=100)
 @click.option('--batch_size', type=int, default=50)
 @click.option('--num_workers',type=int,default=2)
 @click.option('--seed',type=int,default=42)
@@ -92,8 +104,11 @@ def sampling(**opts):
             })
 
             
+    b = json.dumps(output_samples, indent=2, separators=(',', ':'), cls=CustomJSONEncoder)
+    b = b.replace('"##<', "").replace('>##"', "")
     with open(os.path.join(opts.dir, 'samples.json'), 'w') as f:
-        json.dump(output_samples, f, indent=2, separators=(',', ': '))
+        f.write(b)
+
     dist.barrier(device_ids=[device])
     dist.destroy_process_group()
 

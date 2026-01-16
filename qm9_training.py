@@ -45,7 +45,7 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.command()
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
-@click.option('--ema_beta',type=float, default=.999)
+@click.option('--ema_beta',type=float, default=.9999)
 @click.option('--lr', type=float, default=1e-4)
 @click.option('--batch_size', type=int, default=128)
 @click.option('--log_rate',type=int,default=500)
@@ -170,7 +170,8 @@ def training(**opts):
                 'loss': loss/world_size,
                 'dsm_loss': losses["dsm_loss"]/world_size,
                 'tokens_loss': losses["tokens_loss"]/world_size,
-                'insertion_loss': losses["insertion_loss"]/world_size
+                'insertion_loss': losses["insertion_loss"]/world_size,
+                'step': training_iter
             })
             dist.barrier(device_ids=[device])
             # Evaluate sample accuracy

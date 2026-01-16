@@ -15,7 +15,7 @@ import warnings
 
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem
+    from rdkit.Chem import AllChem, Descriptors
     from rdkit import RDLogger
     import warnings
     # Suppress deprecation warnings for GetMorganFingerprintAsBitVect
@@ -282,6 +282,111 @@ def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2,
     return embedding
 
 
+def compute_molecular_properties(symbols_list: List[List[str]], positions_list: List[np.ndarray],
+                                smiles_list: Optional[List[str]] = None) -> dict:
+    """
+    Compute molecular properties for each molecule using RDKit.
+    
+    Properties computed:
+    - mw: Molecular weight
+    - logp: LogP (octanol-water partition coefficient)
+    - hbd: Number of hydrogen-bond donors
+    - hba: Number of hydrogen-bond acceptors
+    
+    Args:
+        symbols_list: List of lists of atomic symbols
+        positions_list: List of numpy arrays of atomic positions
+        smiles_list: Optional list of SMILES strings (preferred for property computation)
+    
+    Returns:
+        Dictionary with keys: 'mw', 'logp', 'hbd', 'hba'
+        Each value is a list of property values for each molecule
+    """
+    if not RDKIT_AVAILABLE:
+        raise ImportError("RDKit is required for molecular property computation")
+    
+    properties = {
+        'mw': [],
+        'logp': [],
+        'hbd': [],
+        'hba': []
+    }
+    
+    failed_count = 0
+    
+    for idx, (symbols, positions) in enumerate(zip(symbols_list, positions_list)):
+        try:
+            # Prefer SMILES if available (more accurate)
+            smiles = smiles_list[idx] if smiles_list and idx < len(smiles_list) else None
+            mol = None
+            
+            if smiles:
+                # Try to create molecule from SMILES
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    # Add hydrogens for accurate property computation
+                    try:
+                        mol = Chem.AddHs(mol)
+                    except:
+                        pass
+            
+            # Fallback to position-based creation if SMILES failed
+            if mol is None:
+                mol = _positions_to_molecule(symbols, positions)
+                if mol is not None:
+                    try:
+                        # Add hydrogens if not already present
+                        mol = Chem.AddHs(mol)
+                    except:
+                        pass
+            
+            if mol is None:
+                failed_count += 1
+                # Append NaN for failed molecules
+                properties['mw'].append(np.nan)
+                properties['logp'].append(np.nan)
+                properties['hbd'].append(np.nan)
+                properties['hba'].append(np.nan)
+                continue
+            
+            # Compute properties
+            try:
+                mw = Descriptors.MolWt(mol)
+                logp = Descriptors.MolLogP(mol)
+                hbd = Descriptors.NumHDonors(mol)
+                hba = Descriptors.NumHAcceptors(mol)
+                
+                properties['mw'].append(mw)
+                properties['logp'].append(logp)
+                properties['hbd'].append(hbd)
+                properties['hba'].append(hba)
+            except Exception as e:
+                failed_count += 1
+                # Append NaN for failed computations
+                properties['mw'].append(np.nan)
+                properties['logp'].append(np.nan)
+                properties['hbd'].append(np.nan)
+                properties['hba'].append(np.nan)
+                if idx < 5:  # Only print first few errors
+                    print(f"Warning: Failed to compute properties for molecule {idx}: {e}")
+                continue
+                
+        except Exception as e:
+            failed_count += 1
+            properties['mw'].append(np.nan)
+            properties['logp'].append(np.nan)
+            properties['hbd'].append(np.nan)
+            properties['hba'].append(np.nan)
+            if idx < 5:
+                print(f"Warning: Error processing molecule {idx}: {e}")
+            continue
+    
+    if failed_count > 0:
+        print(f"Successfully computed properties for {len(symbols_list) - failed_count} molecules ({failed_count} failed)")
+    
+    return properties
+
+
 def compute_atom_counts(symbols_list: List[List[str]]) -> dict:
     """
     Compute atom counts for each molecule.
@@ -344,23 +449,137 @@ def compute_ks_statistic(real_data: np.ndarray, generated_data: np.ndarray) -> f
     
     Returns:
         1 - KSD statistic (higher is better, range [0, 1])
+        Returns np.nan if either dataset is empty or all NaN
     """
+    # Filter out NaN values
+    real_valid = ~np.isnan(real_data)
+    gen_valid = ~np.isnan(generated_data)
+    real_clean = real_data[real_valid]
+    gen_clean = generated_data[gen_valid]
+    
+    if len(real_clean) == 0 or len(gen_clean) == 0:
+        return np.nan
+    
     # Compute empirical CDFs
-    x_real, cdf_real = compute_empirical_cdf(real_data)
-    x_gen, cdf_gen = compute_empirical_cdf(generated_data)
+    x_real, cdf_real = compute_empirical_cdf(real_clean)
+    x_gen, cdf_gen = compute_empirical_cdf(gen_clean)
     
     # Combine all x values and sort
     all_x = np.unique(np.concatenate([x_real, x_gen]))
     all_x = np.sort(all_x)
     
     # Interpolate CDFs at all x values
-    cdf_real_interp = np.array([np.mean(real_data <= x_val) for x_val in all_x])
-    cdf_gen_interp = np.array([np.mean(generated_data <= x_val) for x_val in all_x])
+    cdf_real_interp = np.array([np.mean(real_clean <= x_val) for x_val in all_x])
+    cdf_gen_interp = np.array([np.mean(gen_clean <= x_val) for x_val in all_x])
     
     # Compute maximum difference
     ksd = np.max(np.abs(cdf_real_interp - cdf_gen_interp))
     
     return 1.0 - ksd
+
+
+def plot_distribution_cdfs(real_data_dict: dict, gen_data_dict: dict, 
+                           output_dir: str, ks_stats: Optional[dict] = None,
+                           plot_type: str = 'atom_counts'):
+    """
+    Plot marginal distributions with CDFs for atom counts or molecular properties.
+    
+    Args:
+        real_data_dict: Dictionary of real molecule data (atom counts or properties)
+        gen_data_dict: Dictionary of generated molecule data
+        output_dir: Directory to save plots
+        ks_stats: Optional dictionary of KS statistics
+        plot_type: 'atom_counts' or 'properties' (affects labels and layout)
+    """
+    if plot_type == 'atom_counts':
+        keys = ['total', 'C', 'N', 'O', 'F', 'H']
+        labels = {
+            'total': 'Total Atoms',
+            'C': 'Carbon',
+            'N': 'Nitrogen',
+            'O': 'Oxygen',
+            'F': 'Fluorine',
+            'H': 'Hydrogen'
+        }
+        xlabel_prefix = 'Number of'
+        title_prefix = 'Atom Count'
+        output_file = os.path.join(output_dir, 'atom_count_distributions.png')
+        figsize = (18, 12)
+        nrows, ncols = 2, 3
+    else:  # properties
+        keys = ['mw', 'logp', 'hbd', 'hba']
+        labels = {
+            'mw': 'Molecular Weight',
+            'logp': 'LogP',
+            'hbd': 'H-Bond Donors',
+            'hba': 'H-Bond Acceptors'
+        }
+        xlabel_prefix = ''
+        title_prefix = 'Molecular Property'
+        output_file = os.path.join(output_dir, 'molecular_property_distributions.png')
+        figsize = (16, 10)
+        nrows, ncols = 2, 2
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+    axes = axes.flatten()
+    
+    for idx, key in enumerate(keys):
+        ax = axes[idx]
+        
+        real_data = np.array(real_data_dict[key])
+        gen_data = np.array(gen_data_dict[key])
+        
+        # Filter out NaN values
+        real_valid = ~np.isnan(real_data)
+        gen_valid = ~np.isnan(gen_data)
+        real_data_clean = real_data[real_valid]
+        gen_data_clean = gen_data[gen_valid]
+        
+        if len(real_data_clean) == 0 or len(gen_data_clean) == 0:
+            ax.text(0.5, 0.5, 'No valid data', transform=ax.transAxes,
+                   ha='center', va='center', fontsize=12)
+            ax.set_title(f'{labels[key]} Distribution', fontsize=12, fontweight='bold')
+            continue
+        
+        # Compute CDFs
+        x_real, cdf_real = compute_empirical_cdf(real_data_clean)
+        x_gen, cdf_gen = compute_empirical_cdf(gen_data_clean)
+        
+        # Plot CDFs
+        ax.plot(x_real, cdf_real, label=f'QM9 (n={len(real_data_clean)})', 
+               linewidth=2, color='#2E86AB', alpha=0.8)
+        ax.plot(x_gen, cdf_gen, label=f'Generated (n={len(gen_data_clean)})', 
+               linewidth=2, color='#A23B72', alpha=0.8, linestyle='--')
+        
+        # Add KS statistic if provided
+        if ks_stats and key in ks_stats:
+            ks_val = ks_stats[key]
+            ax.text(0.05, 0.95, f'1-KSD = {ks_val:.3f}', 
+                   transform=ax.transAxes, fontsize=11,
+                   verticalalignment='top', bbox=dict(boxstyle='round', 
+                   facecolor='wheat', alpha=0.5))
+        
+        xlabel = f'{xlabel_prefix} {labels[key]}'.strip()
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel('Cumulative Probability', fontsize=11)
+        ax.set_title(f'{labels[key]} Distribution', 
+                     fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10, loc='lower right')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.05])
+    
+    # Hide unused subplots
+    for idx in range(len(keys), len(axes)):
+        axes[idx].set_visible(False)
+    
+    plt.suptitle(f'{title_prefix} Marginal Distributions (CDFs)', 
+                fontsize=14, fontweight='bold', y=0.995)
+    plt.tight_layout()
+    
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {plot_type} distribution plot to {output_file}")
 
 
 def plot_atom_count_distributions(real_counts: dict, gen_counts: dict, 
@@ -374,60 +593,7 @@ def plot_atom_count_distributions(real_counts: dict, gen_counts: dict,
         output_dir: Directory to save plots
         ks_stats: Optional dictionary of KS statistics for each atom type
     """
-    atom_types = ['total', 'C', 'N', 'O', 'F', 'H']
-    atom_labels = {
-        'total': 'Total Atoms',
-        'C': 'Carbon',
-        'N': 'Nitrogen',
-        'O': 'Oxygen',
-        'F': 'Fluorine',
-        'H': 'Hydrogen'
-    }
-    
-    # Create figure with subplots: 2 rows, 3 columns
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    axes = axes.flatten()
-    
-    for idx, atom_type in enumerate(atom_types):
-        ax = axes[idx]
-        
-        real_data = np.array(real_counts[atom_type])
-        gen_data = np.array(gen_counts[atom_type])
-        
-        # Compute CDFs
-        x_real, cdf_real = compute_empirical_cdf(real_data)
-        x_gen, cdf_gen = compute_empirical_cdf(gen_data)
-        
-        # Plot CDFs
-        ax.plot(x_real, cdf_real, label=f'QM9 (n={len(real_data)})', 
-               linewidth=2, color='#2E86AB', alpha=0.8)
-        ax.plot(x_gen, cdf_gen, label=f'Generated (n={len(gen_data)})', 
-               linewidth=2, color='#A23B72', alpha=0.8, linestyle='--')
-        
-        # Add KS statistic if provided
-        if ks_stats and atom_type in ks_stats:
-            ks_val = ks_stats[atom_type]
-            ax.text(0.05, 0.95, f'1-KSD = {ks_val:.3f}', 
-                   transform=ax.transAxes, fontsize=11,
-                   verticalalignment='top', bbox=dict(boxstyle='round', 
-                   facecolor='wheat', alpha=0.5))
-        
-        ax.set_xlabel(f'Number of {atom_labels[atom_type]}', fontsize=11)
-        ax.set_ylabel('Cumulative Probability', fontsize=11)
-        ax.set_title(f'{atom_labels[atom_type]} Count Distribution', 
-                     fontsize=12, fontweight='bold')
-        ax.legend(fontsize=10, loc='lower right')
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim([0, 1.05])
-    
-    plt.suptitle('Atom Count Marginal Distributions (CDFs)', 
-                fontsize=14, fontweight='bold', y=0.995)
-    plt.tight_layout()
-    
-    output_file = os.path.join(output_dir, 'atom_count_distributions.png')
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved atom count distribution plot to {output_file}")
+    plot_distribution_cdfs(real_counts, gen_counts, output_dir, ks_stats, plot_type='atom_counts')
 
 
 def plot_distribution_comparison(real_embedding: np.ndarray, generated_embedding: np.ndarray,
@@ -510,7 +676,9 @@ def evaluate_molecule_distributions(
     generated_symbols: List[List[str]],
     generated_positions: List[np.ndarray],
     output_dir: str,
-    n_samples: int = 10000,
+    n_samples: Optional[int] = None,
+    n_real_samples: Optional[int] = None,
+    n_gen_samples: Optional[int] = None,
     fingerprint_radius: int = 2,
     fingerprint_bits: int = 2048,
     real_smiles: Optional[List[str]] = None,
@@ -528,7 +696,9 @@ def evaluate_molecule_distributions(
         generated_symbols: List of lists of atomic symbols for generated molecules
         generated_positions: List of numpy arrays of atomic positions for generated molecules
         output_dir: Directory to save plots
-        n_samples: Number of samples to use (default 10000)
+        n_samples: Number of samples to use for both (default None, uses n_real_samples/n_gen_samples)
+        n_real_samples: Number of real samples to use (default None = use all available)
+        n_gen_samples: Number of generated samples to use (default None = use all available)
         fingerprint_radius: Radius for Morgan fingerprint
         fingerprint_bits: Number of bits in fingerprint
         real_smiles: Optional list of SMILES strings for real molecules
@@ -546,20 +716,28 @@ def evaluate_molecule_distributions(
     
     os.makedirs(output_dir, exist_ok=True)
     
+    # Handle backward compatibility: if n_samples is provided, use it for both
+    if n_samples is not None:
+        if n_real_samples is None:
+            n_real_samples = n_samples
+        if n_gen_samples is None:
+            n_gen_samples = n_samples
+    
     # Set random seed for reproducible sampling
     rng = np.random.RandomState(random_seed)
     
-    # Sample if we have more than n_samples
-    if len(real_symbols) > n_samples:
-        indices = rng.choice(len(real_symbols), n_samples, replace=False)
+    # Sample real molecules if n_real_samples is specified
+    if n_real_samples is not None and len(real_symbols) > n_real_samples:
+        indices = rng.choice(len(real_symbols), n_real_samples, replace=False)
         indices = np.sort(indices)  # Sort for consistent ordering
         real_symbols = [real_symbols[i] for i in indices]
         real_positions = [real_positions[i] for i in indices]
         if real_smiles:
             real_smiles = [real_smiles[i] for i in indices]
     
-    if len(generated_symbols) > n_samples:
-        indices = rng.choice(len(generated_symbols), n_samples, replace=False)
+    # Sample generated molecules if n_gen_samples is specified
+    if n_gen_samples is not None and len(generated_symbols) > n_gen_samples:
+        indices = rng.choice(len(generated_symbols), n_gen_samples, replace=False)
         indices = np.sort(indices)  # Sort for consistent ordering
         generated_symbols = [generated_symbols[i] for i in indices]
         generated_positions = [generated_positions[i] for i in indices]
@@ -573,10 +751,24 @@ def evaluate_molecule_distributions(
     real_atom_counts = compute_atom_counts(real_symbols)
     gen_atom_counts = compute_atom_counts(generated_symbols)
     
-    # Compute Kolmogorov-Smirnov statistics for each atom type
-    print("\nComputing Kolmogorov-Smirnov statistics (1-KSD)...")
+    # 2. Compute molecular properties
+    print("\n" + "="*50)
+    print("2. Computing molecular properties...")
+    print("="*50)
+    print("Computing properties for real molecules...")
+    real_properties = compute_molecular_properties(real_symbols, real_positions, smiles_list=real_smiles)
+    print("Computing properties for generated molecules...")
+    gen_properties = compute_molecular_properties(generated_symbols, generated_positions, smiles_list=generated_smiles)
+    
+    # 3. Compute Kolmogorov-Smirnov statistics for all metrics
+    print("\n" + "="*50)
+    print("3. Computing Kolmogorov-Smirnov statistics (1-KSD)...")
+    print("="*50)
     ks_stats = {}
+    
+    # Atom counts
     atom_types = ['total', 'C', 'N', 'O', 'F', 'H']
+    print("\nAtom counts:")
     for atom_type in atom_types:
         real_data = np.array(real_atom_counts[atom_type])
         gen_data = np.array(gen_atom_counts[atom_type])
@@ -584,13 +776,29 @@ def evaluate_molecule_distributions(
         ks_stats[atom_type] = ks_val
         print(f"  {atom_type:>5}: 1-KSD = {ks_val:.4f}")
     
-    # Plot atom count distributions
+    # Molecular properties
+    property_types = ['mw', 'logp', 'hbd', 'hba']
+    print("\nMolecular properties:")
+    for prop_type in property_types:
+        real_data = np.array(real_properties[prop_type])
+        gen_data = np.array(gen_properties[prop_type])
+        ks_val = compute_ks_statistic(real_data, gen_data)
+        ks_stats[prop_type] = ks_val
+        if not np.isnan(ks_val):
+            print(f"  {prop_type:>5}: 1-KSD = {ks_val:.4f}")
+        else:
+            print(f"  {prop_type:>5}: 1-KSD = NaN (insufficient valid data)")
+    
+    # Plot distributions
     print("\nPlotting atom count marginal distributions...")
     plot_atom_count_distributions(real_atom_counts, gen_atom_counts, output_dir, ks_stats)
     
-    # 2. Compute fingerprints and UMAP
+    print("\nPlotting molecular property distributions...")
+    plot_distribution_cdfs(real_properties, gen_properties, output_dir, ks_stats, plot_type='properties')
+    
+    # 4. Compute fingerprints and UMAP
     print("\n" + "="*50)
-    print("2. Computing molecular fingerprints and UMAP embedding...")
+    print("4. Computing molecular fingerprints and UMAP embedding...")
     print("="*50)
     print(f"Using {fingerprint_type} fingerprints...")
     print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
@@ -637,14 +845,53 @@ def evaluate_molecule_distributions(
     print(f"Generated embedding range: X=[{generated_embedding[:, 0].min():.2f}, {generated_embedding[:, 0].max():.2f}], "
           f"Y=[{generated_embedding[:, 1].min():.2f}, {generated_embedding[:, 1].max():.2f}]")
     
-    print("\n" + "="*50)
-    print("Kolmogorov-Smirnov Statistics (1-KSD):")
-    print("="*50)
-    print("Higher values indicate better distribution match (range: 0-1)")
-    for atom_type in atom_types:
-        print(f"  {atom_type:>5}: {ks_stats[atom_type]:.4f}")
-    avg_ks = np.mean(list(ks_stats.values()))
-    print(f"\n  Average: {avg_ks:.4f}")
+    # Print summary table (matching paper format)
+    print("\n" + "="*70)
+    print("Distribution Agreement (1-KSD, higher is better)")
+    print("="*70)
+    print(f"{'Metric':<12} {'1-KSD':>10}")
+    print("-" * 70)
+    
+    # Print in paper order: mw, logp, hbd, hba, C, H, O, N, F, atoms
+    paper_order = ['mw', 'logp', 'hbd', 'hba', 'C', 'H', 'O', 'N', 'F', 'total']
+    paper_labels = {
+        'mw': 'mw', 'logp': 'logp', 'hbd': 'hbd', 'hba': 'hba',
+        'C': 'C', 'H': 'H', 'O': 'O', 'N': 'N', 'F': 'F', 'total': 'atoms'
+    }
+    
+    valid_ks_values = []
+    for metric in paper_order:
+        if metric in ks_stats:
+            ks_val = ks_stats[metric]
+            label = paper_labels.get(metric, metric)
+            if not np.isnan(ks_val):
+                print(f"{label:<12} {ks_val:>10.4f}")
+                valid_ks_values.append(ks_val)
+            else:
+                print(f"{label:<12} {'NaN':>10}")
+    
+    if valid_ks_values:
+        avg_ks = np.mean(valid_ks_values)
+        print("-" * 70)
+        print(f"{'Average':<12} {avg_ks:>10.4f}")
+    
+    # Save summary table to file
+    summary_file = os.path.join(output_dir, 'ks_statistics_summary.txt')
+    with open(summary_file, 'w') as f:
+        f.write("Distribution Agreement (1-KSD, higher is better)\n")
+        f.write("="*70 + "\n")
+        f.write(f"{'Metric':<12} {'1-KSD':>10}\n")
+        f.write("-" * 70 + "\n")
+        for metric in paper_order:
+            if metric in ks_stats:
+                ks_val = ks_stats[metric]
+                label = paper_labels.get(metric, metric)
+                if not np.isnan(ks_val):
+                    f.write(f"{label:<12} {ks_val:>10.4f}\n")
+        if valid_ks_values:
+            f.write("-" * 70 + "\n")
+            f.write(f"{'Average':<12} {avg_ks:>10.4f}\n")
+    print(f"\nSummary saved to {summary_file}")
     
     return {
         'real_fingerprints': real_fps,
@@ -653,7 +900,9 @@ def evaluate_molecule_distributions(
         'generated_embedding': generated_embedding,
         'ks_statistics': ks_stats,
         'real_atom_counts': real_atom_counts,
-        'generated_atom_counts': gen_atom_counts
+        'generated_atom_counts': gen_atom_counts,
+        'real_properties': real_properties,
+        'generated_properties': gen_properties
     }
 
 
