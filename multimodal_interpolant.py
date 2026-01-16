@@ -107,7 +107,9 @@ class MultimodalInterpolant():
         max_length: int,
         linear_start: float = 0.00085,
         linear_end: float = 0.0120,
+        delta : float = .9999,
         train_only_dsm : bool = False,
+        non_special_tokens: int = 5,
         vocab_size: int = 10000,
         mask_token: int = 10000,
         pad_token: int = 10001,
@@ -120,12 +122,14 @@ class MultimodalInterpolant():
         self.euclidean_dim = euclidean_dim
         self.linear_start = linear_start
         self.linear_end = linear_end
+        self.delta = delta
         self.train_only_dsm = train_only_dsm
         self.vocab_size = vocab_size
         self.mask_token = mask_token
         self.pad_token = pad_token
         self.bos_token = bos_token
         self.eos_token = eos_token
+        self.non_special_tokens = non_special_tokens
 
     def beta(self, t):
         return 500 * (self.linear_start**.5 * (1-t) + t * self.linear_end**.5)**2
@@ -142,14 +146,26 @@ class MultimodalInterpolant():
         big_beta = self.beta_int(t)
         return (1 - torch.exp(-2 * big_beta))**.5
     
-    def deletion_time(self, t: Tensor, x0: Tensor, masking_time: Tensor) -> Tensor:
-        deletion_time = masking_time + torch.rand_like(x0, dtype=torch.float32) * (1 - masking_time)
+    def alpha(self, t):
+        return self.delta/(1-self.delta * t)
+    
+    def gamma(self, t):
+        return self.delta/(1-self.delta * t)
+    
+    def alpha_bar(self, t):
+        return -torch.log1p(-self.delta * t)
+    
+    def prob_mask(self, t):
+        # return torch.exp(-self.alpha_bar(t))
+        return 1 - self.delta * t
 
-        return deletion_time
-
-    def masking_time(self, t: Tensor, x0: Tensor) -> Tensor:
-        masking_time = torch.rand_like(x0, dtype=torch.float32)
-        return masking_time
+    def get_masking_and_deletion_time(self, y0):
+        u1 = torch.rand_like(y0, dtype=torch.float32)
+        masking_time = (1-u1) / self.delta
+        u2 = torch.rand_like(y0, dtype=torch.float32)
+        # deletion_time = (1 - u2 * (1-self.delta * masking_time)) / self.delta
+        deletion_time = (1 - u1 * u2) / self.delta
+        return masking_time, deletion_time
 
     def pad_sequence(self, x: Tensor, y: Tensor, mask: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         mask_shaped = mask.unsqueeze(-1).expand(-1, -1, x.shape[-1])
@@ -172,26 +188,29 @@ class MultimodalInterpolant():
 
         return x, y, mask, eos_bos_mask
 
-    def sample_interpolant(self, t: Tensor, x0: Tensor, y0: Tensor,mask_0: Tensor, eos_bos_mask: Tensor) -> JointMultimodalInterpolantResult:
-        t = t.view(-1,1,1)
+    def sample_interpolant(self, t: Tensor, x0: Tensor, y0: Tensor,attn_mask: Tensor, eos_bos_mask: Tensor) -> JointMultimodalInterpolantResult:
+        t_shaped_disc = t.view(-1,1).expand(-1, y0.shape[1])
+        t_shaped_euc = t.view(-1,1,1).expand(-1, x0.shape[1], x0.shape[2])
+
         # Add noise to euclidean data
-        full_xt = self.scale(t) * x0 + self.sigma(t) * torch.randn_like(x0)
-        mask_shaped = mask_0.unsqueeze(-1).expand(-1, -1, full_xt.shape[-1])
-        full_xt = full_xt * mask_shaped
+        full_xt = self.scale(t_shaped_euc) * x0 + self.sigma(t_shaped_euc) * torch.randn_like(x0)
+        full_xt = full_xt * attn_mask.unsqueeze(-1)
         eos_bos_mask_shaped = eos_bos_mask.unsqueeze(-1).expand(-1, -1, full_xt.shape[-1])
         full_xt = torch.where(eos_bos_mask_shaped, torch.zeros_like(full_xt), full_xt)
 
         # Masking data
-        masking_time = self.masking_time(t, y0) 
-        t_shaped = t.view(-1,1).expand(-1, full_xt.shape[1])
-        yt = torch.where(t_shaped >= masking_time, y0, self.mask_token) # Change to mask id
-        deletion_time = self.deletion_time(t, y0, masking_time)
-        new_mask = mask_0 & (t_shaped < deletion_time) & ((t_shaped < deletion_time) | (t_shaped >= masking_time))
-        new_mask = new_mask | eos_bos_mask
+        # Deletion and masking times are independent for every position, thats why we pass y0
+        masking_time, deletion_time = self.get_masking_and_deletion_time(y0)
 
-        t_big = t.view(-1,1,1).expand(-1, full_xt.shape[1], full_xt.shape[2])
-        masking_time_big = masking_time.unsqueeze(-1).expand(-1, -1, full_xt.shape[2])
-        full_xt = torch.where(t_big >= masking_time_big, full_xt, 0.) # Change to mask id
+        # Discrete data
+        yt = torch.where(t_shaped_disc >= masking_time, self.mask_token, y0) # Change to mask id
+
+        # Euclidean data
+        full_xt = torch.where(t_shaped_euc >= masking_time.unsqueeze(-1), 0., full_xt) # Change to mask id
+
+        # Set up attention mask of deleted data
+        new_mask = attn_mask & (t_shaped_disc < deletion_time)
+        new_mask = new_mask | eos_bos_mask
 
         # Reorder the data according to the active positions
         st = self.get_st(new_mask)
@@ -222,8 +241,7 @@ class MultimodalInterpolant():
         return y_safe - x_safe + x_safe * (torch.log(x_safe) - torch.log(y_safe))
  
     def sample_time(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        eps = 1e-5
-        return torch.rand(batch_size, device=device) * (1 - eps) + eps
+        return torch.rand(batch_size, device=device)
     
     def get_st(self, mask_t: Tensor) -> Tensor:
         return mask_t.argsort(dim=1, descending=True, stable=True)
