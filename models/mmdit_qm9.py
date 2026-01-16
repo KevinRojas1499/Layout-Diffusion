@@ -210,30 +210,31 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 class MMDiTQM9(nn.Module):
-    def __init__(self, euclidean_dim, text_vocab_size, context_len, text_depth, image_depth, project_hidden=False, **kwargs):
+    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, **kwargs):
         super().__init__()
         self.euclidean_dim = euclidean_dim
+        self.vocab_size = vocab_size
         self.dim_modalities = kwargs['dim_modalities']
         self.dim_conds = kwargs['dim_conds']
-        self.dim_text = self.dim_modalities[0]
-        self.dim_image = self.dim_modalities[1]
+        self.dim_symbols = self.dim_modalities[0]
+        self.dim_positions = self.dim_modalities[1]
 
         # Extract attention parameters for rotary embeddings
         self.dim_head = kwargs.get('dim_head', 64)
         self.heads = kwargs.get('heads', 8)
 
         # Time Encoders
-        self.text_time_encoder = TimestepEmbedder(self.dim_text)
-        self.image_time_encoder = TimestepEmbedder(self.dim_image)
+        self.symbols_time_encoder = TimestepEmbedder(self.dim_symbols)
+        self.positions_time_encoder = TimestepEmbedder(self.dim_positions)
 
         # Text Embeddings
-        self.text_embedder = nn.Embedding(text_vocab_size, self.dim_text)
+        self.symbols_embedder = nn.Embedding(vocab_size, self.dim_symbols)
 
         # Euclidean Embeddings        # Handle multi-dimensional coordinates [B, L, D] where D is the feature dimension
         # Each dimension is embedded separately using GaussianFourierProjection
         # Then combined and projected to dim_image
         # Each dimension gets embedded_dim features, so total is euclidean_dim * embedded_dim
-        self.embedded_dim_per_feature = self.dim_image // euclidean_dim
+        self.embedded_dim_per_feature = self.dim_positions // euclidean_dim
         self.gaussian_fourier_projs = nn.ModuleList([
             GaussianFourierProjection(self.embedded_dim_per_feature, scale=1.0)
             for _ in range(euclidean_dim)
@@ -241,11 +242,11 @@ class MMDiTQM9(nn.Module):
         # Project the concatenated embeddings to dim_image
         # Total embedding size after concatenation: euclidean_dim * embedded_dim_per_feature
         total_embed_dim = euclidean_dim * self.embedded_dim_per_feature
-        self.euclidean_proj = nn.Linear(total_embed_dim, self.dim_image)
+        self.euclidean_proj = nn.Linear(total_embed_dim, self.dim_positions)
 
         # Rotary Positional Embeddings
-        self.text_rotary = Rotary(dim=self.dim_head, base=10_000)
-        self.image_rotary = Rotary(dim=self.dim_head, base=10_000)
+        self.symbols_rotary = Rotary(dim=self.dim_head, base=10_000)
+        self.positions_rotary = Rotary(dim=self.dim_head, base=10_000)
 
         # Pairwise spatial attention biases (layer-specific, head-specific)
         # We'll get depth from kwargs
@@ -262,25 +263,16 @@ class MMDiTQM9(nn.Module):
         self.joint_embedding = MMDiT(**kwargs)
 
         # Single Embeddings
-        self.has_text = text_depth > 0
-        self.has_image = image_depth > 0
         sep_keys = ['depth', 'dim_modalities', 'dim_conds']
         block_kwargs = {k: v for k, v in kwargs.items() if k not in sep_keys}
-        if self.has_text:
-            self.text_dit = MMDiT(depth = text_depth, dim_modalities = [self.dim_text], dim_conds = [self.dim_text], **block_kwargs)
-        else:
-            self.freeze_last_block(0)
-        if self.has_image:
-            self.image_dit = MMDiT(depth = image_depth, dim_modalities = [self.dim_image], dim_conds = [self.dim_image], **block_kwargs)
-        else:
-            self.freeze_last_block(1)
+        self.symbols_dit = MMDiT(depth = symbols_depth, dim_modalities = [self.dim_symbols], dim_conds = [self.dim_symbols], **block_kwargs)
+        self.positions_dit = MMDiT(depth = positions_depth, dim_modalities = [self.dim_positions], dim_conds = [self.dim_positions], **block_kwargs)
 
         # Final Layers
-        self.rate_pred = FinalLayer(self.dim_image, 1)
-        if self.has_text:
-            self.text_final_layer = FinalLayer(self.dim_text, text_vocab_size)
-        if self.has_image:
-            self.image_final_layer = FinalLayer(self.dim_image, euclidean_dim)
+        self.insertion_rate_pred = FinalLayer(self.dim_positions, 1)
+        self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
+        self.positions_pred_layer = FinalLayer(self.dim_positions, euclidean_dim)
+        self.positions_unmask_pred = FinalLayer(self.dim_positions, euclidean_dim * vocab_size)
 
 
     def freeze_last_block(self, idx):
@@ -298,21 +290,21 @@ class MMDiTQM9(nn.Module):
             param.requires_grad = False
     
     def freeze_joint(self):
-        layers_to_freeze = [self.text_embedder, self.text_time_encoder, 
-                            self.image_embedder, self.image_time_encoder,
+        layers_to_freeze = [self.symbols_embedder, self.symbols_time_encoder, 
+                            self.image_embedder, self.positions_time_encoder,
                             self.joint_embedding]
         for layer in layers_to_freeze:
             for param in layer.parameters():
                 param.requires_grad = False
 
     def freeze_image(self):
-        layers_to_freeze = [self.image_embedder, self.image_time_encoder, self.image_dit, self.image_final_layer]
+        layers_to_freeze = [self.image_embedder, self.positions_time_encoder, self.positions_dit, self.positions_pred_layer]
         for layer in layers_to_freeze:
             for param in layer.parameters():
                 param.requires_grad = False
     
     def freeze_text(self):
-        layers_to_freeze = [self.text_embedder, self.text_time_encoder, self.text_dit, self.text_final_layer]
+        layers_to_freeze = [self.symbols_embedder, self.symbols_time_encoder, self.symbols_dit, self.symbols_pred_layer]
         for layer in layers_to_freeze:
             for param in layer.parameters():
                 param.requires_grad = False
@@ -363,14 +355,14 @@ class MMDiTQM9(nn.Module):
         # Project to final embedding dimension
         euclidean_tokens = self.euclidean_proj(euclidean_tokens)  # [B, L, dim_image]
         
-        cat_tokens = self.text_embedder(cat_tokens)
-        text_time_cond = self.text_time_encoder(text_time_cond)  # [B] -> [B, dim_text]
-        image_time_cond = self.image_time_encoder(image_time_cond)  # [B] -> [B, dim_image]
+        cat_tokens = self.symbols_embedder(cat_tokens)
+        text_time_cond = self.symbols_time_encoder(text_time_cond)  # [B] -> [B, dim_text]
+        image_time_cond = self.positions_time_encoder(image_time_cond)  # [B] -> [B, dim_image]
 
         # Generate rotary positional embeddings for each modality
         # The Rotary class returns (1, seq_len, 3, 1, dim_head) which is what we need
-        text_cos, text_sin = get_rotary_emb(self.text_rotary, cat_tokens)
-        image_cos, image_sin = get_rotary_emb(self.image_rotary, euclidean_tokens)
+        text_cos, text_sin = get_rotary_emb(self.symbols_rotary, cat_tokens)
+        image_cos, image_sin = get_rotary_emb(self.positions_rotary, euclidean_tokens)
         rotary_pos_emb = ((text_cos, text_sin), (image_cos, image_sin))
 
         # Compute pairwise spatial attention biases for each layer
@@ -398,32 +390,34 @@ class MMDiTQM9(nn.Module):
         if detach_hidden[1]:
             euclidean_tokens_hidden = euclidean_tokens_hidden.detach()
 
-        if self.has_text:
-            cat_tokens = self.text_dit(
-                modality_tokens = (text_tokens_hidden,),
-                modality_masks = (text_mask,),
-                time_cond = (text_time_cond,),
-                rotary_pos_emb = ((text_cos, text_sin),),
-            )[0]
-            cat_tokens = self.text_final_layer(cat_tokens, text_time_cond)
-            cat_tokens[:, :, :-1] = cat_tokens[:, :, :-1].log_softmax(dim=-1)
+        cat_tokens = self.symbols_dit(
+            modality_tokens = (text_tokens_hidden,),
+            modality_masks = (text_mask,),
+            time_cond = (text_time_cond,),
+            rotary_pos_emb = ((text_cos, text_sin),),
+        )[0]
 
-        if self.has_image:
-            euclidean_tokens = self.image_dit(
-                modality_tokens = (euclidean_tokens_hidden,),
-                modality_masks = (image_mask,),
-                time_cond = (image_time_cond,),
-                rotary_pos_emb = ((image_cos, image_sin),),
-            )[0]
-            clean_data_pred = self.image_final_layer(euclidean_tokens, image_time_cond)
-            insertion_rate = self.rate_pred(euclidean_tokens, image_time_cond).squeeze(-1)
-            insertion_rate = F.softplus(insertion_rate)
+        # Predict unmasking probabilities for symbols
+        cat_tokens = self.symbols_pred_layer(cat_tokens, text_time_cond)
+
+        euclidean_tokens = self.positions_dit(
+            modality_tokens = (euclidean_tokens_hidden,),
+            modality_masks = (image_mask,),
+            time_cond = (image_time_cond,),
+            rotary_pos_emb = ((image_cos, image_sin),),
+        )[0]
+        # Clean data prediction
+        clean_data_pred = self.positions_pred_layer(euclidean_tokens, image_time_cond)
+        # Clean data prediction for the insertion
+        clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, image_time_cond).view(B, L, self.vocab_size, self.euclidean_dim)
+        # Insertion rate prediction
+        insertion_rate = self.insertion_rate_pred(euclidean_tokens, image_time_cond).squeeze(-1)
 
 
         return MultimodalModelPrediction(
             clean_data=clean_data_pred,
-            insertion_rate=insertion_rate,
             label_logits=cat_tokens,
-            insertion_logits=None
+            insertion_rate=insertion_rate,
+            clean_data_unmasking=clean_data_unmasking
         )
 
