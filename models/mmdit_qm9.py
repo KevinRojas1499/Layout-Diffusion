@@ -422,8 +422,7 @@ class MMDiTQM9(nn.Module):
         else:
             # If no mask, use simple average
             insertion_rate = insertion_rate_per_pos.mean(dim=1)
-        # Insertion probability prediction - aggregate from [B, L, 1] to [B, 1, 1]
-        insertion_prob = self.insertion_prob_pred(euclidean_tokens, pos_time).squeeze(-1)
+        insertion_prob = self.insertion_prob_pred(euclidean_tokens, pos_time).squeeze(-1).log_softmax(dim=-1)
 
         return MultimodalModelPrediction(
             clean_data=clean_data_pred,

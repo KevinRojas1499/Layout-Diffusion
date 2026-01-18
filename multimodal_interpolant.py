@@ -295,7 +295,8 @@ class MultimodalInterpolant():
         dsm_loss = dsm_loss.mean()
         # Insertion loss
         # TODO: Still need to move this to the new loss
-        score = prediction.insertion_prob * prediction.insertion_rate
+        log_score = prediction.insertion_prob + prediction.insertion_rate
+        score = log_score.exp()
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
         insertion_loss = self.jump_kernel_elbo(
             gaps[gaps_mask], score[gaps_mask]
@@ -333,13 +334,10 @@ class MultimodalInterpolant():
         return - (xt - clean_data * self.scale(t).view(-1, 1, 1)) / self.sigma(t).view(-1, 1, 1)**2
     
     def get_insertion_rate(self, prediction: MultimodalModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
-        lambda_t = self.beta(t).view(-1, 1)
-        predicted_rate = prediction.insertion_rate
+        alpha_t = self.alpha(t).view(-1, 1)
+        rate = (prediction.insertion_prob + prediction.insertion_rate).exp()
 
-        # Subtracting 2 because we are not considering the start and end of sequence tokens
-        rate = lambda_t * predicted_rate
-
-        return rate
+        return alpha_t * rate
     
     def get_unmasking_rate(self, prediction: MultimodalModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
         lambda_t = self.beta(t).view(-1, 1)
@@ -404,11 +402,12 @@ class MultimodalInterpolant():
             # Unmasking
             dist = prediction.label_logits[:, :, :self.vocab_size]
             new_sample = sample_categorical(dist.softmax(dim=-1), method="hard")  # [batch, seq_len]
+            indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
+            mean_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
 
             change_pos = (unmasking_nums > 0) & (mask_t == True) & (yt == self.mask_token)
-            new_xt = torch.exp(-beta_int) * prediction.clean_data + torch.sqrt(1 - torch.exp(-2 * beta_int)) * torch.rand_like(xt)
+            new_xt = torch.exp(-beta_int) * mean_cond_y0 + torch.sqrt(1 - torch.exp(-2 * beta_int)) * torch.rand_like(xt)
             xt[change_pos] = new_xt[change_pos]
-
             yt[change_pos] = new_sample[change_pos]
 
 
