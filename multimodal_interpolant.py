@@ -161,7 +161,14 @@ class MultimodalInterpolant():
     
     def prob_mask(self, t):
         # return torch.exp(-self.alpha_bar(t))
-        return 1 - self.delta * t
+        return (1 - self.delta * t) * torch.log(1 - self.delta * t)
+    
+    def prob_empty(self, t):
+        return self.delta * t - self.prob_mask(t)
+    
+    def get_w(self, t):
+        t = t.clamp(min=1e-5)
+        return (1-self.prob_empty(t)) / self.prob_empty(t) * self.prob_mask(t)
 
     def get_masking_and_deletion_time(self, y0):
         u1 = torch.rand_like(y0, dtype=torch.float32)
@@ -259,8 +266,6 @@ class MultimodalInterpolant():
             index_shape = list(st.shape) + [1] * (xt.dim() - 2)
             st_expanded = st.view(*index_shape).expand_as(xt)
             return torch.gather(xt, 1, st_expanded)
-    
-
     def compute_loss(self, model, batch):
         _x0 = batch["x"]
         _y0 = batch["y"]
@@ -296,13 +301,11 @@ class MultimodalInterpolant():
         # Insertion loss
         # TODO: Still need to move this to the new loss
         log_score = prediction.insertion_prob + prediction.insertion_rate
-        score = log_score.exp()
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
-        insertion_loss = self.jump_kernel_elbo(
-            gaps[gaps_mask], score[gaps_mask]
-        )
-        insertion_loss = insertion_loss.sum(dim=-1) / lengths.sum()
-
+        weights = self.get_w(t).view(-1, 1)
+        insertion_loss = self.jump_kernel_elbo(weights, log_score.exp())
+        insertion_loss = insertion_loss * gaps
+        insertion_loss = insertion_loss[gaps_mask].mean()
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
@@ -313,9 +316,9 @@ class MultimodalInterpolant():
 
         # Predicted euclidean loss
         # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y0 is [B, L] with vocab indices
-        y0_indices = y0.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x0.shape[-1])  # [B, L] -> [B, L, 1, D]
+        y0_indices = interpolant_sample.y0_ordered.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x0.shape[-1])  # [B, L] -> [B, L, 1, D]
         predicted_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=y0_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
-        euclidean_loss = (predicted_cond_y0 - x0)**2
+        euclidean_loss = (predicted_cond_y0 - interpolant_sample.x0_ordered)**2
         euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
         euclidean_loss = euclidean_loss.mean()
 
