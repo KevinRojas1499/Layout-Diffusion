@@ -139,7 +139,7 @@ def training(**opts):
             opt.zero_grad()
             
             losses = interpolant.compute_loss(model, data_)
-            loss = losses["dsm_loss"] + losses["tokens_loss"] + losses["insertion_loss"]
+            loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["euclidean_unmasking_loss"] + losses["insertion_loss"]
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -163,12 +163,13 @@ def training(**opts):
             
             
             if rank == 0:
-                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Tokens Loss: {losses["tokens_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
+                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Unmasking Loss: {losses["euclidean_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
             if wandb_enabled:
                 wandb.log({
                 'loss': loss/world_size,
                 'dsm_loss': losses["dsm_loss"]/world_size,
-                'tokens_loss': losses["tokens_loss"]/world_size,
+                'discrete_unmasking_loss': losses["discrete_unmasking_loss"]/world_size,
+                'euclidean_unmasking_loss': losses["euclidean_unmasking_loss"]/world_size,
                 'insertion_loss': losses["insertion_loss"]/world_size,
                 'step': training_iter
             })

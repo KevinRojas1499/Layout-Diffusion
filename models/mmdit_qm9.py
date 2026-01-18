@@ -269,7 +269,8 @@ class MMDiTQM9(nn.Module):
         self.positions_dit = MMDiT(depth = positions_depth, dim_modalities = [self.dim_positions], dim_conds = [self.dim_positions], **block_kwargs)
 
         # Final Layers
-        self.insertion_rate_pred = FinalLayer(self.dim_positions, 1)
+        self.insertion_rate = FinalLayer(self.dim_positions, 1)
+        self.insertion_prob_pred = FinalLayer(self.dim_positions, 1)
         self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
         self.positions_pred_layer = FinalLayer(self.dim_positions, euclidean_dim)
         self.positions_unmask_pred = FinalLayer(self.dim_positions, euclidean_dim * vocab_size)
@@ -314,10 +315,10 @@ class MMDiTQM9(nn.Module):
         *,
         cat_tokens,
         euclidean_tokens,
-        text_mask = None,
-        image_mask = None,
-        image_time_cond = None,
-        text_time_cond = None,
+        symbols_mask = None,
+        pos_mask = None,
+        pos_time = None,
+        symbols_time = None,
         detach_hidden = [False, False]
     ):
         # Shapes will be:
@@ -356,8 +357,8 @@ class MMDiTQM9(nn.Module):
         euclidean_tokens = self.euclidean_proj(euclidean_tokens)  # [B, L, dim_image]
         
         cat_tokens = self.symbols_embedder(cat_tokens)
-        text_time_cond = self.symbols_time_encoder(text_time_cond)  # [B] -> [B, dim_text]
-        image_time_cond = self.positions_time_encoder(image_time_cond)  # [B] -> [B, dim_image]
+        symbols_time = self.symbols_time_encoder(symbols_time)  # [B] -> [B, dim_text]
+        pos_time = self.positions_time_encoder(pos_time)  # [B] -> [B, dim_image]
 
         # Generate rotary positional embeddings for each modality
         # The Rotary class returns (1, seq_len, 3, 1, dim_head) which is what we need
@@ -372,7 +373,7 @@ class MMDiTQM9(nn.Module):
         spatial_biases = []
         for layer_idx in range(depth):
             # Compute spatial bias for this layer: (B, H, L, L)
-            spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=image_mask)
+            spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=pos_mask)
             spatial_biases.append(spatial_bias)
         
         # Format: (None for text, spatial_bias for image) for each layer
@@ -380,8 +381,8 @@ class MMDiTQM9(nn.Module):
 
         text_tokens_hidden, euclidean_tokens_hidden = self.joint_embedding(
             modality_tokens = (cat_tokens, euclidean_tokens),
-            modality_masks = (text_mask, image_mask),
-            time_cond = (text_time_cond, image_time_cond),
+            modality_masks = (symbols_mask, pos_mask),
+            time_cond = (symbols_time, pos_time),
             rotary_pos_emb = rotary_pos_emb,
             attn_bias = attn_biases,
         )
@@ -392,32 +393,43 @@ class MMDiTQM9(nn.Module):
 
         cat_tokens = self.symbols_dit(
             modality_tokens = (text_tokens_hidden,),
-            modality_masks = (text_mask,),
-            time_cond = (text_time_cond,),
+            modality_masks = (symbols_mask,),
+            time_cond = (symbols_time,),
             rotary_pos_emb = ((text_cos, text_sin),),
         )[0]
 
         # Predict unmasking probabilities for symbols
-        cat_tokens = self.symbols_pred_layer(cat_tokens, text_time_cond)
+        cat_tokens = self.symbols_pred_layer(cat_tokens, symbols_time)
 
         euclidean_tokens = self.positions_dit(
             modality_tokens = (euclidean_tokens_hidden,),
-            modality_masks = (image_mask,),
-            time_cond = (image_time_cond,),
+            modality_masks = (pos_mask,),
+            time_cond = (pos_time,),
             rotary_pos_emb = ((image_cos, image_sin),),
         )[0]
         # Clean data prediction
-        clean_data_pred = self.positions_pred_layer(euclidean_tokens, image_time_cond)
+        clean_data_pred = self.positions_pred_layer(euclidean_tokens, pos_time)
         # Clean data prediction for the insertion
-        clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, image_time_cond).view(B, L, self.vocab_size, self.euclidean_dim)
+        clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
         # Insertion rate prediction
-        insertion_rate = self.insertion_rate_pred(euclidean_tokens, image_time_cond).squeeze(-1)
-
+        insertion_rate_per_pos = self.insertion_rate(euclidean_tokens, pos_time)  # [B, L, 1]
+        if pos_mask is not None:
+            # image_mask: [B, L], insertion_rate_per_pos: [B, L, 1]
+            mask_expanded = pos_mask.unsqueeze(-1).float()  # [B, L, 1] - convert bool to float
+            masked_sum = (insertion_rate_per_pos * mask_expanded).sum(dim=1)
+            mask_count = mask_expanded.sum(dim=1).clamp(min=1)
+            insertion_rate = masked_sum / mask_count
+        else:
+            # If no mask, use simple average
+            insertion_rate = insertion_rate_per_pos.mean(dim=1)
+        # Insertion probability prediction - aggregate from [B, L, 1] to [B, 1, 1]
+        insertion_prob = self.insertion_prob_pred(euclidean_tokens, pos_time).squeeze(-1)
 
         return MultimodalModelPrediction(
             clean_data=clean_data_pred,
             label_logits=cat_tokens,
             insertion_rate=insertion_rate,
+            insertion_prob=insertion_prob,
             clean_data_unmasking=clean_data_unmasking
         )
 

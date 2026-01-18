@@ -15,6 +15,7 @@ class MultimodalModelPrediction:
     clean_data_unmasking: Tensor
     # This handles the insertions
     insertion_rate: Tensor
+    insertion_prob: Tensor
 
 @dataclass
 class SamplingTrajectoryResult:
@@ -264,7 +265,6 @@ class MultimodalInterpolant():
         _x0 = batch["x"]
         _y0 = batch["y"]
         _mask_0 = batch["mask"]
-
         x0, y0, mask_0, eos_bos_mask = self.pad_sequence(_x0, _y0, _mask_0)
         t = self.sample_time(_x0.shape[0], _x0.device)
         interpolant_sample = self.sample_interpolant(t, x0, y0, mask_0, eos_bos_mask)
@@ -273,10 +273,10 @@ class MultimodalInterpolant():
         prediction: MultimodalModelPrediction = model(
             euclidean_tokens=interpolant_sample.xt,
             cat_tokens=interpolant_sample.yt,
-            text_mask=interpolant_sample.mask_t,
-            image_mask=interpolant_sample.mask_t,
-            text_time_cond=t,
-            image_time_cond=t
+            symbols_mask=interpolant_sample.mask_t,
+            pos_mask=interpolant_sample.mask_t,
+            symbols_time=t,
+            pos_time=t
         )
         mask_t_shaped = interpolant_sample.mask_t.unsqueeze(-1)
         eos_bos_mask_shaped = eos_bos_mask_t.unsqueeze(-1)
@@ -293,30 +293,36 @@ class MultimodalInterpolant():
         dsm_loss = dsm_loss * ~masked_positions.unsqueeze(-1)
         dsm_loss = dsm_loss.sum(dim=-1) / lengths
         dsm_loss = dsm_loss.mean()
-        
-
         # Insertion loss
+        # TODO: Still need to move this to the new loss
+        score = prediction.insertion_prob * prediction.insertion_rate
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
         insertion_loss = self.jump_kernel_elbo(
-            gaps[gaps_mask], prediction.insertion_rate[gaps_mask]
+            gaps[gaps_mask], score[gaps_mask]
         )
         insertion_loss = insertion_loss.sum(dim=-1) / lengths.sum()
+
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
-        batch_size, seq_len, num_classes = prediction.label_logits.shape
-        logits_flat = prediction.label_logits.view(-1, num_classes)
-        targets_flat = interpolant_sample.y0_ordered.view(-1).long()
+        logits_flat = prediction.label_logits[masked_positions]
+        targets_flat = interpolant_sample.y0_ordered[masked_positions]
         tokens_loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none")
-        # Reshape back to [batch, seq_len]
-        tokens_loss = tokens_loss_flat.view(batch_size, seq_len)
-        tokens_loss = tokens_loss * interpolant_sample.mask_t # Only consider the valid tokens
-        tokens_loss = tokens_loss.sum(dim=-1) / lengths
-        tokens_loss = tokens_loss.mean()
+        tokens_loss = tokens_loss_flat.mean()
+
+        # Predicted euclidean loss
+        # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y0 is [B, L] with vocab indices
+        y0_indices = y0.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x0.shape[-1])  # [B, L] -> [B, L, 1, D]
+        predicted_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=y0_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
+        euclidean_loss = (predicted_cond_y0 - x0)**2
+        euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
+        euclidean_loss = euclidean_loss.mean()
+
 
         return {
             "dsm_loss": dsm_loss,
-            "tokens_loss": tokens_loss,
+            "discrete_unmasking_loss": tokens_loss,
+            "euclidean_unmasking_loss": euclidean_loss,
             "insertion_loss": insertion_loss,
         }
     
@@ -376,10 +382,10 @@ class MultimodalInterpolant():
             prediction: MultimodalModelPrediction = model(
                 cat_tokens=yt,
                 euclidean_tokens=xt,
-                text_mask=mask_t,
-                image_mask=mask_t,
-                text_time_cond=t,
-                image_time_cond=t
+                symbols_mask=mask_t,
+                pos_mask=mask_t,
+                symbols_time=t,
+                pos_time=t
             )
             # Denoise
             score = self.get_score(prediction, xt, t)
