@@ -305,7 +305,7 @@ class MultimodalInterpolant():
         weights = self.get_w(t).view(-1, 1)
         insertion_loss = self.jump_kernel_elbo(weights, log_score.exp())
         insertion_loss = insertion_loss * gaps
-        insertion_loss = insertion_loss[gaps_mask].mean()
+        insertion_loss = insertion_loss[gaps_mask].sum() / y0.shape[0]
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
@@ -320,7 +320,7 @@ class MultimodalInterpolant():
         predicted_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=y0_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
         euclidean_loss = (predicted_cond_y0 - interpolant_sample.x0_ordered)**2
         euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
-        euclidean_loss = euclidean_loss.mean()
+        euclidean_loss = euclidean_loss.mean() / x0.shape[-1]
 
 
         return {

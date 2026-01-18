@@ -185,11 +185,13 @@ def training(**opts):
 
                 samples = interpolant.euclidean_sampling(model, 50, 5, dataset.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
-                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
-                    symbols = character_tokenizer.decode(sample.yt.cpu())
-                    positions = sample.xt.cpu()[1:len(symbols)+1, :]
-                    plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
-                    
+                    try:
+                        plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                        symbols = character_tokenizer.decode(sample.yt.cpu())
+                        positions = sample.xt.cpu()[1:len(symbols)+1, :]
+                        plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
+                    except Exception as e:
+                        print(f'Error plotting sample {i}')
                     # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
                     # pbar = tqdm(enumerate(sample.trajectory), leave=False)
 
