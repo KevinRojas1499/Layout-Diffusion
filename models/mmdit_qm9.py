@@ -270,7 +270,6 @@ class MMDiTQM9(nn.Module):
 
         # Final Layers
         self.insertion_rate = FinalLayer(self.dim_positions, 1)
-        self.insertion_prob_pred = FinalLayer(self.dim_positions, 1)
         self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
         self.positions_pred_layer = FinalLayer(self.dim_positions, euclidean_dim)
         self.positions_unmask_pred = FinalLayer(self.dim_positions, euclidean_dim * vocab_size)
@@ -399,7 +398,7 @@ class MMDiTQM9(nn.Module):
         )[0]
 
         # Predict unmasking probabilities for symbols
-        cat_tokens = self.symbols_pred_layer(cat_tokens, symbols_time)
+        label_logits = self.symbols_pred_layer(cat_tokens, symbols_time)
 
         euclidean_tokens = self.positions_dit(
             modality_tokens = (euclidean_tokens_hidden,),
@@ -412,23 +411,19 @@ class MMDiTQM9(nn.Module):
         # Clean data prediction for the insertion
         clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
         # Insertion rate prediction
-        insertion_rate_per_pos = self.insertion_rate(euclidean_tokens, pos_time)  # [B, L, 1]
+        # TODO : Maybe the insertion rate could use both cat tokens and euclidean ones
+        insertion_rate = self.insertion_rate(cat_tokens, pos_time).squeeze(-1)  # [B, L, 1]
+        # Mask invalid positions by setting them to large negative value before log_softmax
+        # This ensures they get effectively zero probability after exp()
         if pos_mask is not None:
-            # image_mask: [B, L], insertion_rate_per_pos: [B, L, 1]
-            mask_expanded = pos_mask.unsqueeze(-1).float()  # [B, L, 1] - convert bool to float
-            masked_sum = (insertion_rate_per_pos * mask_expanded).sum(dim=1)
-            mask_count = mask_expanded.sum(dim=1).clamp(min=1)
-            insertion_rate = masked_sum / mask_count
-        else:
-            # If no mask, use simple average
-            insertion_rate = insertion_rate_per_pos.mean(dim=1)
-        insertion_prob = self.insertion_prob_pred(euclidean_tokens, pos_time).squeeze(-1).log_softmax(dim=-1)
+            insertion_rate = insertion_rate.masked_fill(~pos_mask, float('-inf'))
+            insertion_rate[:,0] = float('-inf') # We are modeling insertion to the left, so we can't do it for the first position
+        insertion_rate = F.softplus(insertion_rate)
 
         return MultimodalModelPrediction(
             clean_data=clean_data_pred,
-            label_logits=cat_tokens,
+            label_logits=label_logits,
             insertion_rate=insertion_rate,
-            insertion_prob=insertion_prob,
             clean_data_unmasking=clean_data_unmasking
         )
 

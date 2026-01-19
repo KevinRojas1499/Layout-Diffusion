@@ -15,7 +15,6 @@ class MultimodalModelPrediction:
     clean_data_unmasking: Tensor
     # This handles the insertions
     insertion_rate: Tensor
-    insertion_prob: Tensor
 
 @dataclass
 class SamplingTrajectoryResult:
@@ -75,26 +74,17 @@ class JointMultimodalInterpolantResult:
 
     @property
     def gaps_and_mask(self) -> tuple[Tensor, Tensor]:
-        x0_len = self.mask_t.sum(dim=-1)
         gaps = self.st.clone()
 
-        pad_back = gaps.new_zeros((gaps.shape[0], 1))
-        gaps = torch.cat([gaps, pad_back], dim=1)  # Add a leading zero
-
-        xt_length = self.mask_t.sum(dim=-1)
-        gaps.scatter_(
-            1, xt_length.unsqueeze(1) + 1, x0_len.unsqueeze(1)
-        )  # Fill the last position with x1_len
 
         gaps = gaps[:, 1:] - gaps[:, :-1] - 1
         gaps = torch.clamp(gaps, min=0)
-
-        idx = torch.arange(gaps.size(1), device=self.xt.device).unsqueeze(
+        idx = torch.arange(self.st.shape[1], device=self.xt.device).unsqueeze(
             0
         )  # shape [1, max_gap]
-        mask = idx <= xt_length.unsqueeze(1)
+        mask = idx < self.mask_t.sum(dim=-1).unsqueeze(1)
+        gaps = torch.cat([torch.zeros_like(gaps[:, :1]), gaps], dim=1)
         gaps[~mask] = 0
-
         return gaps, mask
 
 def sample_categorical(categorical_probs, method="hard"):
@@ -161,14 +151,19 @@ class MultimodalInterpolant():
     
     def prob_mask(self, t):
         # return torch.exp(-self.alpha_bar(t))
-        return (1 - self.delta * t) * torch.log(1 - self.delta * t)
+        return -(1 - self.delta * t) * torch.log1p(-self.delta * t)
     
     def prob_empty(self, t):
-        return self.delta * t - self.prob_mask(t)
+        return self.delta * t + (1-self.delta * t) * torch.log1p(-self.delta * t)
     
     def get_w(self, t):
-        t = t.clamp(min=1e-5)
-        return (1-self.prob_empty(t)) / self.prob_empty(t) * self.prob_mask(t)
+        t = t.clamp(min=1e-5, max=1.0 - 1e-5)  # Clamp t to avoid edge cases
+        prob_empty = self.prob_empty(t).clamp(min=1e-8, max=1.0 - 1e-8)
+        prob_mask = self.prob_mask(t).clamp(min=1e-8)  # Ensure prob_mask is positive
+        
+        # Compute in log-space
+        log_w = torch.log(prob_mask) + torch.log1p(-prob_empty) - torch.log(prob_empty)
+        return torch.exp(log_w)
 
     def get_masking_and_deletion_time(self, y0):
         u1 = torch.rand_like(y0, dtype=torch.float32)
@@ -214,10 +209,11 @@ class MultimodalInterpolant():
         masking_time, deletion_time = self.get_masking_and_deletion_time(y0)
 
         # Discrete data
-        yt = torch.where(t_shaped_disc >= masking_time, self.mask_token, y0) # Change to mask id
+        mask_positions = (t_shaped_disc >= masking_time) & attn_mask
+        yt = torch.where(mask_positions, self.mask_token, y0) # Change to mask id
 
         # Euclidean data
-        full_xt = torch.where(t_shaped_euc >= masking_time.unsqueeze(-1), 0., full_xt) # Change to mask id
+        full_xt = torch.where(mask_positions.unsqueeze(-1), 0., full_xt) # Change to mask id
 
         # Set up attention mask of deleted data
         new_mask = attn_mask & (t_shaped_disc < deletion_time)
@@ -231,7 +227,7 @@ class MultimodalInterpolant():
         mask_t = self.get_active_positions(new_mask, st) # This will reorder the mask according to the new order
         x0_ordered = self.get_active_positions(x0, st)
         eos_bos_mask_ordered = self.get_active_positions(eos_bos_mask, st)
-        st[:,0] = -1 # Small hack to make the cum sums work nicely
+
         return JointMultimodalInterpolantResult(
             xt=xt, yt=yt, st=st, mask_t=mask_t, t=t, x0=x0, 
             x0_ordered=x0_ordered, 
@@ -252,7 +248,8 @@ class MultimodalInterpolant():
         return y_safe - x_safe + x_safe * (torch.log(x_safe) - torch.log(y_safe))
  
     def sample_time(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.rand(batch_size, device=device)
+        eps = 1e-5
+        return torch.rand(batch_size, device=device) * (1 - eps) + eps
     
     def get_st(self, mask_t: Tensor) -> Tensor:
         return mask_t.argsort(dim=1, descending=True, stable=True)
@@ -266,6 +263,7 @@ class MultimodalInterpolant():
             index_shape = list(st.shape) + [1] * (xt.dim() - 2)
             st_expanded = st.view(*index_shape).expand_as(xt)
             return torch.gather(xt, 1, st_expanded)
+
     def compute_loss(self, model, batch):
         _x0 = batch["x"]
         _y0 = batch["y"]
@@ -295,17 +293,13 @@ class MultimodalInterpolant():
         # not masked: masked_positions.unsqueeze(-1)
         # Not padding: ~eos_bos_mask_shaped
         dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * mask_t_shaped * ~eos_bos_mask_shaped
-        dsm_loss = dsm_loss * ~masked_positions.unsqueeze(-1)
-        dsm_loss = dsm_loss.sum(dim=-1) / lengths
-        dsm_loss = dsm_loss.mean()
+        dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions]
+        dsm_loss = dsm_loss.mean() / x0.shape[-1]
         # Insertion loss
-        # TODO: Still need to move this to the new loss
-        log_score = prediction.insertion_prob + prediction.insertion_rate
+        insertion_rate = prediction.insertion_rate
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
-        weights = self.get_w(t).view(-1, 1)
-        insertion_loss = self.jump_kernel_elbo(weights, log_score.exp())
-        insertion_loss = insertion_loss * gaps
-        insertion_loss = insertion_loss[gaps_mask].sum() / y0.shape[0]
+        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
+        insertion_loss = insertion_loss.sum() / (y0.shape[0] * self.max_length)
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
@@ -333,19 +327,18 @@ class MultimodalInterpolant():
     def get_score(self, prediction: MultimodalModelPrediction, xt: Tensor, t: Tensor) -> Tensor:
         clean_data = prediction.clean_data 
         # clean_data = torch.arange(clean_data.shape[1], device=clean_data.device).repeat(clean_data.shape[0], 1)
-        # Isolating score effect
         return - (xt - clean_data * self.scale(t).view(-1, 1, 1)) / self.sigma(t).view(-1, 1, 1)**2
     
     def get_insertion_rate(self, prediction: MultimodalModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
-        alpha_t = self.alpha(t).view(-1, 1)
-        rate = (prediction.insertion_prob + prediction.insertion_rate).exp()
+        gamma_t = self.gamma(t).view(-1, 1)
+        rate = prediction.insertion_rate
 
-        return alpha_t * rate
+        return gamma_t * rate
     
     def get_unmasking_rate(self, prediction: MultimodalModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
-        lambda_t = self.beta(t).view(-1, 1)
-        big_beta = self.beta_int(t).view(-1, 1)
-        return 1/(torch.exp(big_beta) - 1) * lambda_t
+        alpha_t = self.alpha(t).view(-1, 1)
+        alpha_bar = self.alpha_bar(t).view(-1, 1)
+        return 1/(torch.exp(alpha_bar) - 1) * alpha_t
     
     def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tensor:
         xt = torch.zeros((batch_size, max_length + 2, self.euclidean_dim), device=device)
@@ -389,6 +382,7 @@ class MultimodalInterpolant():
                 pos_time=t
             )
             # Denoise
+            # This has a mistake, it currently denoises positions that are masked
             score = self.get_score(prediction, xt, t)
             beta = self.beta(t).view(-1, 1, 1)
             beta_int = self.beta_int(t).view(-1, 1, 1)
@@ -409,14 +403,14 @@ class MultimodalInterpolant():
             mean_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
 
             change_pos = (unmasking_nums > 0) & (mask_t == True) & (yt == self.mask_token)
-            new_xt = torch.exp(-beta_int) * mean_cond_y0 + torch.sqrt(1 - torch.exp(-2 * beta_int)) * torch.rand_like(xt)
+            new_xt = torch.exp(-beta_int) * mean_cond_y0 + torch.sqrt(1 - torch.exp(-2 * beta_int)) * torch.randn_like(xt)
             xt[change_pos] = new_xt[change_pos]
             yt[change_pos] = new_sample[change_pos]
 
 
             # Perform insertions
             insertion_rate = self.get_insertion_rate(prediction, mask_t, t)
-            ext = torch.bernoulli((insertion_rate * dt).clamp(0.0, 1.0)).long()  # (B, L) where L is seq_len after padding
+            ext = torch.distributions.poisson.Poisson(insertion_rate * dt).sample().floor().long()
 
             seq_len = xt.shape[1]  # After padding, this is max_length + 2
             if i != steps - 1:
@@ -427,11 +421,12 @@ class MultimodalInterpolant():
                     for k in range(seq_len):
                         if not mask_t[j, k]:
                             break
-                        # Insert new token before position k if ext[j, k-1] == 1 (for k > 0)
-                        # insertion_rate[:, k-1] represents the rate for inserting before position k
-                        if k > 0 and ext[j, k-1] == 1:
+                        # Insert new token after position k if ext[j, k] == 1 (for k > 0)
+                        if k > 0 and ext[j, k] > 0:
                             new_sample = torch.zeros_like(xt[0, :1, :])
-                            new_xt_j.append(new_sample)
+                            # for _ in range(ext[j, k]):
+                            # We should only insert one token at a time
+                            new_xt_j.append(new_sample.clone())
                             new_yt_j.append(self.mask_token)
                         # Always append the current token at position k
                         new_xt_j.append(xt[j, k:k+1, :])
