@@ -10,6 +10,7 @@ from custom_datasets.qm9 import QM9Dataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from models.mmdit_qm9 import MMDiTQM9
+from visualize_dataset import plot_sample, plot_molecule
 
 import json
 from json import JSONEncoder
@@ -102,6 +103,16 @@ def sampling(**opts):
                 'positions': positions.tolist()
             })
 
+        # for i, sample in enumerate(samples):
+        #     path = os.path.join(opts.dir, f'samples/')
+        #     os.makedirs(path, exist_ok=True)
+        #     try:
+        #         plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+        #         symbols = character_tokenizer.decode(sample.yt.cpu())
+        #         positions = sample.xt.cpu()[1:len(symbols)+1, :]
+        #         plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
+        #     except Exception as e:
+        #         print(f'Error plotting sample {i}')
             
     b = json.dumps(output_samples, indent=2, separators=(',', ':'), cls=CustomJSONEncoder)
     b = b.replace('"##<', "").replace('>##"', "")

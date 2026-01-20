@@ -3,7 +3,7 @@ from torch import Tensor
 from dataclasses import dataclass
 from typing import List, Iterator, Tuple
 import torch.nn.functional as F
-
+from tqdm import tqdm
 
 
 @dataclass
@@ -101,7 +101,7 @@ class MultimodalInterpolant():
         max_length: int,
         linear_start: float = 0.00085,
         linear_end: float = 0.0120,
-        delta : float = .9999,
+        delta : float = .999,
         train_only_dsm : bool = False,
         non_special_tokens: int = 5,
         vocab_size: int = 10000,
@@ -298,14 +298,15 @@ class MultimodalInterpolant():
         # Insertion loss
         insertion_rate = prediction.insertion_rate
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
-        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
+        alpha_t = self.alpha(t).view(-1, 1).expand(-1, gaps.shape[1])
+        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask]) * alpha_t[gaps_mask]
         insertion_loss = insertion_loss.sum() / (y0.shape[0] * self.max_length)
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
         logits_flat = prediction.label_logits[masked_positions]
         targets_flat = interpolant_sample.y0_ordered[masked_positions]
-        tokens_loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none")
+        tokens_loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none") * alpha_t[masked_positions]
         tokens_loss = tokens_loss_flat.mean()
 
         # Predicted euclidean loss
@@ -338,7 +339,7 @@ class MultimodalInterpolant():
     def get_unmasking_rate(self, prediction: MultimodalModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
         alpha_t = self.alpha(t).view(-1, 1)
         alpha_bar = self.alpha_bar(t).view(-1, 1)
-        return 1/(torch.exp(alpha_bar) - 1) * alpha_t
+        return torch.exp(-alpha_bar)/(self.prob_mask(t).view(-1, 1)) * alpha_t
     
     def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tensor:
         xt = torch.zeros((batch_size, max_length + 2, self.euclidean_dim), device=device)
@@ -372,7 +373,7 @@ class MultimodalInterpolant():
             trajectory.append(SamplingTrajectoryResult(
                 xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
             ))
-        for i in range(steps):
+        for i in tqdm(range(steps), leave=False):
             prediction: MultimodalModelPrediction = model(
                 cat_tokens=yt,
                 euclidean_tokens=xt,
@@ -382,13 +383,14 @@ class MultimodalInterpolant():
                 pos_time=t
             )
             # Denoise
-            # This has a mistake, it currently denoises positions that are masked
+            masked_positions = (yt == self.mask_token)
             score = self.get_score(prediction, xt, t)
             beta = self.beta(t).view(-1, 1, 1)
             beta_int = self.beta_int(t).view(-1, 1, 1)
             mask_shaped = mask_t.unsqueeze(-1).expand(-1, -1, xt.shape[-1])
             eos_bos_mask_shaped = eos_bos_mask.unsqueeze(-1).expand(-1, -1, xt.shape[-1])
             xt = xt + (beta * (xt + score) * dt) * mask_shaped * ~eos_bos_mask_shaped
+            xt = torch.where(masked_positions.unsqueeze(-1), 0., xt)
 
             unmasking_rate = self.get_unmasking_rate(prediction, mask_t, t)
             # Expand unmasking_rate to match sequence length: [batch, 1] -> [batch, seq_len]
@@ -402,7 +404,7 @@ class MultimodalInterpolant():
             indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
             mean_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
 
-            change_pos = (unmasking_nums > 0) & (mask_t == True) & (yt == self.mask_token)
+            change_pos = (unmasking_nums > 0) & (mask_t == True) & (masked_positions)
             new_xt = torch.exp(-beta_int) * mean_cond_y0 + torch.sqrt(1 - torch.exp(-2 * beta_int)) * torch.randn_like(xt)
             xt[change_pos] = new_xt[change_pos]
             yt[change_pos] = new_sample[change_pos]
@@ -424,8 +426,6 @@ class MultimodalInterpolant():
                         # Insert new token after position k if ext[j, k] == 1 (for k > 0)
                         if k > 0 and ext[j, k] > 0:
                             new_sample = torch.zeros_like(xt[0, :1, :])
-                            # for _ in range(ext[j, k]):
-                            # We should only insert one token at a time
                             new_xt_j.append(new_sample.clone())
                             new_yt_j.append(self.mask_token)
                         # Always append the current token at position k
