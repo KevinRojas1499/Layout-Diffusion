@@ -2,3 +2,6 @@
 .venv/
 wandb/
 experiments/
+*.png
+*.json
+results/

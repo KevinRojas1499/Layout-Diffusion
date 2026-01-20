@@ -97,8 +97,18 @@ class VocabTokenizer():
         
         return torch.tensor(tokens, dtype=torch.long)
 
-    def decode(self, tokens: Tensor) -> str:
-        return ''.join([self.idx_to_atom[token.item()] for token in tokens])
+    def decode(self, tokens: Tensor, skip_special_tokens: bool = True) -> str:
+        # Multi-line for readability
+        return ''.join([
+            self.idx_to_atom[token.item()]
+            for token in tokens
+            if not (skip_special_tokens and token.item() in [
+                self.pad_token_id,
+                self.mask_token_id,
+                self.eos_token_id,
+                self.bos_token_id
+            ])
+        ])
     
     def add_token(self, token: str):
         """

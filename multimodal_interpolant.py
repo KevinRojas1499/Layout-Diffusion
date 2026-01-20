@@ -2,17 +2,19 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass
 from typing import List, Iterator, Tuple
-from utils.tokenizer import IntervalTokenizer
 import torch.nn.functional as F
-
+from tqdm import tqdm
 
 
 @dataclass
 class MultimodalModelPrediction:
+    # This handles denoising
     clean_data: Tensor
-    insertion_logits: Tensor
-    insertion_rate: Tensor
+    # This handles the unmasking
     label_logits: Tensor
+    clean_data_unmasking: Tensor
+    # This handles the insertions
+    insertion_rate: Tensor
 
 @dataclass
 class SamplingTrajectoryResult:
@@ -68,34 +70,61 @@ class JointMultimodalInterpolantResult:
     x0_ordered: Tensor
     y0_ordered: Tensor
     yt_original_order: Tensor
+    eos_bos_mask_t: Tensor
+
+    @property
+    def gaps_and_mask(self) -> tuple[Tensor, Tensor]:
+        gaps = self.st.clone()
 
 
+        gaps = gaps[:, 1:] - gaps[:, :-1] - 1
+        gaps = torch.clamp(gaps, min=0)
+        idx = torch.arange(self.st.shape[1], device=self.xt.device).unsqueeze(
+            0
+        )  # shape [1, max_gap]
+        mask = idx < self.mask_t.sum(dim=-1).unsqueeze(1)
+        gaps = torch.cat([torch.zeros_like(gaps[:, :1]), gaps], dim=1)
+        gaps[~mask] = 0
+        return gaps, mask
+
+def sample_categorical(categorical_probs, method="hard"):
+    if method == "hard":
+        gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()
+        return (categorical_probs / gumbel_norm).argmax(dim=-1)
+    else:
+        raise ValueError(f"Method {method} for sampling categorical variables is not valid.")
 
 
 class MultimodalInterpolant():
     def __init__(
         self,
         max_length: int,
-        interval_tokenizer: IntervalTokenizer,
         linear_start: float = 0.00085,
         linear_end: float = 0.0120,
+        delta : float = .999,
         train_only_dsm : bool = False,
+        non_special_tokens: int = 5,
         vocab_size: int = 10000,
         mask_token: int = 10000,
         pad_token: int = 10001,
         bos_token: int = 10002,
         eos_token: int = 10003,
+        euclidean_dim: int = 3,
     ):
         super().__init__()
+        self.max_length = max_length
+        self.euclidean_dim = euclidean_dim
         self.linear_start = linear_start
         self.linear_end = linear_end
+        self.delta = delta
         self.train_only_dsm = train_only_dsm
-        self.tokenizer = interval_tokenizer
         self.vocab_size = vocab_size
         self.mask_token = mask_token
         self.pad_token = pad_token
         self.bos_token = bos_token
         self.eos_token = eos_token
+        self.non_special_tokens = non_special_tokens
+
     def beta(self, t):
         return 500 * (self.linear_start**.5 * (1-t) + t * self.linear_end**.5)**2
 
@@ -111,17 +140,42 @@ class MultimodalInterpolant():
         big_beta = self.beta_int(t)
         return (1 - torch.exp(-2 * big_beta))**.5
     
-    def deletion_time(self, t: Tensor, x0: Tensor, masking_time: Tensor) -> Tensor:
-        deletion_time = masking_time + torch.rand_like(x0) * (1 - masking_time)
+    def alpha(self, t):
+        return self.delta/(1-self.delta * t)
+    
+    def gamma(self, t):
+        return self.delta/(1-self.delta * t)
+    
+    def alpha_bar(self, t):
+        return -torch.log1p(-self.delta * t)
+    
+    def prob_mask(self, t):
+        # return torch.exp(-self.alpha_bar(t))
+        return -(1 - self.delta * t) * torch.log1p(-self.delta * t)
+    
+    def prob_empty(self, t):
+        return self.delta * t + (1-self.delta * t) * torch.log1p(-self.delta * t)
+    
+    def get_w(self, t):
+        t = t.clamp(min=1e-5, max=1.0 - 1e-5)  # Clamp t to avoid edge cases
+        prob_empty = self.prob_empty(t).clamp(min=1e-8, max=1.0 - 1e-8)
+        prob_mask = self.prob_mask(t).clamp(min=1e-8)  # Ensure prob_mask is positive
+        
+        # Compute in log-space
+        log_w = torch.log(prob_mask) + torch.log1p(-prob_empty) - torch.log(prob_empty)
+        return torch.exp(log_w)
 
-        return deletion_time
-
-    def masking_time(self, t: Tensor, x0: Tensor) -> Tensor:
-        masking_time = torch.rand_like(x0)
-        return masking_time
+    def get_masking_and_deletion_time(self, y0):
+        u1 = torch.rand_like(y0, dtype=torch.float32)
+        masking_time = (1-u1) / self.delta
+        u2 = torch.rand_like(y0, dtype=torch.float32)
+        # deletion_time = (1 - u2 * (1-self.delta * masking_time)) / self.delta
+        deletion_time = (1 - u1 * u2) / self.delta
+        return masking_time, deletion_time
 
     def pad_sequence(self, x: Tensor, y: Tensor, mask: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        x = torch.where(mask, x, torch.zeros_like(x)) # This is to represent the end of the sequence with zeros
+        mask_shaped = mask.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+        x = torch.where(mask_shaped, x, torch.zeros_like(x)) # This is to represent the end of the sequence with zeros
         y = torch.where(mask, y, torch.full_like(y, self.pad_token))
         # Add at the start of the sequence
         x = torch.cat([torch.zeros_like(x[:, :1]), x], dim=1)
@@ -140,26 +194,39 @@ class MultimodalInterpolant():
 
         return x, y, mask, eos_bos_mask
 
-    def sample_interpolant(self, t: Tensor, x0: Tensor, y0: Tensor,mask_0: Tensor, eos_bos_mask: Tensor) -> JointMultimodalInterpolantResult:
-        t = t.view(-1,1)
-        full_xt = self.scale(t) * x0 + self.sigma(t) * torch.randn_like(x0)
-        full_xt = full_xt * mask_0
-        full_xt = torch.where(eos_bos_mask, torch.zeros_like(full_xt), full_xt)
+    def sample_interpolant(self, t: Tensor, x0: Tensor, y0: Tensor,attn_mask: Tensor, eos_bos_mask: Tensor) -> JointMultimodalInterpolantResult:
+        t_shaped_disc = t.view(-1,1).expand(-1, y0.shape[1])
+        t_shaped_euc = t.view(-1,1,1).expand(-1, x0.shape[1], x0.shape[2])
 
-        masking_time = self.masking_time(t, x0) # This is for the text modality, but I am using x0 for dtype 
-        yt = torch.where(t < masking_time, y0, self.vocab_size) # Change to mask id
-        t_shaped = t.expand(-1, full_xt.shape[1])
-        deletion_time = self.deletion_time(t, x0, masking_time)
-        new_mask = mask_0 & (t_shaped < deletion_time) & ((t_shaped < deletion_time) | (t_shaped >= masking_time))
+        # Add noise to euclidean data
+        full_xt = self.scale(t_shaped_euc) * x0 + self.sigma(t_shaped_euc) * torch.randn_like(x0)
+        full_xt = full_xt * attn_mask.unsqueeze(-1)
+        eos_bos_mask_shaped = eos_bos_mask.unsqueeze(-1).expand(-1, -1, full_xt.shape[-1])
+        full_xt = torch.where(eos_bos_mask_shaped, torch.zeros_like(full_xt), full_xt)
+
+        # Masking data
+        # Deletion and masking times are independent for every position, thats why we pass y0
+        masking_time, deletion_time = self.get_masking_and_deletion_time(y0)
+
+        # Discrete data
+        mask_positions = (t_shaped_disc >= masking_time) & attn_mask
+        yt = torch.where(mask_positions, self.mask_token, y0) # Change to mask id
+
+        # Euclidean data
+        full_xt = torch.where(mask_positions.unsqueeze(-1), 0., full_xt) # Change to mask id
+
+        # Set up attention mask of deleted data
+        new_mask = attn_mask & (t_shaped_disc < deletion_time)
         new_mask = new_mask | eos_bos_mask
 
+        # Reorder the data according to the active positions
         st = self.get_st(new_mask)
         xt = self.get_active_positions(full_xt, st)
         yt = self.get_active_positions(yt, st)
         y0_reordered = self.get_active_positions(y0, st)
         mask_t = self.get_active_positions(new_mask, st) # This will reorder the mask according to the new order
         x0_ordered = self.get_active_positions(x0, st)
-        st[:,0] = -1 # Small hack to make the cum sums work nicely
+        eos_bos_mask_ordered = self.get_active_positions(eos_bos_mask, st)
 
         return JointMultimodalInterpolantResult(
             xt=xt, yt=yt, st=st, mask_t=mask_t, t=t, x0=x0, 
@@ -167,9 +234,19 @@ class MultimodalInterpolant():
             xt_original_order=full_xt, 
             mask_original_order=new_mask, 
             y0_ordered=y0_reordered,
-            yt_original_order=yt
+            yt_original_order=yt,
+            eos_bos_mask_t=eos_bos_mask_ordered
         )
-    
+
+    # TODO: check if this formulation is correct
+    def jump_kernel_elbo(self, x, y, eps=1e-6):
+        # x_safe: true length
+        # y_safe: predicted length
+        x_safe = torch.clamp(x, min=eps)
+        y_safe = torch.clamp(y, min=eps)
+
+        return y_safe - x_safe + x_safe * (torch.log(x_safe) - torch.log(y_safe))
+ 
     def sample_time(self, batch_size: int, device: torch.device) -> torch.Tensor:
         eps = 1e-5
         return torch.rand(batch_size, device=device) * (1 - eps) + eps
@@ -178,144 +255,94 @@ class MultimodalInterpolant():
         return mask_t.argsort(dim=1, descending=True, stable=True)
     
     def get_active_positions(self, xt: Tensor, st: Tensor) -> Tensor:
-        return torch.gather(xt, 1, st)
-    
-    def interval_mixture(self, probs: torch.Tensor, st: torch.Tensor) -> torch.Tensor:
-        """
-        probs: [B, D, K]  (densities on K-grid for each of D dims)
-        st:    [B, D]     (partially ordered indices with a "reset")
-
-        returns:
-        mixture: [B, D, K], where mixture[:, d, :] = average of probs over
-                i in [st[:, d]+1, st[:, d+1]-1] for d in the first increasing run,
-                else 0.
-        """
-        B, D, K = probs.shape
-        assert st.shape == (B, D)
-
-        # Pairs that are strictly increasing
-        # st = torch.cat([st, -torch.ones_like(st[:, :1]) * D], dim=1)
-        inc = st[:, 1:] > st[:, :-1]          # [B, D-1]
-
-        # Keep only the first increasing prefix
-        prefix = torch.cumprod(inc.to(torch.int64), dim=1).to(torch.bool)  # [B, D-1]
-
-        start = st[:, :-1] + 1   # [B, D-1]
-        end   = st[:, 1:]  - 1   # [B, D-1]
-
-        nonempty = end >= start
-        mask = prefix & nonempty  # [B, D-1]
-
-        # Interval lengths (clamp to 1 so empty intervals are safe)
-        lengths = (end - start + 1).clamp(min=1)  # [B, D-1]
-
-        # Range-sum over dim=1 using cumsum
-        cs = probs.cumsum(dim=1)  # [B, D, K]
-        cs_pad = torch.cat(
-            [torch.zeros(B, 1, K, device=probs.device, dtype=probs.dtype), cs],
-            dim=1
-        )  # [B, D+1, K]
-        start_cl = start.clamp(0, D)
-        endp1_cl = (end + 1).clamp(0, D)
-
-        start_idx = start_cl.unsqueeze(-1).expand(-1, -1, K)
-        endp1_idx = endp1_cl.unsqueeze(-1).expand(-1, -1, K)
-
-        interval_sum = cs_pad.gather(1, endp1_idx) - cs_pad.gather(1, start_idx)
-        interval_sum = interval_sum * mask.unsqueeze(-1)
-
-        # Divide by interval length
-        interval_avg = interval_sum / lengths.unsqueeze(-1)
-
-        # Put into [B, D, K]
-        mixture = probs.new_zeros(B, D, K)
-        mixture[:, :-1, :] = interval_avg
-        return mixture
+        if xt.dim() == 2:
+            return torch.gather(xt, 1, st)
+        else:
+            # Expand st to match xt's shape along all dimensions except dimension 1
+            # st: [B, L] -> [B, L, 1, 1, ...] to match xt: [B, L, D, ...]
+            index_shape = list(st.shape) + [1] * (xt.dim() - 2)
+            st_expanded = st.view(*index_shape).expand_as(xt)
+            return torch.gather(xt, 1, st_expanded)
 
     def compute_loss(self, model, batch):
-        _x0 = batch["data"]
-        _y0 = batch["label"]
+        _x0 = batch["x"]
+        _y0 = batch["y"]
         _mask_0 = batch["mask"]
-
         x0, y0, mask_0, eos_bos_mask = self.pad_sequence(_x0, _y0, _mask_0)
         t = self.sample_time(_x0.shape[0], _x0.device)
         interpolant_sample = self.sample_interpolant(t, x0, y0, mask_0, eos_bos_mask)
+        eos_bos_mask_t = interpolant_sample.eos_bos_mask_t
 
         prediction: MultimodalModelPrediction = model(
             euclidean_tokens=interpolant_sample.xt,
             cat_tokens=interpolant_sample.yt,
-            text_mask=interpolant_sample.mask_t,
-            image_mask=interpolant_sample.mask_t,
-            text_time_cond=t,
-            image_time_cond=t
+            symbols_mask=interpolant_sample.mask_t,
+            pos_mask=interpolant_sample.mask_t,
+            symbols_time=t,
+            pos_time=t
         )
+        mask_t_shaped = interpolant_sample.mask_t.unsqueeze(-1)
+        eos_bos_mask_shaped = eos_bos_mask_t.unsqueeze(-1)
+        lengths = interpolant_sample.mask_t.sum(dim=-1, keepdim=True).clamp(min=1)
 
-        lengths = (interpolant_sample.mask_t.sum(dim=-1) - 2).clamp(min=1) # Subtracting 2 because we are not considering the end of sequence token and the start of sequence token
-        dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * interpolant_sample.mask_t * ~eos_bos_mask
-        dsm_loss = dsm_loss.sum(dim=-1) / lengths
-        dsm_loss = dsm_loss.mean()
+        masked_positions = (interpolant_sample.yt == self.mask_token)
         
-        means = (self.scale(t).view(-1, 1) * interpolant_sample.x0).unsqueeze(-1)
-        variances = self.sigma(t).view(-1,1,1) ** 2
-
-        grid_points = torch.linspace(
-            self.tokenizer.left_endpoint, 
-            self.tokenizer.right_endpoint, 
-            self.tokenizer.num_bins, device=x0.device
-        ).view(1,1,-1)
-        potentials = -.5 * (grid_points - means)**2 / variances
-        probs = 1 / (variances * 2 * torch.pi).sqrt() * torch.exp(potentials)
-
-        mixture_prob = self.interval_mixture(probs, interpolant_sample.st)
+        # Euclidean loss
+        # We must only compute the loss for positions that are:
+        # not deleted: mask_t_shaped
+        # not masked: masked_positions.unsqueeze(-1)
+        # Not padding: ~eos_bos_mask_shaped
+        dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * mask_t_shaped * ~eos_bos_mask_shaped
+        dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions]
+        dsm_loss = dsm_loss.mean() / x0.shape[-1]
+        # Insertion loss
         insertion_rate = prediction.insertion_rate
-        insertion_logits = prediction.insertion_logits.log_softmax(dim=-1)
-        euclidean_insertion_loss = insertion_rate - (mixture_prob * (insertion_logits + insertion_rate.log().unsqueeze(-1))).sum(dim=-1)
-        euclidean_insertion_loss = euclidean_insertion_loss * interpolant_sample.mask_t
-
-        euclidean_insertion_loss = euclidean_insertion_loss.sum(dim=-1) / lengths
-        euclidean_insertion_loss = euclidean_insertion_loss.mean()
-
+        gaps, gaps_mask = interpolant_sample.gaps_and_mask
+        alpha_t = self.alpha(t).view(-1, 1).expand(-1, gaps.shape[1])
+        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask]) * alpha_t[gaps_mask]
+        insertion_loss = insertion_loss.sum() / (y0.shape[0] * self.max_length)
+        # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
-        batch_size, seq_len, num_classes = prediction.label_logits.shape
-        logits_flat = prediction.label_logits.view(-1, num_classes)
-        targets_flat = interpolant_sample.y0_ordered.view(-1).long()
-        tokens_loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none")
-        # Reshape back to [batch, seq_len]
-        tokens_loss = tokens_loss_flat.view(batch_size, seq_len)
-        tokens_loss = tokens_loss * interpolant_sample.mask_t # Only consider the valid tokens
-        tokens_loss = tokens_loss.sum(dim=-1) / lengths
-        tokens_loss = tokens_loss.mean()
-        
+        logits_flat = prediction.label_logits[masked_positions]
+        targets_flat = interpolant_sample.y0_ordered[masked_positions]
+        tokens_loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none") * alpha_t[masked_positions]
+        tokens_loss = tokens_loss_flat.mean()
+
+        # Predicted euclidean loss
+        # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y0 is [B, L] with vocab indices
+        y0_indices = interpolant_sample.y0_ordered.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x0.shape[-1])  # [B, L] -> [B, L, 1, D]
+        predicted_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=y0_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
+        euclidean_loss = (predicted_cond_y0 - interpolant_sample.x0_ordered)**2
+        euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
+        euclidean_loss = euclidean_loss.mean() / x0.shape[-1]
+
+
         return {
             "dsm_loss": dsm_loss,
-            "tokens_loss": tokens_loss,
-            "euclidean_insertion_loss": euclidean_insertion_loss,
+            "discrete_unmasking_loss": tokens_loss,
+            "euclidean_unmasking_loss": euclidean_loss,
+            "insertion_loss": insertion_loss,
         }
     
     def get_score(self, prediction: MultimodalModelPrediction, xt: Tensor, t: Tensor) -> Tensor:
         clean_data = prediction.clean_data 
         # clean_data = torch.arange(clean_data.shape[1], device=clean_data.device).repeat(clean_data.shape[0], 1)
-        # Isolating score effect
-        return - (xt - clean_data * self.scale(t).view(-1, 1)) / self.sigma(t).view(-1, 1)**2
+        return - (xt - clean_data * self.scale(t).view(-1, 1, 1)) / self.sigma(t).view(-1, 1, 1)**2
     
     def get_insertion_rate(self, prediction: MultimodalModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
-        lambda_t = self.beta(t).view(-1, 1)
-        predicted_rate = prediction.insertion_rate
+        gamma_t = self.gamma(t).view(-1, 1)
+        rate = prediction.insertion_rate
 
-        # Subtracting 2 because we are not considering the start and end of sequence tokens
-        rate = lambda_t / (mask_t.sum(dim=-1, keepdim=True) - 2).clamp(min=1)
-        rate = rate * predicted_rate
-
-        return rate
+        return gamma_t * rate
     
     def get_unmasking_rate(self, prediction: MultimodalModelPrediction, mask_t: Tensor, t: Tensor) -> Tensor:
-        lambda_t = self.beta(t).view(-1, 1)
-        big_beta = self.beta_int(t).view(-1, 1)
-        return 1/(torch.exp(big_beta) - 1) * lambda_t
+        alpha_t = self.alpha(t).view(-1, 1)
+        alpha_bar = self.alpha_bar(t).view(-1, 1)
+        return torch.exp(-alpha_bar)/(self.prob_mask(t).view(-1, 1)) * alpha_t
     
     def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tensor:
-        xt = torch.zeros((batch_size, max_length + 2), device=device)
+        xt = torch.zeros((batch_size, max_length + 2, self.euclidean_dim), device=device)
         yt = torch.cat([
             torch.ones((batch_size, 1), device=device, dtype=torch.long) * self.bos_token, 
             torch.ones((batch_size, 1), device=device, dtype=torch.long) * self.eos_token], dim=1)
@@ -346,19 +373,24 @@ class MultimodalInterpolant():
             trajectory.append(SamplingTrajectoryResult(
                 xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
             ))
-        for i in range(steps):
+        for i in tqdm(range(steps), leave=False):
             prediction: MultimodalModelPrediction = model(
                 cat_tokens=yt,
                 euclidean_tokens=xt,
-                text_mask=mask_t,
-                image_mask=mask_t,
-                text_time_cond=t,
-                image_time_cond=t
+                symbols_mask=mask_t,
+                pos_mask=mask_t,
+                symbols_time=t,
+                pos_time=t
             )
             # Denoise
+            masked_positions = (yt == self.mask_token)
             score = self.get_score(prediction, xt, t)
-            beta = self.beta(t).view(-1, 1)
-            xt = xt + (beta * (xt + score) * dt) * mask_t * ~eos_bos_mask
+            beta = self.beta(t).view(-1, 1, 1)
+            beta_int = self.beta_int(t).view(-1, 1, 1)
+            mask_shaped = mask_t.unsqueeze(-1).expand(-1, -1, xt.shape[-1])
+            eos_bos_mask_shaped = eos_bos_mask.unsqueeze(-1).expand(-1, -1, xt.shape[-1])
+            xt = xt + (beta * (xt + score) * dt) * mask_shaped * ~eos_bos_mask_shaped
+            xt = torch.where(masked_positions.unsqueeze(-1), 0., xt)
 
             unmasking_rate = self.get_unmasking_rate(prediction, mask_t, t)
             # Expand unmasking_rate to match sequence length: [batch, 1] -> [batch, seq_len]
@@ -366,20 +398,22 @@ class MultimodalInterpolant():
             unmasking_rate = unmasking_rate.expand(-1, seq_len)
             unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
 
-            # Extract the valid tokens
+            # Unmasking
             dist = prediction.label_logits[:, :, :self.vocab_size]
             new_sample = sample_categorical(dist.softmax(dim=-1), method="hard")  # [batch, seq_len]
+            indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
+            mean_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
 
-            change_pos = (unmasking_nums > 0) & (mask_t == True) & (yt == self.mask_token)
-
+            change_pos = (unmasking_nums > 0) & (mask_t == True) & (masked_positions)
+            new_xt = torch.exp(-beta_int) * mean_cond_y0 + torch.sqrt(1 - torch.exp(-2 * beta_int)) * torch.randn_like(xt)
+            xt[change_pos] = new_xt[change_pos]
             yt[change_pos] = new_sample[change_pos]
 
 
             # Perform insertions
             insertion_rate = self.get_insertion_rate(prediction, mask_t, t)
-            ext = torch.bernoulli((insertion_rate * dt).clamp(0.0, 1.0)).long()  # (B, L) where L is seq_len after padding
+            ext = torch.distributions.poisson.Poisson(insertion_rate * dt).sample().floor().long()
 
-            probabilities = F.softmax(prediction.label_logits, dim=-1)
             seq_len = xt.shape[1]  # After padding, this is max_length + 2
             if i != steps - 1:
                 for j in range(batch_size):
@@ -389,22 +423,20 @@ class MultimodalInterpolant():
                     for k in range(seq_len):
                         if not mask_t[j, k]:
                             break
-                        # Insert new token before position k if ext[j, k-1] == 1 (for k > 0)
-                        # insertion_rate[:, k-1] represents the rate for inserting before position k
-                        if k > 0 and ext[j, k-1] == 1:
-                            new_sample = torch.multinomial(probabilities[j, k], 1).float()
-                            new_sample = self.tokenizer.decode(new_sample)
-                            new_xt_j.append(new_sample.item())
+                        # Insert new token after position k if ext[j, k] == 1 (for k > 0)
+                        if k > 0 and ext[j, k] > 0:
+                            new_sample = torch.zeros_like(xt[0, :1, :])
+                            new_xt_j.append(new_sample.clone())
                             new_yt_j.append(self.mask_token)
                         # Always append the current token at position k
-                        new_xt_j.append(xt[j, k].item())
+                        new_xt_j.append(xt[j, k:k+1, :])
                         new_yt_j.append(yt[j, k].item())
                     
                     # Ensure we don't exceed the tensor size
-                    new_len = min(len(new_xt_j), seq_len)
-                    new_xt_tensor = torch.tensor(new_xt_j[:new_len], device=device, dtype=xt.dtype)
+                    new_len = min(len(new_xt_j), max_length) 
+                    new_xt_tensor = torch.cat(new_xt_j[:new_len], dim=0)
                     new_yt_tensor = torch.tensor(new_yt_j[:new_len], device=device, dtype=yt.dtype)
-                    xt[j, :new_len] = new_xt_tensor
+                    xt[j, :new_len, :] = new_xt_tensor
                     yt[j, :new_len] = new_yt_tensor
                     xt[j, 0] = 0.
                     xt[j, new_len-1] = 0.

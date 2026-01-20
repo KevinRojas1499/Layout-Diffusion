@@ -1,11 +1,7 @@
 from __future__ import annotations
 from typing import Tuple
-from euclidean_interpolant import EuclideanFixedSizeInterpolant
-from huggingface_hub import PyTorchModelHubMixin
 
 import torch
-import math
-import numpy as np
 from torch import nn
 from torch import Tensor
 import torch.nn.functional as F
@@ -20,8 +16,7 @@ from x_transformers import (
     FeedForward
 )
 
-from model.transformer import GaussianFourierProjection
-from multimodal_interpolant import MultimodalModelPrediction
+from model.rotary import rotate_half, apply_rotary_pos_emb as apply_rotary_pos_emb_original
 
 # mlp 
 def mlp(dim, dim_hidden, dim_out):
@@ -83,6 +78,7 @@ class JointAttention(Module):
 
         num_inputs = len(dim_inputs)
         self.num_inputs = num_inputs
+        self.heads = heads
 
         self.to_qkv = ModuleList([nn.Linear(dim_input, dim_inner * 3, bias = False) for dim_input in dim_inputs])
 
@@ -112,7 +108,9 @@ class JointAttention(Module):
     def forward(
         self,
         inputs: Tuple[Tensor],
-        masks: Tuple[Tensor | None] | None = None
+        masks: Tuple[Tensor | None] | None = None,
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None,
+        attn_bias: Tuple[Tensor | None, ...] | None = None
     ):
 
         device = self.dummy.device
@@ -120,6 +118,8 @@ class JointAttention(Module):
         assert len(inputs) == self.num_inputs
 
         masks = default(masks, (None,) * self.num_inputs)
+        rotary_pos_emb = default(rotary_pos_emb, (None,) * self.num_inputs)
+        attn_bias = default(attn_bias, (None,) * self.num_inputs)
 
         # project each modality separately for qkv
         # also handle masks, assume None means attend to all tokens
@@ -127,18 +127,30 @@ class JointAttention(Module):
         all_qkvs = []
         all_masks = []
 
-        for x, mask, to_qkv, q_rmsnorm, k_rmsnorm in zip(inputs, masks, self.to_qkv, self.q_rmsnorms, self.k_rmsnorms):
+        for x, mask, to_qkv, q_rmsnorm, k_rmsnorm, rotary_emb in zip(
+            inputs, masks, self.to_qkv, self.q_rmsnorms, self.k_rmsnorms, rotary_pos_emb
+        ):
 
             qkv = to_qkv(x)
-            qkv = self.split_heads(qkv)
+            qkv = self.split_heads(qkv)  # (qkv, b, h, n, d)
+
+            # extract q, k, v for potential modifications
+            q, k, v = qkv
 
             # optional qk rmsnorm per modality
-
             if self.qk_rmsnorm:
-                q, k, v = qkv
                 q = q_rmsnorm(q)
                 k = k_rmsnorm(k)
-                qkv = torch.stack((q, k, v))
+
+            if exists(rotary_emb):
+                cos, sin = rotary_emb
+                qkv_stacked = torch.stack((q, k, v), dim=0)  # (3, b, h, n, d)
+                qkv_reshaped = rearrange(qkv_stacked, 'qkv b h n d -> b n qkv h d')
+                qkv_rotated = apply_rotary_pos_emb_original(qkv_reshaped, cos, sin)
+                qkv_rotated = rearrange(qkv_rotated, 'b n qkv h d -> qkv b h n d')
+                q, k, v = qkv_rotated
+
+            qkv = torch.stack((q, k, v))
 
             all_qkvs.append(qkv)
 
@@ -153,12 +165,49 @@ class JointAttention(Module):
 
         all_qkvs, packed_shape = pack(all_qkvs, 'qkv b h * d')
         all_masks, _ = pack(all_masks, 'b *')
+        
+        combined_attn_bias = None
+        if any(exists(bias) for bias in attn_bias):
+            if isinstance(attn_bias, torch.Tensor):
+                combined_attn_bias = attn_bias
+            else:
+                seq_lens = [x.shape[1] for x in inputs]  # List of sequence lengths per modality
+                total_seq_len = sum(seq_lens)
+                B = inputs[0].shape[0]
+                
+                H = self.heads
+                
+                combined_attn_bias = torch.zeros(
+                    (B, H, total_seq_len, total_seq_len),
+                    device=device,
+                    dtype=inputs[0].dtype
+                )
+                
+                start_idx = 0
+                for modality_idx, bias in enumerate(attn_bias):
+                    if exists(bias):
+                        end_idx = start_idx + seq_lens[modality_idx]
+                        combined_attn_bias[:, :, start_idx:end_idx, start_idx:end_idx] = bias
+                    start_idx += seq_lens[modality_idx]
 
         # attention
 
         q, k, v = all_qkvs
 
-        outs, *_ = self.attend(q, k, v, mask = all_masks)
+        if exists(combined_attn_bias):
+            # Manually compute attention with bias
+            scale = q.shape[-1] ** -0.5
+            attn_scores = torch.einsum('b h i d, b h j d -> b h i j', q, k) * scale
+            attn_scores = attn_scores + combined_attn_bias
+            
+            if exists(all_masks):
+                mask_expanded = (~all_masks).unsqueeze(1).unsqueeze(2)
+                attn_scores = attn_scores.masked_fill(mask_expanded, float('-inf'))
+            
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            outs = torch.einsum('b h i j, b h j d -> b h i d', attn_weights, v)
+        else:
+            outs, *_ = self.attend(q, k, v, mask = all_masks)
 
         # merge heads and then separate by modality for combine heads projection
 
@@ -288,9 +337,14 @@ class MMDiTBlock(Module):
         *,
         modality_tokens: Tuple[Tensor, ...],
         modality_masks: Tuple[Tensor | None, ...] | None = None,
-        time_cond = Tuple[Tensor | None, ...]
+        time_cond = Tuple[Tensor | None, ...],
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None,
+        attn_bias: Tuple[Tensor | None, ...] | None = None
     ):
         assert len(modality_tokens) == self.num_modalities and len(time_cond) == self.num_modalities
+
+        rotary_pos_emb = default(rotary_pos_emb, (None,) * self.num_modalities)
+        attn_bias = default(attn_bias, (None,) * self.num_modalities)
 
         attn_gammas = [1.] * len(time_cond) # Default to 1. if no condition
         ff_gammas = [1.] * len(time_cond) # Default to 1. if no condition
@@ -303,7 +357,12 @@ class MMDiTBlock(Module):
         modality_tokens = [ln(tokens, cond) for tokens, cond, ln in zip(modality_tokens, time_cond, self.attn_layernorms)]
 
         # attention
-        modality_tokens = self.joint_attn(inputs = modality_tokens, masks = modality_masks)
+        modality_tokens = self.joint_attn(
+            inputs = modality_tokens, 
+            masks = modality_masks,
+            rotary_pos_emb = rotary_pos_emb,
+            attn_bias = attn_bias
+        )
 
         # post attention gammas
         modality_tokens = [tokens * gamma for tokens, gamma in zip(modality_tokens, attn_gammas)]
@@ -349,109 +408,61 @@ class MMDiT(Module):
         *,
         modality_tokens: Tuple[Tensor, ...],
         modality_masks: Tuple[Tensor | None, ...] | None = None,
-        time_cond = Tuple[Tensor | None, ...]
+        time_cond = Tuple[Tensor | None, ...],
+        rotary_pos_emb: Tuple[Tuple[Tensor, Tensor] | None, ...] | None = None,
+        attn_bias: Tuple[Tensor | None, ...] | None = None
     ):
-        for block in self.blocks:
+        # We precompute the attention biases for each layer to avoid recomputing them
+        precomputed_biases = None
+        if exists(attn_bias) and len(attn_bias) > 0:
+            seq_lens = [tokens.shape[1] for tokens in modality_tokens]
+            total_seq_len = sum(seq_lens)
+            B = modality_tokens[0].shape[0]
+            
+            # Get number of heads from the first block
+            H = self.blocks[0].joint_attn.heads
+            
+            device = modality_tokens[0].device
+            dtype = modality_tokens[0].dtype
+            
+            # Pre-compute combined bias for each layer
+            precomputed_biases = []
+            for layer_idx, layer_bias in enumerate(attn_bias):
+                if exists(layer_bias) and any(exists(b) for b in layer_bias if isinstance(layer_bias, (list, tuple))):
+                    # Create full-size bias matrix for this layer
+                    combined_bias = torch.zeros(
+                        (B, H, total_seq_len, total_seq_len),
+                        device=device,
+                        dtype=dtype
+                    )
+                    
+                    # Fill in biases for each modality
+                    start_idx = 0
+                    for modality_idx, bias in enumerate(layer_bias if isinstance(layer_bias, (list, tuple)) else [layer_bias]):
+                        if exists(bias):
+                            end_idx = start_idx + seq_lens[modality_idx]
+                            combined_bias[:, :, start_idx:end_idx, start_idx:end_idx] = bias
+                        start_idx += seq_lens[modality_idx]
+                    
+                    precomputed_biases.append(combined_bias)
+                else:
+                    precomputed_biases.append(None)
+        
+        for layer_idx, block in enumerate(self.blocks):
+            # Use pre-computed combined bias if available
+            layer_attn_bias = precomputed_biases[layer_idx] if precomputed_biases else None
+            
             modality_tokens = block(
                 time_cond = time_cond,
                 modality_tokens = modality_tokens,
-                modality_masks = modality_masks
+                modality_masks = modality_masks,
+                rotary_pos_emb = rotary_pos_emb,
+                attn_bias = layer_attn_bias
             )
 
         modality_tokens = [norm(tokens) for tokens, norm in zip(modality_tokens, self.norms)]
 
         return tuple(modality_tokens)
-
-# New stuff
-
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t = t.flatten()
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
-
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
-
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb
 
 class PatchEmbed(nn.Module):
     """ Image to Patch Embedding
@@ -487,309 +498,3 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
     
-def unpatchify(x, channels=3):
-    patch_size = int((x.shape[2] // channels) ** 0.5)
-    h = w = int(x.shape[1] ** .5)
-    assert h * w == x.shape[1] and patch_size ** 2 * channels == x.shape[2]
-    x = rearrange(x, 'B (h w) (p1 p2 C) -> B C (h p1) (w p2)', h=h, p1=patch_size, p2=patch_size)
-    return x
-
-# MMDiT for images and text
-class MMDiTModel(nn.Module):
-    def __init__(self, img_resolution, patch_size, img_channels, vocab_size, context_len, text_depth, image_depth, project_hidden=False, **kwargs):
-        super().__init__()
-        self.img_channels = img_channels
-        self.dim_modalities = kwargs['dim_modalities']
-        self.dim_conds = kwargs['dim_conds']
-        self.dim_text = self.dim_modalities[0]
-        self.dim_image = self.dim_modalities[1]
-
-        assert img_resolution % patch_size == 0, f'img_resolution must be divisible by patch_size got {img_resolution} and {patch_size}'
-
-        # Time Encoders
-        self.text_time_encoder = TimestepEmbedder(self.dim_text)
-        self.image_time_encoder = TimestepEmbedder(self.dim_image)
-
-        # Text Embeddings
-        self.text_embedder = nn.Embedding(vocab_size, self.dim_text)
-        self.text_pos_embed = nn.Embedding(context_len, self.dim_text)
-        nn.init.normal_(self.text_pos_embed.weight, std=0.02)
-
-        # Image Embeddings
-        self.image_embedder = PatchEmbed(patch_size, img_channels, self.dim_image)
-        grid = np.arange(grid_size)
-        self.register_buffer('pos_embed', torch.from_numpy(get_1d_sincos_pos_embed_from_grid(self.dim_image, grid)).float().unsqueeze(0))
-
-        # Joint Embedding
-        self.joint_embedding = MMDiT(**kwargs)
-
-        # Single Embeddings
-        self.has_text = text_depth > 0
-        self.has_image = image_depth > 0
-        sep_keys = ['depth', 'dim_modalities', 'dim_conds']
-        block_kwargs = {k: v for k, v in kwargs.items() if k not in sep_keys}
-        if self.has_text:
-            self.text_dit = MMDiT(depth = text_depth, dim_modalities = [self.dim_text], dim_conds = [self.dim_text], **block_kwargs)
-        else:
-            self.freeze_last_block(0)
-        if self.has_image:
-            self.image_dit = MMDiT(depth = image_depth, dim_modalities = [self.dim_image], dim_conds = [self.dim_image], **block_kwargs)
-        else:
-            self.freeze_last_block(1)
-
-        # Final Layers
-        if self.has_text:
-            self.text_final_layer = FinalLayer(self.dim_text, vocab_size)
-        if self.has_image:
-            self.image_final_layer = FinalLayer(self.dim_image, patch_size**2 * img_channels)
-
-        # Hidden states projection 
-        self.project_hidden = project_hidden
-        if project_hidden:
-            if self.has_text:
-                self.text_hidden_projection = mlp(self.dim_text, self.dim_text, 768)
-
-            if self.has_image:
-                self.image_hidden_projection = mlp(self.dim_image, self.dim_image, 1024)
-
-    def freeze_last_block(self, idx):
-        last_block = self.joint_embedding.blocks[-1]
-        feedforward = last_block.feedforwards[idx]
-        layernorm = last_block.ff_layernorms[idx]
-        last_block.joint_attn.to_out[idx].weight.requires_grad = False
-        cond_block = last_block.cond_dict[f'cond_linear_{idx}']
-        self.joint_embedding.norms[idx].g.requires_grad = False
-        for param in feedforward.parameters():
-            param.requires_grad = False
-        for param in layernorm.parameters():
-            param.requires_grad = False
-        for param in cond_block.parameters():
-            param.requires_grad = False
-    
-    def freeze_joint(self):
-        layers_to_freeze = [self.text_embedder, self.text_pos_embed, self.text_time_encoder, 
-                            self.image_embedder, self.image_time_encoder,
-                            self.joint_embedding]
-        for layer in layers_to_freeze:
-            for param in layer.parameters():
-                param.requires_grad = False
-
-    def freeze_image(self):
-        layers_to_freeze = [self.image_embedder, self.image_time_encoder, self.image_dit, self.image_final_layer]
-        for layer in layers_to_freeze:
-            for param in layer.parameters():
-                param.requires_grad = False
-    
-    def freeze_text(self):
-        layers_to_freeze = [self.text_embedder, self.text_pos_embed, self.text_time_encoder, self.text_dit, self.text_final_layer]
-        for layer in layers_to_freeze:
-            for param in layer.parameters():
-                param.requires_grad = False
-
-    def forward(
-        self,
-        *,
-        text_tokens,
-        image,
-        text_mask = None,
-        image_mask = None,
-        image_time_cond = None,
-        text_time_cond = None,
-        detach_hidden = [False, False]
-    ):
-        # Create position indices based on sequence length
-        positions = torch.arange(text_tokens.shape[1], device=text_tokens.device)
-        positions = positions.unsqueeze(0).expand(text_tokens.shape[0], -1)[:, :text_tokens.shape[1]] # [batch, seq_len]
-        
-        image_tokens = self.image_embedder(image) + self.pos_embed
-        text_tokens = self.text_embedder(text_tokens) + self.text_pos_embed(positions)
-        text_time_cond = self.text_time_encoder(text_time_cond)
-        image_time_cond = self.image_time_encoder(image_time_cond)
-
-        text_tokens_hidden, image_tokens_hidden = self.joint_embedding(
-            modality_tokens = (text_tokens, image_tokens),
-            modality_masks = (text_mask, image_mask),
-            time_cond = (text_time_cond, image_time_cond),
-        )
-        if detach_hidden[0]:
-            text_tokens_hidden = text_tokens_hidden.detach()
-        if detach_hidden[1]:
-            image_tokens_hidden = image_tokens_hidden.detach()
-
-        if self.has_text:
-            text_tokens = self.text_dit(
-                modality_tokens = (text_tokens_hidden,),
-                modality_masks = (text_mask,),
-                time_cond = (text_time_cond,),
-            )[0]
-            text_tokens = self.text_final_layer(text_tokens, text_time_cond)
-            text_tokens[:, :, :-1] = text_tokens[:, :, :-1].log_softmax(dim=-1)
-
-        if self.has_image:
-            image_tokens = self.image_dit(
-                modality_tokens = (image_tokens_hidden,),
-                modality_masks = (image_mask,),
-                time_cond = (image_time_cond,),
-            )[0]
-
-            image_tokens = self.image_final_layer(image_tokens, image_time_cond)
-            image_tokens = unpatchify(image_tokens, self.img_channels)
-
-
-        # Project hidden states
-        if self.project_hidden:
-            text_tokens_hidden = self.text_hidden_projection(text_tokens_hidden) if self.has_text else None
-            image_tokens_hidden = self.image_hidden_projection(image_tokens_hidden) if self.has_image else None
-        else:
-            image_tokens_hidden = None
-            text_tokens_hidden = None
-
-        return image_tokens, text_tokens
-
-
-# 
-class MMDiTModelNoImage(nn.Module):
-    def __init__(self, euclidean_dim, text_vocab_size, euclidean_vocab_size, context_len, text_depth, image_depth, project_hidden=False, **kwargs):
-        super().__init__()
-        self.euclidean_dim = euclidean_dim
-        self.dim_modalities = kwargs['dim_modalities']
-        self.dim_conds = kwargs['dim_conds']
-        self.dim_text = self.dim_modalities[0]
-        self.dim_image = self.dim_modalities[1]
-
-        # Time Encoders
-        self.text_time_encoder = TimestepEmbedder(self.dim_text)
-        self.image_time_encoder = TimestepEmbedder(self.dim_image)
-
-        # Text Embeddings
-        self.text_embedder = nn.Embedding(text_vocab_size, self.dim_text)
-        self.text_pos_embed = nn.Embedding(context_len, self.dim_text)
-        nn.init.normal_(self.text_pos_embed.weight, std=0.02)
-
-        # Image Embeddings
-        grid = np.arange(euclidean_dim)
-        self.register_buffer('pos_embed', torch.from_numpy(get_1d_sincos_pos_embed_from_grid(self.dim_image, grid)).float().unsqueeze(0))
-        self.euclidean_embedding = nn.Sequential(
-            GaussianFourierProjection(self.dim_image, scale=1.0),
-            nn.Linear(self.dim_image, self.dim_image),
-        )
-
-        # Joint Embedding
-        self.joint_embedding = MMDiT(**kwargs)
-
-        # Single Embeddings
-        self.has_text = text_depth > 0
-        self.has_image = image_depth > 0
-        sep_keys = ['depth', 'dim_modalities', 'dim_conds']
-        block_kwargs = {k: v for k, v in kwargs.items() if k not in sep_keys}
-        if self.has_text:
-            self.text_dit = MMDiT(depth = text_depth, dim_modalities = [self.dim_text], dim_conds = [self.dim_text], **block_kwargs)
-        else:
-            self.freeze_last_block(0)
-        if self.has_image:
-            self.image_dit = MMDiT(depth = image_depth, dim_modalities = [self.dim_image], dim_conds = [self.dim_image], **block_kwargs)
-        else:
-            self.freeze_last_block(1)
-
-        # Final Layers
-        self.logits_pred = FinalLayer(self.dim_image, euclidean_vocab_size)
-        self.rate_pred = FinalLayer(self.dim_image, 1)
-        if self.has_text:
-            self.text_final_layer = FinalLayer(self.dim_text, text_vocab_size)
-        if self.has_image:
-            self.image_final_layer = FinalLayer(self.dim_image, 1)
-
-
-    def freeze_last_block(self, idx):
-        last_block = self.joint_embedding.blocks[-1]
-        feedforward = last_block.feedforwards[idx]
-        layernorm = last_block.ff_layernorms[idx]
-        last_block.joint_attn.to_out[idx].weight.requires_grad = False
-        cond_block = last_block.cond_dict[f'cond_linear_{idx}']
-        self.joint_embedding.norms[idx].g.requires_grad = False
-        for param in feedforward.parameters():
-            param.requires_grad = False
-        for param in layernorm.parameters():
-            param.requires_grad = False
-        for param in cond_block.parameters():
-            param.requires_grad = False
-    
-    def freeze_joint(self):
-        layers_to_freeze = [self.text_embedder, self.text_pos_embed, self.text_time_encoder, 
-                            self.image_embedder, self.image_time_encoder,
-                            self.joint_embedding]
-        for layer in layers_to_freeze:
-            for param in layer.parameters():
-                param.requires_grad = False
-
-    def freeze_image(self):
-        layers_to_freeze = [self.image_embedder, self.image_time_encoder, self.image_dit, self.image_final_layer]
-        for layer in layers_to_freeze:
-            for param in layer.parameters():
-                param.requires_grad = False
-    
-    def freeze_text(self):
-        layers_to_freeze = [self.text_embedder, self.text_pos_embed, self.text_time_encoder, self.text_dit, self.text_final_layer]
-        for layer in layers_to_freeze:
-            for param in layer.parameters():
-                param.requires_grad = False
-
-    def forward(
-        self,
-        *,
-        cat_tokens,
-        euclidean_tokens,
-        text_mask = None,
-        image_mask = None,
-        image_time_cond = None,
-        text_time_cond = None,
-        detach_hidden = [False, False]
-    ):
-        # Create position indices based on sequence length
-        positions = torch.arange(cat_tokens.shape[1], device=cat_tokens.device)
-        positions = positions.unsqueeze(0).expand(cat_tokens.shape[0], -1)[:, :cat_tokens.shape[1]] # [batch, seq_len]
-        
-        if euclidean_tokens.dim() == 2:
-            euclidean_tokens = euclidean_tokens.unsqueeze(-1)
-        euclidean_tokens = self.euclidean_embedding(euclidean_tokens) + self.pos_embed
-        cat_tokens = self.text_embedder(cat_tokens) + self.text_pos_embed(positions)
-        text_time_cond = self.text_time_encoder(text_time_cond)
-        image_time_cond = self.image_time_encoder(image_time_cond)
-
-        text_tokens_hidden, euclidean_tokens_hidden = self.joint_embedding(
-            modality_tokens = (cat_tokens, euclidean_tokens),
-            modality_masks = (text_mask, image_mask),
-            time_cond = (text_time_cond, image_time_cond),
-        )
-        if detach_hidden[0]:
-            text_tokens_hidden = text_tokens_hidden.detach()
-        if detach_hidden[1]:
-            euclidean_tokens_hidden = euclidean_tokens_hidden.detach()
-
-        if self.has_text:
-            cat_tokens = self.text_dit(
-                modality_tokens = (text_tokens_hidden,),
-                modality_masks = (text_mask,),
-                time_cond = (text_time_cond,),
-            )[0]
-            cat_tokens = self.text_final_layer(cat_tokens, text_time_cond)
-            cat_tokens[:, :, :-1] = cat_tokens[:, :, :-1].log_softmax(dim=-1)
-
-        if self.has_image:
-            euclidean_tokens = self.image_dit(
-                modality_tokens = (euclidean_tokens_hidden,),
-                modality_masks = (image_mask,),
-                time_cond = (image_time_cond,),
-            )[0]
-            clean_data_pred = self.image_final_layer(euclidean_tokens, image_time_cond).squeeze(-1)
-            insertion_rate = self.rate_pred(euclidean_tokens, image_time_cond).squeeze(-1)
-            insertion_rate = F.softplus(insertion_rate)
-            insertion_logits = self.logits_pred(euclidean_tokens, image_time_cond)
-
-
-        return MultimodalModelPrediction(
-            clean_data=clean_data_pred,
-            insertion_logits=insertion_logits,
-            insertion_rate=insertion_rate,
-            label_logits=cat_tokens
-        )

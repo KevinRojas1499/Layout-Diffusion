@@ -12,11 +12,13 @@ dependencies = [
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.8",
     "natsort>=8.4.0",
+    "rdkit>=2025.9.3",
     "seaborn>=0.13.2",
     "torch>=2.9.1",
     "torchaudio>=2.9.1",
     "torchvision>=0.24.1",
     "tqdm>=4.67.1",
+    "umap-learn>=0.5.11",
     "wandb>=0.23.1",
     "x-transformers>=2.12.2",
 ]
