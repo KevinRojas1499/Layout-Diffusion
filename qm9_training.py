@@ -88,9 +88,9 @@ def training(**opts):
     model = MMDiTQM9(
         euclidean_dim=3,
         vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=4,
-        positions_depth=4,
-        depth=4,
+        symbols_depth=2,
+        positions_depth=2,
+        depth=10,
         dim_modalities=[384, 384],
         dim_joint_attn=384,
         dim_conds=[384, 384]
