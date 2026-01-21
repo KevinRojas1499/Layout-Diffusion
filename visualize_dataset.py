@@ -7,7 +7,28 @@ from utils.datasets import get_dataset
 from utils.tokenizer import VocabTokenizer
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
-RDKIT_AVAILABLE = True
+from openbabel import openbabel as ob
+import sys
+import os
+from contextlib import contextmanager
+
+# Suppress OpenBabel error messages
+@contextmanager
+def suppress_stderr():
+    """Context manager to suppress stderr output from OpenBabel (including C++ output)."""
+    # Redirect at file descriptor level to catch C++ output
+    with open(os.devnull, 'w') as devnull:
+        old_stderr_fd = sys.stderr.fileno()
+        # Save original stderr
+        saved_stderr = os.dup(old_stderr_fd)
+        try:
+            # Redirect stderr to devnull
+            os.dup2(devnull.fileno(), old_stderr_fd)
+            yield
+        finally:
+            # Restore original stderr
+            os.dup2(saved_stderr, old_stderr_fd)
+            os.close(saved_stderr)
 
 def plot_sample(data, yt, mask, out_file_name, character_tokenizer : VocabTokenizer, max_category=100):
     # Convert to numpy for plotting
@@ -94,13 +115,14 @@ def plot_sample(data, yt, mask, out_file_name, character_tokenizer : VocabTokeni
 
 def plot_molecule(symbols, positions, out_file_name, smiles=None):
     """
-    Plots a molecule in 3D with accurate bond detection.
+    Plots a molecule in 3D with accurate bond detection using OpenBabel pipeline.
+    Matches evaluation methodology: xyz → sdf (OpenBabel) → RDKit.
     
     Args:
         symbols: List of atomic symbols (e.g., ['C', 'H', 'O', ...])
         positions: numpy array of shape (N, 3) with atomic positions in Angstroms
         out_file_name: Output file path for the plot
-        smiles: Optional SMILES string for accurate bond detection via RDKit
+        smiles: Optional SMILES string (not used, kept for backward compatibility)
     """
     # Convert to numpy if needed
     if isinstance(positions, torch.Tensor):
@@ -150,8 +172,8 @@ def plot_molecule(symbols, positions, out_file_name, smiles=None):
     ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2], 
                s=atom_sizes, c=atom_colors, edgecolor='black', alpha=1.0, linewidths=1.5)
     
-    # Get bonds - use RDKit if available and SMILES provided, otherwise use improved distance-based method
-    bonds = _get_bonds(symbols, positions, smiles)
+    # Get bonds using OpenBabel pipeline (matches evaluation methodology)
+    bonds = _get_bonds_via_openbabel(symbols, positions)
     
     # Plot bonds
     for i, j in bonds:
@@ -188,176 +210,53 @@ def plot_molecule(symbols, positions, out_file_name, smiles=None):
     plt.close()
 
 
-def _get_bonds(symbols, positions, smiles=None):
+def _get_bonds_via_openbabel(symbols, positions):
     """
-    Get bonds between atoms using robust distance-based detection.
-    Works without SMILES by using accurate bond length thresholds and graph-based validation.
+    Get bonds between atoms using OpenBabel pipeline (matches evaluation methodology).
+    Converts xyz → sdf → RDKit to get accurate bond structure.
+    
+    Args:
+        symbols: List of atomic symbols
+        positions: numpy array of shape (N, 3) with atomic positions
     
     Returns:
         List of tuples (i, j) representing bonds between atoms i and j
     """
-    num_atoms = len(symbols)
-    
-    # Try RDKit-based bond detection if SMILES is available (optional, for validation)
-    if smiles and RDKIT_AVAILABLE:
-        try:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is not None:
-                mol = Chem.AddHs(mol)
-                rdkit_bonds = []
-                for bond in mol.GetBonds():
-                    i = bond.GetBeginAtomIdx()
-                    j = bond.GetEndAtomIdx()
-                    if i < num_atoms and j < num_atoms:
-                        rdkit_bonds.append((i, j))
-                if len(rdkit_bonds) > 0:
-                    return rdkit_bonds
-        except Exception:
-            pass
-    
-    # Robust distance-based bond detection (works without SMILES)
-    # Bond length thresholds in Angstroms - using maximum reasonable bond lengths
-    # These are conservative to avoid false positives
-    bond_thresholds = {
-        # Single bonds
-        ('H', 'H'): 0.80,
-        ('H', 'C'): 1.15,
-        ('H', 'N'): 1.08,
-        ('H', 'O'): 1.02,
-        ('H', 'F'): 0.98,
-        ('H', 'S'): 1.35,
-        ('H', 'Cl'): 1.30,
-        ('C', 'C'): 1.70,  # Conservative for single bonds, will catch double/triple too
-        ('C', 'N'): 1.60,
-        ('C', 'O'): 1.55,
-        ('C', 'F'): 1.45,
-        ('C', 'S'): 1.90,
-        ('C', 'Cl'): 1.85,
-        ('N', 'N'): 1.55,
-        ('N', 'O'): 1.50,
-        ('N', 'F'): 1.45,
-        ('O', 'O'): 1.60,
-        ('O', 'F'): 1.50,
-        ('F', 'F'): 1.50,
-        ('S', 'S'): 2.20,
-        ('Cl', 'Cl'): 2.20,
-    }
-    
-    # Covalent radii for fallback calculation (in Angstroms)
-    covalent_radii = {
-        'H': 0.31,
-        'C': 0.76,
-        'N': 0.71,
-        'O': 0.66,
-        'F': 0.57,
-        'S': 1.05,
-        'Cl': 1.02,
-        'P': 1.07,
-        'Br': 1.20,
-    }
-    
-    # Calculate all pairwise distances
-    distances = np.zeros((num_atoms, num_atoms))
-    for i in range(num_atoms):
-        for j in range(i + 1, num_atoms):
-            dist = np.linalg.norm(positions[i] - positions[j])
-            distances[i, j] = dist
-            distances[j, i] = dist
-    
-    # Find potential bonds
-    potential_bonds = []
-    for i in range(num_atoms):
-        for j in range(i + 1, num_atoms):
-            atom1, atom2 = symbols[i], symbols[j]
-            dist = distances[i, j]
-            
-            # Get threshold for this atom pair
-            bond_key = tuple(sorted([atom1, atom2]))
-            if bond_key in bond_thresholds:
-                threshold = bond_thresholds[bond_key]
-            else:
-                # Fallback: use sum of covalent radii + 30% tolerance
-                r1 = covalent_radii.get(atom1, 0.7)
-                r2 = covalent_radii.get(atom2, 0.7)
-                threshold = (r1 + r2) * 1.3
-            
-            # Special cases
-            if atom1 == 'H' and atom2 == 'H':
-                # H-H bonds are very rare, only if extremely close
-                if dist > 0.85:
-                    continue
-            elif atom1 == 'H' or atom2 == 'H':
-                # H can only have one bond typically, but we'll let the graph validation handle this
-                pass
-            
-            if dist < threshold:
-                potential_bonds.append((i, j, dist))
-    
-    # Sort by distance (shorter bonds are more likely to be real)
-    potential_bonds.sort(key=lambda x: x[2])
-    
-    # Graph-based validation: ensure each atom has reasonable connectivity
-    # Build adjacency list
-    bonds = []
-    atom_degrees = {i: 0 for i in range(num_atoms)}
-    
-    # Maximum expected valency (number of bonds) for each element
-    max_valency = {
-        'H': 1,
-        'C': 4,
-        'N': 3,  # Can be 4 with charge, but 3 is typical
-        'O': 2,
-        'F': 1,
-        'S': 6,  # Can form multiple bonds
-        'Cl': 1,
-        'P': 5,
-        'Br': 1,
-    }
-    
-    for i, j, dist in potential_bonds:
-        atom1, atom2 = symbols[i], symbols[j]
-        max_deg1 = max_valency.get(atom1, 4)
-        max_deg2 = max_valency.get(atom2, 4)
+    try:
+        # Convert xyz → sdf using OpenBabel (suppress error messages)
+        xyz_lines = [f"{len(symbols)}\n", "Molecule\n"]
+        for symbol, pos in zip(symbols, positions):
+            xyz_lines.append(f"{symbol:2s} {pos[0]:12.6f} {pos[1]:12.6f} {pos[2]:12.6f}\n")
+        xyz_str = "".join(xyz_lines)
         
-        # Check if adding this bond would exceed valency
-        if atom_degrees[i] < max_deg1 and atom_degrees[j] < max_deg2:
-            bonds.append((i, j))
-            atom_degrees[i] += 1
-            atom_degrees[j] += 1
+        # Convert xyz to sdf using OpenBabel
+        with suppress_stderr():
+            conv = ob.OBConversion()
+            conv.SetInAndOutFormats("xyz", "sdf")
+            
+            obmol = ob.OBMol()
+            if conv.ReadString(obmol, xyz_str):
+                # Convert to sdf string
+                sdf_str = conv.WriteString(obmol)
+                
+                # Read sdf into RDKit
+                mol = Chem.MolFromMolBlock(sdf_str, sanitize=False)
+                if mol is not None:
+                    try:
+                        Chem.SanitizeMol(mol)
+                        # Extract bonds from RDKit molecule
+                        bonds = []
+                        for bond in mol.GetBonds():
+                            i = bond.GetBeginAtomIdx()
+                            j = bond.GetEndAtomIdx()
+                            if i < len(symbols) and j < len(symbols):
+                                bonds.append((i, j))
+                        return bonds
+                    except:
+                        pass
+    except Exception:
+        pass
     
-    # Additional pass: for atoms that seem under-connected, look for slightly longer bonds
-    # This helps catch cases where the initial threshold was too conservative
-    for i in range(num_atoms):
-        atom = symbols[i]
-        expected_min_bonds = 1 if atom != 'H' else 1
-        
-        # If atom has no bonds and should have at least one, be more lenient
-        if atom_degrees[i] == 0:
-            for j in range(num_atoms):
-                if i == j:
-                    continue
-                if (i, j) in bonds or (j, i) in bonds:
-                    continue
-                
-                atom2 = symbols[j]
-                dist = distances[i, j]
-                bond_key = tuple(sorted([atom, atom2]))
-                
-                # Use more lenient threshold
-                if bond_key in bond_thresholds:
-                    threshold = bond_thresholds[bond_key] * 1.15  # 15% more lenient
-                else:
-                    r1 = covalent_radii.get(atom, 0.7)
-                    r2 = covalent_radii.get(atom2, 0.7)
-                    threshold = (r1 + r2) * 1.5
-                
-                max_deg1 = max_valency.get(atom, 4)
-                max_deg2 = max_valency.get(atom2, 4)
-                
-                if dist < threshold and atom_degrees[i] < max_deg1 and atom_degrees[j] < max_deg2:
-                    bonds.append((i, j))
-                    atom_degrees[i] += 1
-                    atom_degrees[j] += 1
-                    break  # Only add one bond per iteration
-    
-    return bonds
+    # Fallback: return empty list if conversion fails
+    # (molecule will be plotted without bonds rather than with incorrect bonds)
+    return []

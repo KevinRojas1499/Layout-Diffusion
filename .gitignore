@@ -5,3 +5,5 @@ experiments/
 *.png
 *.json
 results/
+results_*/
+data/

@@ -1508,6 +1508,12 @@ wheels = [
 ]
 
 [[package]]
+name = "openbabel"
+version = "3.1.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9d/3f/f08f5d1422d74ed0e1e612870b343bfcc26313bdf9efec9165c3ea4b3ae2/openbabel-3.1.1.1.tar.gz", hash = "sha256:bb7f8cad15f3a208f4869d7943cbb14eb7125372eba397588f207f8d19e78373", size = 82811, upload-time = "2020-05-23T09:33:22.782Z" }
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2590,6 +2596,7 @@ dependencies = [
     { name = "ipykernel" },
     { name = "matplotlib" },
     { name = "natsort" },
+    { name = "openbabel" },
     { name = "rdkit" },
     { name = "seaborn" },
     { name = "torch" },
@@ -2610,6 +2617,7 @@ requires-dist = [
     { name = "ipykernel", specifier = ">=7.1.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "natsort", specifier = ">=8.4.0" },
+    { name = "openbabel", specifier = ">=3.1.1.1" },
     { name = "rdkit", specifier = ">=2025.9.3" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "torch", specifier = ">=2.9.1" },

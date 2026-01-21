@@ -24,7 +24,8 @@ from utils.tokenizer import VocabTokenizer
 
 def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distribution_test.png',
                           generated_file: str = None, comparison_output: str = None,
-                          n_real_samples: Optional[int] = None, n_gen_samples: Optional[int] = None):
+                          n_real_samples: Optional[int] = None, n_gen_samples: Optional[int] = None,
+                          use_all_samples: bool = False):
     """
     Plot QM9 dataset distribution using UMAP.
     
@@ -35,6 +36,7 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
         comparison_output: Directory to save full comparison results (optional)
         n_real_samples: Number of QM9 samples to use (default None = use n_samples, or all if n_samples not set)
         n_gen_samples: Number of generated samples to use (default None = use all available)
+        use_all_samples: If True, use all generated samples without filtering (overrides n_gen_samples, but not n_real_samples or n_samples)
     """
     print("="*60)
     if generated_file:
@@ -101,11 +103,16 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
         print(f"   Generated - Atom distribution: {gen_atom_counts}")
     
     # If comparison mode, use evaluate_molecule_distributions
+    results = None
     if generated_file and comparison_output:
         print(f"\n5. Running full distribution comparison (paper methodology)...")
         try:
             # Determine sample counts: use all QM9 we extracted, limit generated if specified
-            gen_n_samples = n_gen_samples if n_gen_samples is not None else len(gen_symbols)
+            if use_all_samples:
+                gen_n_samples = len(gen_symbols)
+                print(f"   Using ALL {gen_n_samples} generated samples (--use_all_samples flag set)")
+            else:
+                gen_n_samples = n_gen_samples if n_gen_samples is not None else len(gen_symbols)
             
             results = evaluate_molecule_distributions(
                 real_symbols, real_positions,
@@ -130,68 +137,85 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
             traceback.print_exc()
             return
     
-    # Compute fingerprints for QM9
-    step_num = 5 if not generated_file else 6
-    print(f"\n{step_num}. Computing molecular fingerprints for QM9...")
-    try:
-        real_fingerprints, real_valid = compute_molecular_fingerprints(
-            real_symbols, real_positions, smiles_list=real_smiles, radius=2, n_bits=2048
-        )
-        print(f"   Computed {len(real_fingerprints)} valid fingerprints")
+    # Reuse results from evaluate_molecule_distributions if available, otherwise compute separately
+    if results is not None:
+        # Reuse fingerprints and embeddings from evaluation results
+        print(f"\n6. Reusing fingerprints and embeddings from evaluation results...")
+        real_fingerprints = results['real_fingerprints']
+        gen_fingerprints = results.get('generated_fingerprints', None)
+        real_embedding = results['real_embedding']
+        gen_embedding = results.get('generated_embedding', None)
+        
+        print(f"   Reused {len(real_fingerprints)} real fingerprints")
+        if gen_fingerprints is not None:
+            print(f"   Reused {len(gen_fingerprints)} generated fingerprints")
         print(f"   Fingerprint shape: {real_fingerprints.shape}")
         print(f"   Fingerprint sparsity: {(real_fingerprints == 0).sum() / real_fingerprints.size * 100:.2f}%")
-    except Exception as e:
-        print(f"   ERROR computing fingerprints: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-    
-    # Compute fingerprints for generated if provided
-    gen_fingerprints = None
-    if gen_symbols:
-        print(f"\n{step_num + 1}. Computing molecular fingerprints for generated molecules...")
+        print(f"   Embedding shape: {real_embedding.shape}")
+        print(f"   Embedding range: X=[{real_embedding[:, 0].min():.2f}, {real_embedding[:, 0].max():.2f}], "
+              f"Y=[{real_embedding[:, 1].min():.2f}, {real_embedding[:, 1].max():.2f}]")
+    else:
+        # Compute fingerprints for QM9 (only if not already computed)
+        step_num = 5 if not generated_file else 6
+        print(f"\n{step_num}. Computing molecular fingerprints for QM9...")
         try:
-            gen_fingerprints, gen_valid = compute_molecular_fingerprints(
-                gen_symbols, gen_positions, smiles_list=None, radius=2, n_bits=2048
+            real_fingerprints, real_valid = compute_molecular_fingerprints(
+                real_symbols, real_positions, radius=2, n_bits=2048
             )
-            print(f"   Computed {len(gen_fingerprints)} valid fingerprints")
+            print(f"   Computed {len(real_fingerprints)} valid fingerprints")
+            print(f"   Fingerprint shape: {real_fingerprints.shape}")
+            print(f"   Fingerprint sparsity: {(real_fingerprints == 0).sum() / real_fingerprints.size * 100:.2f}%")
         except Exception as e:
             print(f"   ERROR computing fingerprints: {e}")
             import traceback
             traceback.print_exc()
             return
-    
-    # Compute UMAP embedding
-    step_num += 1 if gen_symbols else 0
-    print(f"\n{step_num + 1}. Computing UMAP embedding...")
-    try:
-        if gen_fingerprints is not None:
-            # Joint embedding for comparison
-            all_fps = np.vstack([real_fingerprints, gen_fingerprints])
-            all_embedding = compute_umap_embedding(
-                all_fps, n_components=2, n_neighbors=15, min_dist=0.1, random_state=42
-            )
-            real_embedding = all_embedding[:len(real_fingerprints)]
-            gen_embedding = all_embedding[len(real_fingerprints):]
-        else:
-            # Single distribution
-            real_embedding = compute_umap_embedding(
-                real_fingerprints, n_components=2, n_neighbors=15, min_dist=0.1, random_state=42
-            )
-            gen_embedding = None
         
-        print(f"   Embedding shape: {real_embedding.shape}")
-        print(f"   Embedding range: X=[{real_embedding[:, 0].min():.2f}, {real_embedding[:, 0].max():.2f}], "
-              f"Y=[{real_embedding[:, 1].min():.2f}, {real_embedding[:, 1].max():.2f}]")
-    except Exception as e:
-        print(f"   ERROR computing UMAP: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+        # Compute fingerprints for generated if provided
+        gen_fingerprints = None
+        if gen_symbols:
+            print(f"\n{step_num + 1}. Computing molecular fingerprints for generated molecules...")
+            try:
+                gen_fingerprints, gen_valid = compute_molecular_fingerprints(
+                    gen_symbols, gen_positions, radius=2, n_bits=2048
+                )
+                print(f"   Computed {len(gen_fingerprints)} valid fingerprints")
+            except Exception as e:
+                print(f"   ERROR computing fingerprints: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+        
+        # Compute UMAP embedding
+        step_num += 1 if gen_symbols else 0
+        print(f"\n{step_num + 1}. Computing UMAP embedding...")
+        try:
+            if gen_fingerprints is not None:
+                # Joint embedding for comparison
+                all_fps = np.vstack([real_fingerprints, gen_fingerprints])
+                all_embedding = compute_umap_embedding(
+                    all_fps, n_components=2, n_neighbors=15, min_dist=0.1, random_state=42
+                )
+                real_embedding = all_embedding[:len(real_fingerprints)]
+                gen_embedding = all_embedding[len(real_fingerprints):]
+            else:
+                # Single distribution
+                real_embedding = compute_umap_embedding(
+                    real_fingerprints, n_components=2, n_neighbors=15, min_dist=0.1, random_state=42
+                )
+                gen_embedding = None
+            
+            print(f"   Embedding shape: {real_embedding.shape}")
+            print(f"   Embedding range: X=[{real_embedding[:, 0].min():.2f}, {real_embedding[:, 0].max():.2f}], "
+                  f"Y=[{real_embedding[:, 1].min():.2f}, {real_embedding[:, 1].max():.2f}]")
+        except Exception as e:
+            print(f"   ERROR computing UMAP: {e}")
+            import traceback
+            traceback.print_exc()
+            return
     
     # Plot distribution
-    step_num += 1
-    print(f"\n{step_num + 1}. Plotting distribution...")
+    print(f"\n7. Plotting distribution...")
     try:
         if gen_embedding is not None:
             # Create side-by-side comparison plot
@@ -309,6 +333,9 @@ Example usage:
   
   # Use more QM9 samples for stable reference, fewer generated samples
   python test_qm9_distribution.py --n_real_samples 20000 --n_gen_samples 5000 --generated generated_molecules.json --comparison_output results/
+  
+  # Use all generated samples (no filtering on generated)
+  python test_qm9_distribution.py --use_all_samples --generated generated_molecules.json
         """
     )
     parser.add_argument('--n_samples', type=int, default=5000,
@@ -317,6 +344,8 @@ Example usage:
                        help='Number of QM9 samples to use (default: None = use --n_samples, or all available if not set)')
     parser.add_argument('--n_gen_samples', type=int, default=None,
                        help='Number of generated samples to use (default: None = use all available)')
+    parser.add_argument('--use_all_samples', action='store_true',
+                       help='Use all generated samples without filtering (overrides --n_gen_samples, but not --n_real_samples or --n_samples)')
     parser.add_argument('--output', type=str, default='qm9_distribution_test.png',
                        help='Output file path for plot (default: qm9_distribution_test.png)')
     parser.add_argument('--generated', type=str, default=None,
@@ -332,5 +361,6 @@ Example usage:
         generated_file=args.generated,
         comparison_output=args.comparison_output,
         n_real_samples=args.n_real_samples,
-        n_gen_samples=args.n_gen_samples
+        n_gen_samples=args.n_gen_samples,
+        use_all_samples=args.use_all_samples
     )

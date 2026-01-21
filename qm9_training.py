@@ -88,15 +88,19 @@ def training(**opts):
     model = MMDiTQM9(
         euclidean_dim=3,
         vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=2,
-        positions_depth=2,
-        depth=10,
+        symbols_depth=4,
+        positions_depth=4,
+        depth=4,
         dim_modalities=[384, 384],
         dim_joint_attn=384,
         dim_conds=[384, 384]
     ).to(device)
     ema = deepcopy(model)
+    # dim_2_params = [p for p in model.parameters() if p.ndim == 2] # Selects weights of Linear layers
+    # other_params = [p for p in model.parameters() if p.ndim != 2]
+
     opt = torch.optim.AdamW(model.parameters(),lr=opts.lr)
+    # muon  = torch.optim.Muon(dim_2_params,lr=opts.lr)
     scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler(device)
     

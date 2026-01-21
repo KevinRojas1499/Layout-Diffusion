@@ -35,6 +35,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.option('--dir',type=str)
 @click.option('--return_trace', type=bool, default=False)
 @click.option('--load_checkpoint',type=str, help='Directory where we can find the desired checkpoints')
+@click.option('--enable_plotting', is_flag=True, default=False)
 def sampling(**opts):
     opts = dotdict(opts)
     batch_size = opts.batch_size
@@ -103,16 +104,17 @@ def sampling(**opts):
                 'positions': positions.tolist()
             })
 
-        # for i, sample in enumerate(samples):
-        #     path = os.path.join(opts.dir, f'samples/')
-        #     os.makedirs(path, exist_ok=True)
-        #     try:
-        #         plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
-        #         symbols = character_tokenizer.decode(sample.yt.cpu())
-        #         positions = sample.xt.cpu()[1:len(symbols)+1, :]
-        #         plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
-        #     except Exception as e:
-        #         print(f'Error plotting sample {i}')
+        if opts.enable_plotting:
+            for i, sample in enumerate(samples):
+                path = os.path.join(opts.dir, f'samples/batch_{_}/')
+                os.makedirs(path, exist_ok=True)
+                try:
+                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                    symbols = character_tokenizer.decode(sample.yt.cpu())
+                    positions = sample.xt.cpu()[1:len(symbols)+1, :]
+                    plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
+                except Exception as e:
+                    print(f'Error plotting sample {i}')
             
     b = json.dumps(output_samples, indent=2, separators=(',', ':'), cls=CustomJSONEncoder)
     b = b.replace('"##<', "").replace('>##"', "")

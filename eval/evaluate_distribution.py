@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
 import os
 import warnings
+import sys
+from contextlib import contextmanager
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
@@ -23,6 +25,24 @@ from openbabel import openbabel as ob
 warnings.filterwarnings("ignore", message=".*GetMorganFingerprintAsBitVect.*", category=DeprecationWarning)
 # Suppress RDKit error/warning messages (they're too verbose for invalid molecules)
 RDLogger.DisableLog('rdApp.*')
+
+# Suppress OpenBabel error messages
+@contextmanager
+def suppress_stderr():
+    """Context manager to suppress stderr output from OpenBabel (including C++ output)."""
+    # Redirect at file descriptor level to catch C++ output
+    with open(os.devnull, 'w') as devnull:
+        old_stderr_fd = sys.stderr.fileno()
+        # Save original stderr
+        saved_stderr = os.dup(old_stderr_fd)
+        try:
+            # Redirect stderr to devnull
+            os.dup2(devnull.fileno(), old_stderr_fd)
+            yield
+        finally:
+            # Restore original stderr
+            os.dup2(saved_stderr, old_stderr_fd)
+            os.close(saved_stderr)
 
 
 def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list: List[np.ndarray], 
@@ -126,18 +146,19 @@ def _xyz_to_sdf_via_openbabel(symbols: List[str], positions: np.ndarray) -> Opti
             xyz_lines.append(f"{symbol:2s} {pos[0]:12.6f} {pos[1]:12.6f} {pos[2]:12.6f}\n")
         xyz_str = "".join(xyz_lines)
         
-        # Convert xyz to sdf using OpenBabel
-        conv = ob.OBConversion()
-        conv.SetInAndOutFormats("xyz", "sdf")
-        
-        obmol = ob.OBMol()
-        # Read xyz string into molecule
-        if conv.ReadString(obmol, xyz_str):
-            # Convert to sdf string
-            sdf_str = conv.WriteString(obmol)
-            return sdf_str
-        else:
-            return None
+        # Convert xyz to sdf using OpenBabel (suppress error messages)
+        with suppress_stderr():
+            conv = ob.OBConversion()
+            conv.SetInAndOutFormats("xyz", "sdf")
+            
+            obmol = ob.OBMol()
+            # Read xyz string into molecule
+            if conv.ReadString(obmol, xyz_str):
+                # Convert to sdf string
+                sdf_str = conv.WriteString(obmol)
+                return sdf_str
+            else:
+                return None
     except Exception as e:
         return None
 
@@ -752,25 +773,57 @@ def evaluate_molecule_distributions(
         if generated_smiles:
             generated_smiles = [generated_smiles[i] for i in indices]
     
-    # 1. Compute atom count distributions
+    # 1. Compute molecular properties (this also filters if filter_invalid=True)
     print("\n" + "="*50)
-    print("1. Computing atom count distributions...")
-    print("="*50)
-    real_atom_counts = compute_atom_counts(real_symbols)
-    gen_atom_counts = compute_atom_counts(generated_symbols)
-    
-    # 2. Compute molecular properties
-    print("\n" + "="*50)
-    print("2. Computing molecular properties...")
+    print("1. Computing molecular properties...")
     print("="*50)
     print("Computing properties for real molecules...")
     real_properties = compute_molecular_properties(real_symbols, real_positions, filter_invalid=filter_invalid)
     print("Computing properties for generated molecules...")
     gen_properties = compute_molecular_properties(generated_symbols, generated_positions, filter_invalid=filter_invalid)
     
-    # 3. Compute Kolmogorov-Smirnov statistics for all metrics
+    # 2. Compute fingerprints (this also filters and returns valid indices)
     print("\n" + "="*50)
-    print("3. Computing Kolmogorov-Smirnov statistics (1-KSD)...")
+    print("2. Computing molecular fingerprints...")
+    print("="*50)
+    print(f"Using {fingerprint_type} fingerprints...")
+    print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
+    real_fps, real_valid = compute_molecular_fingerprints(
+        real_symbols, real_positions,
+        radius=fingerprint_radius, n_bits=fingerprint_bits,
+        fingerprint_type=fingerprint_type,
+        filter_invalid=filter_invalid
+    )
+    print(f"Valid real molecules: {len(real_fps)}")
+    
+    print(f"Computing fingerprints for {len(generated_symbols)} generated molecules...")
+    generated_fps, gen_valid = compute_molecular_fingerprints(
+        generated_symbols, generated_positions,
+        radius=fingerprint_radius, n_bits=fingerprint_bits,
+        fingerprint_type=fingerprint_type,
+        filter_invalid=filter_invalid
+    )
+    print(f"Valid generated molecules: {len(generated_fps)}")
+    
+    # 3. Compute atom counts on filtered molecules only (for consistency)
+    print("\n" + "="*50)
+    print("3. Computing atom count distributions (on filtered molecules)...")
+    print("="*50)
+    # Filter symbols to match valid molecules from fingerprint computation
+    if filter_invalid:
+        real_symbols_filtered = [real_symbols[i] for i in real_valid]
+        gen_symbols_filtered = [generated_symbols[i] for i in gen_valid]
+    else:
+        # If not filtering, use all molecules
+        real_symbols_filtered = real_symbols
+        gen_symbols_filtered = generated_symbols
+    
+    real_atom_counts = compute_atom_counts(real_symbols_filtered)
+    gen_atom_counts = compute_atom_counts(gen_symbols_filtered)
+    
+    # 4. Compute Kolmogorov-Smirnov statistics for all metrics
+    print("\n" + "="*50)
+    print("4. Computing Kolmogorov-Smirnov statistics (1-KSD)...")
     print("="*50)
     ks_stats = {}
     
@@ -804,31 +857,12 @@ def evaluate_molecule_distributions(
     print("\nPlotting molecular property distributions...")
     plot_distribution_cdfs(real_properties, gen_properties, output_dir, ks_stats, plot_type='properties')
     
-    # 4. Compute fingerprints and UMAP
+    # 5. Compute UMAP embedding
     print("\n" + "="*50)
-    print("4. Computing molecular fingerprints and UMAP embedding...")
+    print("5. Computing UMAP embedding...")
     print("="*50)
-    print(f"Using {fingerprint_type} fingerprints...")
-    print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
-    real_fps, real_valid = compute_molecular_fingerprints(
-        real_symbols, real_positions,
-        radius=fingerprint_radius, n_bits=fingerprint_bits,
-        fingerprint_type=fingerprint_type,
-        filter_invalid=filter_invalid
-    )
-    print(f"Valid real molecules: {len(real_fps)}")
-    
-    print(f"Computing fingerprints for {len(generated_symbols)} generated molecules...")
-    generated_fps, gen_valid = compute_molecular_fingerprints(
-        generated_symbols, generated_positions,
-        radius=fingerprint_radius, n_bits=fingerprint_bits,
-        fingerprint_type=fingerprint_type,
-        filter_invalid=filter_invalid
-    )
-    print(f"Valid generated molecules: {len(generated_fps)}")
     
     # Combine for joint UMAP fitting (better comparison)
-    print("Computing UMAP embedding...")
     all_fps = np.vstack([real_fps, generated_fps])
     # Use the same random seed for UMAP to ensure reproducibility
     all_embedding = compute_umap_embedding(all_fps, random_state=random_seed)
