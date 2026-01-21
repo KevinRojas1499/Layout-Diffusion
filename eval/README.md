@@ -13,7 +13,10 @@ The evaluation pipeline:
 
 Install required dependencies:
 ```bash
-# RDKit for molecular fingerprinting
+# OpenBabel for xyz → sdf conversion (matches paper methodology)
+conda install -c conda-forge openbabel
+
+# RDKit for molecular fingerprinting and property computation
 conda install -c conda-forge rdkit
 
 # UMAP for dimensionality reduction
@@ -156,7 +159,8 @@ python eval/test_qm9_distribution.py \
 
 ## Notes
 
-- The script automatically handles molecules that cannot be converted to valid RDKit structures (skips them with warnings)
-- SMILES strings are preferred for accurate fingerprinting, but the script can infer bonds from 3D coordinates if SMILES are not available
-- Invalid molecules (e.g., valency violations) are automatically filtered out during fingerprint computation
+- The script uses OpenBabel to convert xyz coordinates to SDF format (matches paper methodology), which infers bond structure and SMILES strings
+- Molecules are then read into RDKit for fingerprint and property computation
+- Invalid molecules (RDKit valid=false) and not-fully-connected molecules are automatically filtered out when `filter_invalid=True` (default)
 - The UMAP embedding uses a joint embedding when comparing distributions to ensure consistent coordinate systems
+- Filtering statistics (valid, invalid, not-fully-connected counts) are logged during computation

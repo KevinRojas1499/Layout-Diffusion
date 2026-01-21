@@ -13,83 +13,66 @@ from typing import List, Tuple, Optional
 import os
 import warnings
 
-try:
-    from rdkit import Chem
-    from rdkit.Chem import AllChem, Descriptors
-    from rdkit import RDLogger
-    import warnings
-    # Suppress deprecation warnings for GetMorganFingerprintAsBitVect
-    warnings.filterwarnings("ignore", message=".*GetMorganFingerprintAsBitVect.*", category=DeprecationWarning)
-    # Suppress RDKit error/warning messages (they're too verbose for invalid molecules)
-    RDLogger.DisableLog('rdApp.*')
-    RDKIT_AVAILABLE = True
-except ImportError:
-    RDKIT_AVAILABLE = False
-    print("Warning: RDKit not available. Install with: conda install -c conda-forge rdkit")
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors
+from rdkit import RDLogger
+import umap
+from openbabel import openbabel as ob
 
-try:
-    import umap
-    UMAP_AVAILABLE = True
-except ImportError:
-    UMAP_AVAILABLE = False
-    print("Warning: UMAP not available. Install with: pip install umap-learn")
+# Suppress deprecation warnings for GetMorganFingerprintAsBitVect
+warnings.filterwarnings("ignore", message=".*GetMorganFingerprintAsBitVect.*", category=DeprecationWarning)
+# Suppress RDKit error/warning messages (they're too verbose for invalid molecules)
+RDLogger.DisableLog('rdApp.*')
 
 
 def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list: List[np.ndarray], 
-                                   smiles_list: Optional[List[str]] = None,
                                    radius: int = 2, n_bits: int = 2048,
-                                   fingerprint_type: str = 'morgan') -> np.ndarray:
+                                   fingerprint_type: str = 'morgan',
+                                   filter_invalid: bool = True) -> Tuple[np.ndarray, List[int]]:
     """
-    Compute molecular fingerprints for molecules.
+    Compute molecular fingerprints for molecules using OpenBabel pipeline.
+    Matches paper methodology: xyz → sdf (OpenBabel) → RDKit.
     
     Args:
         symbols_list: List of lists, where each inner list contains atomic symbols
         positions_list: List of numpy arrays, where each array is (N, 3) atomic positions
-        smiles_list: Optional list of SMILES strings (preferred over position-based conversion)
         radius: Radius for Morgan fingerprint (default 2)
         n_bits: Number of bits in fingerprint (default 2048)
         fingerprint_type: Type of fingerprint ('morgan' or 'rdkit')
+        filter_invalid: If True, filter out invalid and not-fully-connected molecules
     
     Returns:
-        numpy array of shape (num_molecules, n_bits) with binary fingerprints
+        Tuple of (fingerprints, valid_indices):
+        - fingerprints: numpy array of shape (num_molecules, n_bits) with binary fingerprints
+        - valid_indices: List of original indices that passed filtering
     """
-    if not RDKIT_AVAILABLE:
-        raise ImportError("RDKit is required for fingerprint computation")
-    
     fingerprints = []
     valid_indices = []
     failed_count = 0
+    invalid_count = 0
+    not_connected_count = 0
     
     for idx, (symbols, positions) in enumerate(zip(symbols_list, positions_list)):
         try:
-            # Prefer SMILES if available
-            smiles = smiles_list[idx] if smiles_list and idx < len(smiles_list) else None
-            mol = None
-            
-            if smiles:
-                # Try to create molecule from SMILES
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is not None:
-                    # Add 3D coordinates if available
-                    try:
-                        mol = Chem.AddHs(mol)  # Add hydrogens
-                        AllChem.EmbedMolecule(mol, randomSeed=42)
-                        AllChem.MMFFOptimizeMolecule(mol)
-                    except:
-                        pass  # Continue without 3D coordinates
-            
-            # Fallback to position-based creation if SMILES failed
-            if mol is None:
-                mol = _positions_to_molecule(symbols, positions)
+            # Use OpenBabel pipeline: xyz → sdf → RDKit (matches paper methodology)
+            mol, _, is_valid, is_fully_connected = _positions_to_molecule_via_openbabel(symbols, positions)
             
             if mol is None:
                 failed_count += 1
                 continue
             
+            # Apply filtering if requested
+            if filter_invalid:
+                if not is_valid:
+                    invalid_count += 1
+                    continue
+                if not is_fully_connected:
+                    not_connected_count += 1
+                    continue
+            
             # Compute fingerprint based on type
             if fingerprint_type.lower() == 'rdkit':
                 # RDKit fingerprint (standard RDKit topological fingerprint)
-                # This is the standard RDKit fingerprint used in the paper
                 fp = Chem.RDKFingerprint(mol, maxPath=7, fpSize=n_bits)
             else:
                 # Morgan fingerprint (default)
@@ -106,127 +89,148 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
     if len(fingerprints) == 0:
         raise ValueError(f"No valid fingerprints computed (failed for all {len(symbols_list)} molecules)")
     
-    if failed_count > 0:
-        print(f"Successfully computed {len(fingerprints)} fingerprints ({failed_count} failed)")
+    # Logging
+    total_processed = len(symbols_list)
+    total_valid = len(fingerprints)
+    if filter_invalid:
+        print(f"Fingerprint computation summary:")
+        print(f"  Total molecules: {total_processed}")
+        print(f"  Valid (RDKit valid=true): {total_valid + invalid_count + not_connected_count}")
+        print(f"  Invalid (RDKit valid=false): {invalid_count}")
+        print(f"  Not fully connected: {not_connected_count}")
+        print(f"  Failed conversion: {failed_count}")
+        print(f"  Final valid count: {total_valid}")
+    else:
+        if failed_count > 0:
+            print(f"Successfully computed {total_valid} fingerprints ({failed_count} failed)")
     
     return np.array(fingerprints), valid_indices
 
 
-def _positions_to_molecule(symbols: List[str], positions: np.ndarray):
+def _xyz_to_sdf_via_openbabel(symbols: List[str], positions: np.ndarray) -> Optional[str]:
     """
-    Convert atomic symbols and positions to RDKit molecule object.
-    Uses distance-based bond detection with strict valency checking.
+    Convert atomic symbols and positions to SDF format using OpenBabel.
+    This matches the paper's methodology: xyz → sdf conversion via OpenBabel.
+    
+    Args:
+        symbols: List of atomic symbols
+        positions: numpy array of shape (N, 3) with atomic positions in Angstroms
+    
+    Returns:
+        SDF string or None if conversion fails
+    """
+    try:
+        # Create xyz string for input
+        xyz_lines = [f"{len(symbols)}\n", "Generated molecule\n"]
+        for symbol, pos in zip(symbols, positions):
+            xyz_lines.append(f"{symbol:2s} {pos[0]:12.6f} {pos[1]:12.6f} {pos[2]:12.6f}\n")
+        xyz_str = "".join(xyz_lines)
+        
+        # Convert xyz to sdf using OpenBabel
+        conv = ob.OBConversion()
+        conv.SetInAndOutFormats("xyz", "sdf")
+        
+        obmol = ob.OBMol()
+        # Read xyz string into molecule
+        if conv.ReadString(obmol, xyz_str):
+            # Convert to sdf string
+            sdf_str = conv.WriteString(obmol)
+            return sdf_str
+        else:
+            return None
+    except Exception as e:
+        return None
+
+
+def _is_fully_connected(mol) -> bool:
+    """
+    Check if molecule is fully connected (all atoms in a single connected component).
+    
+    Args:
+        mol: RDKit molecule object
+    
+    Returns:
+        True if fully connected, False otherwise
+    """
+    if mol is None:
+        return False
+    
+    try:
+        # Get connected components
+        num_components = len(Chem.GetMolFrags(mol))
+        return num_components == 1
+    except:
+        return False
+
+
+def _sdf_to_rdkit_molecule(sdf_str: str) -> Optional[object]:
+    """
+    Read SDF string into RDKit molecule object.
+    
+    Args:
+        sdf_str: SDF format string
+    
+    Returns:
+        RDKit molecule object or None if parsing fails
+    """
+    try:
+        # Read from SDF string
+        mol = Chem.MolFromMolBlock(sdf_str, sanitize=False)
+        if mol is None:
+            return None
+        
+        # Sanitize to check validity
+        try:
+            Chem.SanitizeMol(mol)
+            return mol
+        except:
+            # Invalid molecule
+            return None
+    except:
+        return None
+
+
+def _positions_to_molecule_via_openbabel(symbols: List[str], positions: np.ndarray) -> Tuple[Optional[object], Optional[str], bool, bool]:
+    """
+    Convert atomic symbols and positions to RDKit molecule using OpenBabel pipeline.
+    Matches paper methodology: xyz → sdf (OpenBabel) → RDKit.
     
     Args:
         symbols: List of atomic symbols
         positions: numpy array of shape (N, 3) with atomic positions
     
     Returns:
-        RDKit molecule object or None if conversion fails
+        Tuple of (mol, smiles, is_valid, is_fully_connected):
+        - mol: RDKit molecule object or None
+        - smiles: SMILES string or None
+        - is_valid: True if RDKit valid flag is True
+        - is_fully_connected: True if molecule is fully connected
     """
-    if not RDKIT_AVAILABLE:
-        return None
+    # Convert xyz → sdf using OpenBabel
+    sdf_str = _xyz_to_sdf_via_openbabel(symbols, positions)
+    if sdf_str is None:
+        return None, None, False, False
     
-    if len(symbols) == 0 or len(positions) == 0:
-        return None
+    # Read sdf into RDKit
+    mol = _sdf_to_rdkit_molecule(sdf_str)
+    if mol is None:
+        return None, None, False, False
     
+    # Check validity: if we got here, sanitization succeeded, so molecule is valid
+    # (RDKit's sanitization in _sdf_to_rdkit_molecule ensures validity)
+    is_valid = True
+    
+    # Check if fully connected
+    is_fully_connected = _is_fully_connected(mol)
+    
+    # Extract SMILES if possible
+    smiles = None
     try:
-        # Create molecule from symbols and positions
-        mol = Chem.RWMol()
-        
-        # Add atoms
-        for symbol in symbols:
-            try:
-                atom = Chem.Atom(symbol)
-                mol.AddAtom(atom)
-            except:
-                return None  # Invalid atom symbol
-        
-        if mol.GetNumAtoms() == 0:
-            return None
-        
-        # Set 3D coordinates
-        conf = Chem.Conformer(mol.GetNumAtoms())
-        for i, pos in enumerate(positions):
-            if i < mol.GetNumAtoms():
-                conf.SetAtomPosition(i, tuple(pos))
-        mol.AddConformer(conf)
-        
-        # Get maximum valencies for each atom
-        valencies = {
-            'H': 1, 'C': 4, 'N': 3, 'O': 2, 'F': 1,
-            'S': 2, 'Cl': 1, 'P': 3, 'Br': 1
-        }
-        max_valencies = [valencies.get(sym, 4) for sym in symbols]
-        
-        # Get all potential bonds sorted by distance
-        potential_bonds = []
-        for i in range(len(symbols)):
-            for j in range(i + 1, len(symbols)):
-                dist = np.linalg.norm(positions[i] - positions[j])
-                if _is_bonded(symbols[i], symbols[j], dist):
-                    potential_bonds.append((i, j, dist))
-        
-        # Sort by distance (shorter bonds first)
-        potential_bonds.sort(key=lambda x: x[2])
-        
-        # Add bonds greedily with strict valency checking
-        added_bonds = set()
-        atom_degrees = [0] * len(symbols)
-        
-        for i, j, dist in potential_bonds:
-            # Strict check: both atoms must have available valency
-            if atom_degrees[i] < max_valencies[i] and atom_degrees[j] < max_valencies[j]:
-                # Check if adding this bond would create a reasonable structure
-                # (avoid creating too many bonds to the same atom)
-                    try:
-                        mol.AddBond(i, j, Chem.BondType.SINGLE)
-                        added_bonds.add((i, j))
-                        atom_degrees[i] += 1
-                        atom_degrees[j] += 1
-                    except:
-                    # Bond addition failed, skip it
-                        pass
-        
-        # If no bonds were added, the molecule is likely invalid
-        if len(added_bonds) == 0:
-            return None
-        
-        # Try to sanitize molecule - this will fail if valencies are invalid
-        try:
-            Chem.SanitizeMol(mol)
-            return mol.GetMol()
-        except:
-            # Sanitization failed - molecule has invalid structure
-                return None
-            
-    except Exception as e:
-        return None
-
-
-def _get_max_valency(atom1: str, atom2: str) -> int:
-    """Get maximum valency for bond detection."""
-    # Common valencies
-    valencies = {
-        'H': 1, 'C': 4, 'N': 3, 'O': 2, 'F': 1,
-        'S': 2, 'Cl': 1, 'P': 3, 'Br': 1
-    }
-    return max(valencies.get(atom1, 4), valencies.get(atom2, 4))
-
-
-def _is_bonded(atom1: str, atom2: str, distance: float) -> bool:
-    """Check if two atoms are likely bonded based on distance."""
-    # Covalent radii (Angstroms)
-    radii = {
-        'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'F': 0.57,
-        'S': 1.05, 'Cl': 1.02, 'P': 1.07, 'Br': 1.20
-    }
+        smiles = Chem.MolToSmiles(mol)
+    except:
+        pass
     
-    r1 = radii.get(atom1, 0.7)
-    r2 = radii.get(atom2, 0.7)
-    threshold = (r1 + r2) * 1.3  # 30% tolerance
-    
-    return distance < threshold
+    return mol, smiles, is_valid, is_fully_connected
 
 
 def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2, 
@@ -255,9 +259,6 @@ def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2,
     Returns:
         numpy array of shape (N, n_components) with UMAP embedding
     """
-    if not UMAP_AVAILABLE:
-        raise ImportError("UMAP is required for embedding computation")
-    
     # Set numpy random seed for additional reproducibility
     # (UMAP uses numpy random internally)
     np.random.seed(random_state)
@@ -283,9 +284,10 @@ def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2,
 
 
 def compute_molecular_properties(symbols_list: List[List[str]], positions_list: List[np.ndarray],
-                                smiles_list: Optional[List[str]] = None) -> dict:
+                                filter_invalid: bool = True) -> dict:
     """
-    Compute molecular properties for each molecule using RDKit.
+    Compute molecular properties for each molecule using OpenBabel pipeline.
+    Matches paper methodology: xyz → sdf (OpenBabel) → RDKit.
     
     Properties computed:
     - mw: Molecular weight
@@ -296,15 +298,12 @@ def compute_molecular_properties(symbols_list: List[List[str]], positions_list: 
     Args:
         symbols_list: List of lists of atomic symbols
         positions_list: List of numpy arrays of atomic positions
-        smiles_list: Optional list of SMILES strings (preferred for property computation)
+        filter_invalid: If True, filter out invalid and not-fully-connected molecules
     
     Returns:
         Dictionary with keys: 'mw', 'logp', 'hbd', 'hba'
         Each value is a list of property values for each molecule
     """
-    if not RDKIT_AVAILABLE:
-        raise ImportError("RDKit is required for molecular property computation")
-    
     properties = {
         'mw': [],
         'logp': [],
@@ -313,32 +312,32 @@ def compute_molecular_properties(symbols_list: List[List[str]], positions_list: 
     }
     
     failed_count = 0
+    invalid_count = 0
+    not_connected_count = 0
     
     for idx, (symbols, positions) in enumerate(zip(symbols_list, positions_list)):
         try:
-            # Prefer SMILES if available (more accurate)
-            smiles = smiles_list[idx] if smiles_list and idx < len(smiles_list) else None
-            mol = None
+            # Use OpenBabel pipeline: xyz → sdf → RDKit (matches paper methodology)
+            mol, _, is_valid, is_fully_connected = _positions_to_molecule_via_openbabel(symbols, positions)
             
-            if smiles:
-                # Try to create molecule from SMILES
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is not None:
-                    # Add hydrogens for accurate property computation
-                    try:
-                        mol = Chem.AddHs(mol)
-                    except:
-                        pass
-            
-            # Fallback to position-based creation if SMILES failed
-            if mol is None:
-                mol = _positions_to_molecule(symbols, positions)
-                if mol is not None:
-                    try:
-                        # Add hydrogens if not already present
-                        mol = Chem.AddHs(mol)
-                    except:
-                        pass
+            # Apply filtering if requested
+            if filter_invalid:
+                if mol is None or not is_valid:
+                    invalid_count += 1
+                    # Append NaN for filtered molecules
+                    properties['mw'].append(np.nan)
+                    properties['logp'].append(np.nan)
+                    properties['hbd'].append(np.nan)
+                    properties['hba'].append(np.nan)
+                    continue
+                if not is_fully_connected:
+                    not_connected_count += 1
+                    # Append NaN for filtered molecules
+                    properties['mw'].append(np.nan)
+                    properties['logp'].append(np.nan)
+                    properties['hbd'].append(np.nan)
+                    properties['hba'].append(np.nan)
+                    continue
             
             if mol is None:
                 failed_count += 1
@@ -381,8 +380,20 @@ def compute_molecular_properties(symbols_list: List[List[str]], positions_list: 
                 print(f"Warning: Error processing molecule {idx}: {e}")
             continue
     
-    if failed_count > 0:
-        print(f"Successfully computed properties for {len(symbols_list) - failed_count} molecules ({failed_count} failed)")
+    # Logging
+    total_processed = len(symbols_list)
+    total_valid = sum(1 for mw in properties['mw'] if not np.isnan(mw))
+    if filter_invalid:
+        print(f"Property computation summary:")
+        print(f"  Total molecules: {total_processed}")
+        print(f"  Valid (RDKit valid=true): {total_valid + invalid_count + not_connected_count}")
+        print(f"  Invalid (RDKit valid=false): {invalid_count}")
+        print(f"  Not fully connected: {not_connected_count}")
+        print(f"  Failed conversion: {failed_count}")
+        print(f"  Final valid count: {total_valid}")
+    else:
+        if failed_count > 0:
+            print(f"Successfully computed properties for {total_valid} molecules ({failed_count} failed)")
     
     return properties
 
@@ -684,11 +695,12 @@ def evaluate_molecule_distributions(
     real_smiles: Optional[List[str]] = None,
     generated_smiles: Optional[List[str]] = None,
     fingerprint_type: str = 'morgan',
-    random_seed: int = 42
+    random_seed: int = 42,
+    filter_invalid: bool = True
 ):
     """
     Main evaluation function: Compare real vs generated molecule distributions.
-    Based on the paper's evaluation methodology.
+    Based on the paper's evaluation methodology using OpenBabel pipeline.
     
     Args:
         real_symbols: List of lists of atomic symbols for real molecules
@@ -701,19 +713,15 @@ def evaluate_molecule_distributions(
         n_gen_samples: Number of generated samples to use (default None = use all available)
         fingerprint_radius: Radius for Morgan fingerprint
         fingerprint_bits: Number of bits in fingerprint
-        real_smiles: Optional list of SMILES strings for real molecules
-        generated_smiles: Optional list of SMILES strings for generated molecules
+        real_smiles: Optional list of SMILES strings for real molecules (not used, kept for compatibility)
+        generated_smiles: Optional list of SMILES strings for generated molecules (not used, kept for compatibility)
         fingerprint_type: Type of fingerprint ('morgan' or 'rdkit')
         random_seed: Random seed for reproducible sampling and UMAP (default 42)
+        filter_invalid: If True, filter out invalid and not-fully-connected molecules (default True)
     
     Returns:
         Dictionary containing evaluation results including fingerprints, embeddings, KS statistics
     """
-    if not RDKIT_AVAILABLE:
-        raise ImportError("RDKit is required for evaluation")
-    if not UMAP_AVAILABLE:
-        raise ImportError("UMAP is required for evaluation")
-    
     os.makedirs(output_dir, exist_ok=True)
     
     # Handle backward compatibility: if n_samples is provided, use it for both
@@ -756,9 +764,9 @@ def evaluate_molecule_distributions(
     print("2. Computing molecular properties...")
     print("="*50)
     print("Computing properties for real molecules...")
-    real_properties = compute_molecular_properties(real_symbols, real_positions, smiles_list=real_smiles)
+    real_properties = compute_molecular_properties(real_symbols, real_positions, filter_invalid=filter_invalid)
     print("Computing properties for generated molecules...")
-    gen_properties = compute_molecular_properties(generated_symbols, generated_positions, smiles_list=generated_smiles)
+    gen_properties = compute_molecular_properties(generated_symbols, generated_positions, filter_invalid=filter_invalid)
     
     # 3. Compute Kolmogorov-Smirnov statistics for all metrics
     print("\n" + "="*50)
@@ -803,17 +811,19 @@ def evaluate_molecule_distributions(
     print(f"Using {fingerprint_type} fingerprints...")
     print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
     real_fps, real_valid = compute_molecular_fingerprints(
-        real_symbols, real_positions, smiles_list=real_smiles, 
+        real_symbols, real_positions,
         radius=fingerprint_radius, n_bits=fingerprint_bits,
-        fingerprint_type=fingerprint_type
+        fingerprint_type=fingerprint_type,
+        filter_invalid=filter_invalid
     )
     print(f"Valid real molecules: {len(real_fps)}")
     
     print(f"Computing fingerprints for {len(generated_symbols)} generated molecules...")
     generated_fps, gen_valid = compute_molecular_fingerprints(
-        generated_symbols, generated_positions, smiles_list=generated_smiles,
+        generated_symbols, generated_positions,
         radius=fingerprint_radius, n_bits=fingerprint_bits,
-        fingerprint_type=fingerprint_type
+        fingerprint_type=fingerprint_type,
+        filter_invalid=filter_invalid
     )
     print(f"Valid generated molecules: {len(generated_fps)}")
     

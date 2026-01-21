@@ -265,16 +265,14 @@ class MultimodalInterpolant():
         # Insertion loss
         insertion_rate = prediction.insertion_rate
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
-        alpha_t = self.alpha(t).view(-1, 1).expand(-1, gaps.shape[1])
-        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask]) * alpha_t[gaps_mask]
+        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
         insertion_loss = insertion_loss.sum() / (y0.shape[0] * self.max_length)
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
         logits_flat = prediction.label_logits[masked_positions]
         targets_flat = interpolant_sample.y0_ordered[masked_positions]
-        tokens_loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none") * alpha_t[masked_positions]
-        tokens_loss = tokens_loss_flat.mean()
+        tokens_loss = F.cross_entropy(logits_flat, targets_flat, reduction="none").mean()
 
         # Predicted euclidean loss
         # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y0 is [B, L] with vocab indices
@@ -385,6 +383,7 @@ class MultimodalInterpolant():
                             break
                         # Insert new token after position k if ext[j, k] == 1 (for k > 0)
                         if k > 0 and ext[j, k] > 0:
+                            # Consider doing a for loop here
                             new_sample = torch.zeros_like(xt[0, :1, :])
                             new_xt_j.append(new_sample.clone())
                             new_yt_j.append(self.mask_token)
@@ -404,13 +403,11 @@ class MultimodalInterpolant():
                     yt[j, new_len-1] = self.eos_token
                     mask_t[j, :new_len] = True
                     mask_t[j, new_len:] = False
-                    eos_bos_mask[j,:] = False
-                    eos_bos_mask[j, 0] = True
-                    eos_bos_mask[j, new_len-1] = True
                 else:
                     # Do something here 
                     pass
 
+            eos_bos_mask = (yt == self.eos_token) | (yt == self.bos_token)
             if return_trace:
                 trajectory.append(SamplingTrajectoryResult(
                     xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
