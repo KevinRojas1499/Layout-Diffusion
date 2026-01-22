@@ -202,6 +202,7 @@ def training(**opts):
                     # for j, trajectory in pbar:
                     #     plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
                     #     pbar.set_description(f'Saving trajectory {i} step {j}')
+                model.train()
 
     if rank == 0:
         save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
