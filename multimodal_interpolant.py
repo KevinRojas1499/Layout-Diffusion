@@ -299,7 +299,8 @@ class MultimodalInterpolant():
         return rate
     
     def get_unmasking_rate(self, prediction: MultimodalModelPrediction, t: Tensor) -> Tensor:
-        rate = self.alpha(t).view(-1, 1, 1) * prediction.label_logits[:, :, :self.vocab_size].softmax(dim=-1)
+        # Subtracting 4 because we are not considering the start of sequence token, end of sequence token, the mask token and the pad token
+        rate = self.alpha(t).view(-1, 1, 1) * prediction.label_logits[:, :, :self.vocab_size-4].softmax(dim=-1)
         return rate
     
     def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tensor:
@@ -355,15 +356,18 @@ class MultimodalInterpolant():
             unmasking_rate = self.get_unmasking_rate(prediction, t)
             unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
             num_jumps = unmasking_nums.sum(dim=-1)
-            change_pos = (num_jumps == 1) & (mask_t) & (masked_positions)
-            unmasking_nums = unmasking_nums * change_pos.unsqueeze(-1)
-            new_sample = unmasking_nums.argmax(dim=-1)
-
-            yt = torch.where(change_pos, new_sample, yt)
-
+            if i != steps - 1:
+                change_pos = (num_jumps == 1) & (mask_t) & (masked_positions)
+                unmasking_nums = unmasking_nums * change_pos.unsqueeze(-1)
+                new_sample = unmasking_nums.argmax(dim=-1)
+            else:
+                change_pos = masked_positions
+                new_sample = unmasking_rate.argmax(dim=-1)
+            
             indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
             mean_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
 
+            yt = torch.where(change_pos, new_sample, yt)
             new_xt = (1 - self.delta * t.view(-1, 1, 1)) * mean_cond_y0 + self.delta * t.view(-1, 1, 1) * torch.randn_like(xt)
             xt = torch.where(change_pos.unsqueeze(-1), new_xt, xt)
 
