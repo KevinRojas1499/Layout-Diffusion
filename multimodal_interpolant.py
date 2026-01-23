@@ -349,13 +349,13 @@ class MultimodalInterpolant():
             xt = xt + (drift * dt)
             xt = torch.where(mask_t.unsqueeze(-1), xt, 0.)
             xt = torch.where(eos_bos_mask.unsqueeze(-1), 0., xt)
+            xt = torch.where(masked_positions.unsqueeze(-1), 0., xt)
 
             # Unmasking
             unmasking_rate = self.get_unmasking_rate(prediction, t)
             unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
             num_jumps = unmasking_nums.sum(dim=-1)
             change_pos = (num_jumps == 1) & (mask_t) & (masked_positions)
-
             unmasking_nums = unmasking_nums * change_pos.unsqueeze(-1)
             new_sample = unmasking_nums.argmax(dim=-1)
 
