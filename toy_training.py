@@ -55,6 +55,10 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.option('--run_name', type=str, default='')
 def training(**opts):
     opts = dotdict(opts)
+    seed = opts.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     batch_size = opts.batch_size
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -165,9 +169,9 @@ def training(**opts):
                 samples = interpolant.euclidean_sampling(model, 50, 5, dataset.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
                     plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+
                     os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
                     pbar = tqdm(enumerate(sample.trajectory), leave=False)
-
                     for j, trajectory in pbar:
                         plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
                         pbar.set_description(f'Saving trajectory {i} step {j}')

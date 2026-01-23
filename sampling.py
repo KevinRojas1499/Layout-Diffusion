@@ -3,6 +3,7 @@ import json
 import click
 import torch
 import torch.distributed as dist
+import numpy as np
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
@@ -10,7 +11,7 @@ from custom_datasets.qm9 import QM9Dataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from models.mmdit_qm9 import MMDiTQM9
-from visualize_dataset import plot_sample, plot_molecule
+from visualize_dataset import plot_sample, plot_molecule, plot_molecule_with_mask, compute_axis_limits
 
 import json
 from json import JSONEncoder
@@ -95,7 +96,7 @@ def sampling(**opts):
 
     output_samples = {"molecules": []}
     for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
-        samples = interpolant.euclidean_sampling(model, batch_size, num_steps, dataset.max_length, device, return_trace=opts.return_trace)
+        samples = interpolant.euclidean_sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace)
         for i, sample in enumerate(samples):
             symbols = character_tokenizer.decode(sample.yt.cpu())
             positions = sample.xt.cpu()[1:len(symbols)+1, :]
@@ -113,6 +114,44 @@ def sampling(**opts):
                     symbols = character_tokenizer.decode(sample.yt.cpu())
                     positions = sample.xt.cpu()[1:len(symbols)+1, :]
                     plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
+
+                    os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
+                    os.makedirs(os.path.join(path, f'trajectory_sample_{i}'), exist_ok=True)
+                    
+                    # Compute fixed axis limits from the final molecule for animation consistency
+                    final_yt = sample.yt.cpu()
+                    final_xt = sample.xt.cpu()
+                    # Convert to numpy for axis limit computation
+                    if isinstance(final_xt, torch.Tensor):
+                        final_xt_np = final_xt.cpu().numpy()
+                    else:
+                        final_xt_np = np.array(final_xt)
+                    axis_limits = compute_axis_limits(final_xt_np, padding=2.0)
+                    
+                    pbar = tqdm(enumerate(sample.trajectory), leave=False)
+                    for j, trajectory in pbar:
+                        # Get trajectory data - xt is [L+2, 3], yt is [L+2], mask_t is [L+2]
+                        cur_yt = trajectory.yt.cpu()  # Token IDs
+                        cur_xt = trajectory.xt.cpu()  # Positions [L+2, 3]
+                        cur_mask_t = trajectory.mask_t.cpu()  # Mask [L+2]
+                        cur_t = trajectory.t.cpu().item() if hasattr(trajectory.t, 'item') else trajectory.t
+                        
+                        # Determine which tokens are masked (mask_token_id)
+                        mask_token_id = character_tokenizer.mask_token_id
+                        is_masked = (cur_yt == mask_token_id).numpy()
+                        
+                        # Plot molecule with mask visualization and fixed axis limits
+                        plot_molecule_with_mask(
+                            cur_yt,  # Token IDs
+                            cur_xt,  # All positions including BOS/EOS
+                            is_masked,  # Which tokens are masked
+                            os.path.join(path, f'trajectory_{i}', f'step_{j}.png'),
+                            character_tokenizer,
+                            t=cur_t,
+                            axis_limits=axis_limits  # Fixed limits for animation
+                        )
+                        plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_sample_{i}', f'step_{j}.png'), character_tokenizer)
+                        pbar.set_description(f'Saving trajectory {i} step {j}')
                 except Exception as e:
                     print(f'Error plotting sample {i}')
             

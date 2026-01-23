@@ -192,18 +192,320 @@ def plot_molecule(symbols, positions, out_file_name, smiles=None):
     ax.set_ylabel('Y (Å)')
     ax.set_zlabel('Z (Å)')
     
-    # Set equal aspect ratio for 3D plot to prevent distortion
-    max_range = np.array([positions[:, 0].max()-positions[:, 0].min(), 
-                          positions[:, 1].max()-positions[:, 1].min(), 
-                          positions[:, 2].max()-positions[:, 2].min()]).max() / 2.0
-
-    mid_x = (positions[:, 0].max()+positions[:, 0].min()) * 0.5
-    mid_y = (positions[:, 1].max()+positions[:, 1].min()) * 0.5
-    mid_z = (positions[:, 2].max()+positions[:, 2].min()) * 0.5
+    # Use fixed axis limits for consistent visualization
+    axis_limits = get_fixed_axis_limits()
+    (x_min, x_max), (y_min, y_max), (z_min, z_max) = axis_limits
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_zlim(z_min, z_max)
     
-    ax.set_xlim(mid_x - max_range, mid_x + max_range)
-    ax.set_ylim(mid_y - max_range, mid_y + max_range)
-    ax.set_zlim(mid_z - max_range, mid_z + max_range)
+    plt.tight_layout()
+    plt.savefig(out_file_name, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def get_fixed_axis_limits():
+    """
+    Get fixed axis limits for consistent visualization across all molecules.
+    These limits are independent of the molecule size and ensure all plots use the same scale.
+    
+    Returns:
+        Tuple of ((x_min, x_max), (y_min, y_max), (z_min, z_max))
+    """
+    # Fixed limits suitable for QM9 molecules (small organic molecules)
+    # Range of -15 to 15 Angstroms should accommodate most molecules with some padding
+    limit = 3.0
+    return ((-limit, limit), (-limit, limit), (-limit, limit))
+
+
+def compute_axis_limits(positions, padding=2.0):
+    """
+    Compute fixed axis limits for animation consistency.
+    
+    Args:
+        positions: numpy array of shape (N, 3) with atomic positions
+        padding: Additional padding around the molecule in Angstroms
+    
+    Returns:
+        Tuple of ((x_min, x_max), (y_min, y_max), (z_min, z_max))
+    """
+    if len(positions) == 0:
+        return get_fixed_axis_limits()
+    
+    # Filter out invalid positions (at origin)
+    valid_mask = np.any(positions != 0, axis=1) | (np.sum(np.abs(positions), axis=1) > 1e-6)
+    if valid_mask.sum() == 0:
+        return get_fixed_axis_limits()
+    
+    valid_positions = positions[valid_mask]
+    
+    max_range = np.array([
+        valid_positions[:, 0].max() - valid_positions[:, 0].min(),
+        valid_positions[:, 1].max() - valid_positions[:, 1].min(),
+        valid_positions[:, 2].max() - valid_positions[:, 2].min()
+    ]).max() / 2.0
+    
+    if max_range == 0:
+        max_range = 5.0
+    
+    mid_x = (valid_positions[:, 0].max() + valid_positions[:, 0].min()) * 0.5
+    mid_y = (valid_positions[:, 1].max() + valid_positions[:, 1].min()) * 0.5
+    mid_z = (valid_positions[:, 2].max() + valid_positions[:, 2].min()) * 0.5
+    
+    return (
+        (mid_x - max_range - padding, mid_x + max_range + padding),
+        (mid_y - max_range - padding, mid_y + max_range + padding),
+        (mid_z - max_range - padding, mid_z + max_range + padding)
+    )
+
+
+def plot_molecule_with_mask(symbols, positions, mask, out_file_name, character_tokenizer, t=None, axis_limits=None):
+    """
+    Plots a molecule in 3D showing masked tokens with different visualization.
+    Masked tokens are shown as transparent/hollow atoms.
+    
+    Args:
+        symbols: List of atomic symbols (e.g., ['C', 'H', 'O', ...]) or token IDs (Tensor/array)
+        positions: numpy array of shape (N, 3) with atomic positions in Angstroms
+        mask: numpy array or tensor of shape (N,) indicating which tokens are masked (True=masked)
+        out_file_name: Output file path for the plot
+        character_tokenizer: Tokenizer to decode symbols if they are token IDs
+        t: Optional timestep value to display
+        axis_limits: Optional tuple ((x_min, x_max), (y_min, y_max), (z_min, z_max)) to fix axis limits
+    """
+    # Convert to numpy if needed
+    if isinstance(positions, torch.Tensor):
+        positions = positions.cpu().numpy()
+    if isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+    
+    positions = np.array(positions)
+    mask = np.array(mask, dtype=bool)
+    
+    # Get special token IDs before converting
+    bos_token_id = character_tokenizer.bos_token_id
+    eos_token_id = character_tokenizer.eos_token_id
+    pad_token_id = character_tokenizer.pad_token_id
+    mask_token_id = character_tokenizer.mask_token_id
+    
+    # Store original token IDs before conversion
+    if isinstance(symbols, torch.Tensor):
+        token_ids = symbols.cpu().numpy()
+    elif isinstance(symbols, (list, np.ndarray)) and len(symbols) > 0:
+        first_elem = symbols[0] if isinstance(symbols, list) else symbols[0].item() if isinstance(symbols, np.ndarray) else symbols[0]
+        if isinstance(first_elem, (int, np.integer)):
+            token_ids = np.array([int(token) for token in symbols])
+        else:
+            token_ids = None
+    else:
+        token_ids = None
+    
+    # Identify special tokens from token IDs
+    if token_ids is not None:
+        is_bos = (token_ids == bos_token_id)
+        is_eos = (token_ids == eos_token_id)
+        is_pad = (token_ids == pad_token_id)
+    else:
+        # Already converted to strings, check by string comparison
+        is_bos = np.array([s == '<BOS>' or s == character_tokenizer.idx_to_atom.get(bos_token_id, '') for s in symbols])
+        is_eos = np.array([s == '<EOS>' or s == character_tokenizer.idx_to_atom.get(eos_token_id, '') for s in symbols])
+        is_pad = np.array([s == '<pad>' or s == character_tokenizer.idx_to_atom.get(pad_token_id, '') for s in symbols])
+    
+    # Decode symbols if they are token IDs
+    if isinstance(symbols, torch.Tensor):
+        symbols_tensor = symbols.cpu()
+        # Convert token IDs to symbol strings
+        symbols = [character_tokenizer.idx_to_atom[token.item()] for token in symbols_tensor]
+    elif isinstance(symbols, (list, np.ndarray)) and len(symbols) > 0:
+        # Check if first element is an integer (token ID)
+        first_elem = symbols[0] if isinstance(symbols, list) else symbols[0].item() if isinstance(symbols, np.ndarray) else symbols[0]
+        if isinstance(first_elem, (int, np.integer)):
+            # Convert token IDs to symbol strings
+            symbols = [character_tokenizer.idx_to_atom[int(token)] for token in symbols]
+    else:
+        symbols = list(symbols)
+    
+    # Filter out padding (atoms at origin with zero coordinates)
+    # Use a very strict threshold - only consider positions at exactly/nearly origin as invalid
+    # This ensures we preserve actual positions for masked tokens that are being denoised
+    position_magnitude = np.sum(np.abs(positions), axis=1)
+    # Very strict: only positions that are essentially at origin (within 1e-5) are considered invalid
+    # This way, masked tokens with any meaningful position will be shown at their actual location
+    valid_positions = position_magnitude > 1e-5  # Very strict threshold to preserve actual positions
+    
+    # Create display mask: exclude BOS, EOS, and padding
+    # But we want to show masked tokens even if they don't have valid positions yet
+    display_mask = ~is_pad & ~is_bos & ~is_eos
+    
+    if display_mask.sum() == 0:
+        # Nothing to plot
+        return
+    
+    # Apply display mask
+    symbols = [symbols[i] for i in range(len(symbols)) if display_mask[i]]
+    positions = positions[display_mask]
+    mask = mask[display_mask] if len(mask) == len(display_mask) else mask[:len(display_mask)][display_mask]
+    valid_positions = valid_positions[display_mask]
+    
+    # IMPORTANT: Masked tokens are set to origin (0,0,0) in the interpolant
+    # We should show them at origin, but spread them slightly so they're visible
+    # Check which masked tokens are at origin
+    masked_at_origin = [i for i in range(len(positions)) if mask[i] and not valid_positions[i]]
+    
+    # For masked tokens at origin, keep them at origin but spread them minimally for visibility
+    # Masked tokens are set to (0,0,0) in the interpolant, so we show them clustered at origin
+    if len(masked_at_origin) > 0:
+        # Spread masked tokens in a very small sphere around origin (0.3 Å radius)
+        # This makes them visible while clearly showing they're at origin
+        spread_radius = 0.3  # Very small spread - just enough to see multiple tokens
+        for idx, i in enumerate(masked_at_origin):
+            if len(masked_at_origin) == 1:
+                # Single masked token - keep it exactly at origin
+                positions[i] = np.array([0.0, 0.0, 0.0])
+            else:
+                # Multiple masked tokens - spread them in a tiny sphere around origin
+                angle = 2 * np.pi * idx / len(masked_at_origin)
+                z_offset = 0.1 * np.sin(2 * angle)  # Very small z variation
+                positions[i] = spread_radius * np.array([
+                    np.cos(angle),
+                    np.sin(angle),
+                    z_offset
+                ])
+    
+    # Note: Masked tokens with valid positions (not at origin) will be shown at their actual positions
+    # This can happen during denoising when positions are being updated
+    
+    # Count masked tokens
+    num_masked = mask.sum()
+    num_unmasked = (~mask).sum()
+    
+    # CPK coloring convention
+    colors = {
+        'H': 'white',
+        'C': 'grey',
+        'N': 'blue',
+        'O': 'red',
+        'F': 'green',
+        'S': 'yellow',
+        'Cl': 'green',
+        'P': 'orange',
+        'Br': 'darkred',
+        '<M>': 'purple',  # Mask token
+        '<pad>': 'lightgray',  # Padding
+    }
+    
+    # Atom sizes (approximate relative scales)
+    sizes = {
+        'H': 100,
+        'C': 300,
+        'N': 300,
+        'O': 300,
+        'F': 300,
+        'S': 400,
+        'Cl': 400,
+        'P': 400,
+        'Br': 400,
+        '<M>': 250,
+        '<pad>': 150,
+    }
+    
+    # Separate masked and unmasked atoms
+    unmasked_indices = np.where(~mask)[0]
+    masked_indices = np.where(mask)[0]
+    
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot unmasked atoms (normal, opaque)
+    if len(unmasked_indices) > 0:
+        unmasked_symbols = [symbols[i] for i in unmasked_indices]
+        unmasked_positions = positions[unmasked_indices]
+        unmasked_colors = [colors.get(s, 'pink') for s in unmasked_symbols]
+        unmasked_sizes = [sizes.get(s, 200) for s in unmasked_symbols]
+        
+        ax.scatter(unmasked_positions[:, 0], unmasked_positions[:, 1], unmasked_positions[:, 2], 
+                   s=unmasked_sizes, c=unmasked_colors, edgecolor='black', alpha=1.0, linewidths=1.5,
+                   label='Unmasked', zorder=5)
+    
+    # Plot masked atoms (transparent/hollow with red edge) at their ACTUAL positions from trajectory
+    # Note: positions[masked_indices] contains the actual positions from the trajectory data
+    # We only modified positions for masked tokens that were at origin (no valid position)
+    # All other masked tokens are shown at their real positions from the sampling process
+    if len(masked_indices) > 0:
+        masked_symbols = [symbols[i] for i in masked_indices]
+        masked_positions = positions[masked_indices]  # Actual positions from trajectory (or default if was at origin)
+        masked_colors = [colors.get(s, 'purple') for s in masked_symbols]
+        masked_sizes = [sizes.get(s, 200) for s in masked_symbols]
+        
+        # Plot as hollow/transparent with red edge
+        # This shows masked tokens at their actual positions from the trajectory
+        # If a masked token had a valid position, it's shown there; if not, it's at the default location
+        ax.scatter(masked_positions[:, 0], masked_positions[:, 1], masked_positions[:, 2], 
+                   s=masked_sizes, c=masked_colors, edgecolor='red', alpha=0.3, linewidths=2.5,
+                   label='Masked', zorder=4)
+        # Add a second layer with just edges for visibility
+        ax.scatter(masked_positions[:, 0], masked_positions[:, 1], masked_positions[:, 2], 
+                   s=masked_sizes, facecolors='none', edgecolor='red', alpha=0.8, linewidths=2.5,
+                   zorder=6)
+    
+    # Get bonds using OpenBabel pipeline (only for unmasked atoms)
+    if len(unmasked_indices) > 0:
+        unmasked_symbols_for_bonds = [symbols[i] for i in unmasked_indices]
+        unmasked_positions_for_bonds = positions[unmasked_indices]
+        bonds = _get_bonds_via_openbabel(unmasked_symbols_for_bonds, unmasked_positions_for_bonds)
+        
+        # Map bond indices back to original positions
+        idx_map = {orig_idx: new_idx for new_idx, orig_idx in enumerate(unmasked_indices)}
+        for i, j in bonds:
+            if i < len(unmasked_indices) and j < len(unmasked_indices):
+                orig_i = unmasked_indices[i]
+                orig_j = unmasked_indices[j]
+                ax.plot([positions[orig_i, 0], positions[orig_j, 0]],
+                        [positions[orig_i, 1], positions[orig_j, 1]],
+                        [positions[orig_i, 2], positions[orig_j, 2]],
+                        color='black', linewidth=2, zorder=1, alpha=0.6)
+    
+    # Label atoms
+    for i, sym in enumerate(symbols):
+        if mask[i]:
+            # Masked atoms: show as "M" or the symbol with a red background
+            label = f'M' if sym == '<M>' else sym
+            ax.text(positions[i, 0], positions[i, 1], positions[i, 2], label, 
+                    fontsize=9, ha='center', va='center', zorder=10, 
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='red', alpha=0.5, edgecolor='red', linewidth=1.5),
+                    color='white', weight='bold')
+        else:
+            # Unmasked atoms: normal label
+            ax.text(positions[i, 0], positions[i, 1], positions[i, 2], sym, 
+                    fontsize=10, ha='center', va='center', zorder=10, 
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7, edgecolor='none'))
+    
+    ax.set_xlabel('X (Å)')
+    ax.set_ylabel('Y (Å)')
+    ax.set_zlabel('Z (Å)')
+    
+    # Create title with mask information
+    title_parts = [f'Masked: {num_masked}, Unmasked: {num_unmasked}']
+    if t is not None:
+        title_parts.append(f't={t:.3f}')
+    ax.set_title(' / '.join(title_parts), fontsize=12, pad=20)
+    
+    # Add legend
+    ax.legend(loc='upper left')
+    
+    # Use fixed axis limits for consistent visualization
+    # If axis_limits is provided (for trajectory animation), use those; otherwise use global fixed limits
+    if axis_limits is not None:
+        # Use provided fixed axis limits for animation consistency
+        (x_min, x_max), (y_min, y_max), (z_min, z_max) = axis_limits
+    else:
+        # Use global fixed axis limits
+        axis_limits = get_fixed_axis_limits()
+        (x_min, x_max), (y_min, y_max), (z_min, z_max) = axis_limits
+    
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_zlim(z_min, z_max)
     
     plt.tight_layout()
     plt.savefig(out_file_name, dpi=150, bbox_inches='tight')
