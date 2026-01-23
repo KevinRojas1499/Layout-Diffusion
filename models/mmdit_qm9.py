@@ -412,13 +412,10 @@ class MMDiTQM9(nn.Module):
         clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
         # Insertion rate prediction
         # TODO : Maybe the insertion rate could use both cat tokens and euclidean ones
-        insertion_rate = self.insertion_rate(cat_tokens, pos_time).squeeze(-1)  # [B, L, 1]
-        # Mask invalid positions by setting them to large negative value before log_softmax
-        # This ensures they get effectively zero probability after exp()
-        if pos_mask is not None:
-            insertion_rate = insertion_rate.masked_fill(~pos_mask, float('-inf'))
-            insertion_rate[:,0] = float('-inf') # We are modeling insertion to the left, so we can't do it for the first position
+        insertion_rate = self.insertion_rate(cat_tokens, pos_time).squeeze(-1)  # [B, L]
         insertion_rate = F.softplus(insertion_rate)
+        insertion_rate = insertion_rate * pos_mask
+        insertion_rate[:,0] = 0.0
 
         return MultimodalModelPrediction(
             clean_data=clean_data_pred,
