@@ -67,15 +67,15 @@ class JointMultimodalInterpolantResult:
     xt_original_order: Tensor # Shape [Batch, Length]
     mask_original_order: Tensor # Shape [Batch, Length]
     t: Tensor # Shape [Batch]
-    x0: Tensor
-    y0: Tensor
-    x0_ordered: Tensor
-    y0_ordered: Tensor
+    x1: Tensor
+    y1: Tensor
+    x1_ordered: Tensor
+    y1_ordered: Tensor
     yt_original_order: Tensor
 
     @property
     def y1_length(self) -> Tensor:
-        return (self.y0 != self.pad_token).sum(dim=1)
+        return (self.y1 != self.pad_token).sum(dim=1)
     
     @property
     def yt_length(self) -> Tensor:
@@ -131,10 +131,10 @@ class MultimodalInterpolant():
     def alpha(self, t):
         return t
     
-    def get_masking_and_deletion_time(self, y0):
-        u1 = torch.rand_like(y0, dtype=torch.float32)
+    def get_masking_and_deletion_time(self, y1):
+        u1 = torch.rand_like(y1, dtype=torch.float32)
         deletion_time = (1-u1)
-        u2 = torch.rand_like(y0, dtype=torch.float32)
+        u2 = torch.rand_like(y1, dtype=torch.float32)
         masking_time = (1 - u1 * u2) 
         return masking_time, deletion_time
 
@@ -151,22 +151,22 @@ class MultimodalInterpolant():
 
         return x, y, mask
 
-    def sample_interpolant(self, t: Tensor, x0: Tensor, y0: Tensor,attn_mask: Tensor) -> JointMultimodalInterpolantResult:
+    def sample_interpolant(self, t: Tensor, x1: Tensor, y1: Tensor,attn_mask: Tensor) -> JointMultimodalInterpolantResult:
         t_shaped_disc = t.view(-1,1)
         t_shaped_euc = t.view(-1,1,1)
 
         # Add noise to euclidean data
-        full_xt = self.alpha(t_shaped_euc) * x0 + (1 - self.alpha(t_shaped_euc)) * torch.randn_like(x0)
+        full_xt = self.alpha(t_shaped_euc) * x1 + (1 - self.alpha(t_shaped_euc)) * torch.randn_like(x1)
         full_xt = torch.where(attn_mask.unsqueeze(-1), full_xt, 0.)
         full_xt[:,0] = 0. # Don't corrupt begginning of the sequence
 
         # Masking data
-        # Deletion and masking times are independent for every position, thats why we pass y0
-        masking_time, deletion_time = self.get_masking_and_deletion_time(y0)
+        # Deletion and masking times are independent for every position, thats why we pass y1
+        masking_time, deletion_time = self.get_masking_and_deletion_time(y1)
 
         # Discrete data
         mask_positions = (t_shaped_disc <= masking_time) & attn_mask
-        yt = torch.where(mask_positions, self.mask_token, y0) # Change to mask id
+        yt = torch.where(mask_positions, self.mask_token, y1) # Change to mask id
 
         # Euclidean data
         full_xt = torch.where(mask_positions.unsqueeze(-1), 0., full_xt) # Change to mask id
@@ -182,16 +182,16 @@ class MultimodalInterpolant():
         xt = self.get_active_positions(full_xt, st)
         yt = self.get_active_positions(yt, st)
         mask_t = self.get_active_positions(new_mask, st) # This will reorder the mask according to the new order
-        y0_reordered = self.get_active_positions(y0, st)
-        x0_ordered = self.get_active_positions(x0, st)
+        y1_ordered = self.get_active_positions(y1, st)
+        x1_ordered = self.get_active_positions(x1, st)
 
         return JointMultimodalInterpolantResult(
             pad_token=self.pad_token,
-            xt=xt, yt=yt, st=st, mask_t=mask_t, t=t, x0=x0, y0=y0, 
-            x0_ordered=x0_ordered, 
+            xt=xt, yt=yt, st=st, mask_t=mask_t, t=t, x1=x1, y1=y1, 
+            x1_ordered=x1_ordered, 
             xt_original_order=full_xt, 
             mask_original_order=new_mask, 
-            y0_ordered=y0_reordered,
+            y1_ordered=y1_ordered,
             yt_original_order=yt,
         )
 
@@ -222,12 +222,12 @@ class MultimodalInterpolant():
             return torch.gather(xt, 1, st_expanded)
 
     def compute_loss(self, model, batch):
-        _x0 = batch["x"]
-        _y0 = batch["y"]
-        _mask_0 = batch["mask"]
-        x0, y0, mask_0 = self.pad_sequence(_x0, _y0, _mask_0)
-        t = self.sample_time(_x0.shape[0], _x0.device)
-        interpolant_sample = self.sample_interpolant(t, x0, y0, mask_0)
+        _x1 = batch["x"]
+        _y1 = batch["y"]
+        _mask_1 = batch["mask"]
+        x1, y1, mask_1 = self.pad_sequence(_x1, _y1, _mask_1)
+        t = self.sample_time(_x1.shape[0], _x1.device)
+        interpolant_sample = self.sample_interpolant(t, x1, y1, mask_1)
 
         prediction: MultimodalModelPrediction = model(
             euclidean_tokens=interpolant_sample.xt,
@@ -245,29 +245,29 @@ class MultimodalInterpolant():
         # We must only compute the loss for positions that are:
         # not deleted: mask_t_shaped
         # not masked: masked_positions.unsqueeze(-1)
-        dsm_loss = (interpolant_sample.x0_ordered - prediction.clean_data)**2 * mask_t_shaped
+        dsm_loss = (interpolant_sample.x1_ordered - prediction.clean_data)**2 * mask_t_shaped
         dsm_loss[:,0] = 0. # Don't take loss at the start of the sequence
         dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions]
-        dsm_loss = dsm_loss.mean() / x0.shape[-1]
+        dsm_loss = dsm_loss.mean() / x1.shape[-1]
         # Insertion loss
         insertion_rate = prediction.insertion_rate
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
         insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
-        insertion_loss = insertion_loss.sum() / (y0.shape[0] * self.max_length)
+        insertion_loss = insertion_loss.sum() / (y1.shape[0] * self.max_length)
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
         logits_flat = prediction.label_logits[masked_positions]
-        targets_flat = interpolant_sample.y0_ordered[masked_positions]
+        targets_flat = interpolant_sample.y1_ordered[masked_positions]
         tokens_loss = F.cross_entropy(logits_flat, targets_flat, reduction="none").mean()
 
         # Predicted euclidean loss
-        # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y0 is [B, L] with vocab indices
-        y0_indices = interpolant_sample.y0_ordered.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x0.shape[-1])  # [B, L] -> [B, L, 1, D]
-        predicted_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=y0_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
-        euclidean_loss = (predicted_cond_y0 - interpolant_sample.x0_ordered)**2
+        # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y1 is [B, L] with vocab indices
+        y1_indices = interpolant_sample.y1_ordered.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x1.shape[-1])  # [B, L] -> [B, L, 1, D]
+        predicted_cond_y1 = prediction.clean_data_unmasking.gather(dim=2, index=y1_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
+        euclidean_loss = (predicted_cond_y1 - interpolant_sample.x1_ordered)**2
         euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
-        euclidean_loss = euclidean_loss.mean() / x0.shape[-1]
+        euclidean_loss = euclidean_loss.mean() / x1.shape[-1]
 
 
         return {
@@ -352,10 +352,10 @@ class MultimodalInterpolant():
                 new_sample = unmasking_rate.argmax(dim=-1)
             
             indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
-            mean_cond_y0 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
+            mean_cond_y1 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
 
             yt = torch.where(change_pos, new_sample, yt)
-            new_xt = self.alpha(t).view(-1, 1, 1) * mean_cond_y0 + (1 - self.alpha(t).view(-1, 1, 1)) * torch.randn_like(xt)
+            new_xt = self.alpha(t).view(-1, 1, 1) * mean_cond_y1 + (1 - self.alpha(t).view(-1, 1, 1)) * torch.randn_like(xt)
             xt = torch.where(change_pos.unsqueeze(-1), new_xt, xt)
 
 
