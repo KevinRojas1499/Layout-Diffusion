@@ -56,10 +56,23 @@ class MultimodalVariableLengthToyDataset(Dataset):
         self.max_length = max_length
         self.tokenizer = tokenizer
         self.text_vocab_size = tokenizer.vocab_size
-        self.text = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        self.text_options =[
+            'NARUTO', # 6
+            'SASUKE', # 6
+            'ITACHI', # 6
+            'KAKASHI', # 7
+            'SAKURA', # 6
+            'KIBA', # 4
+            'HINATA',
+            'SHINO', # 5
+            'GAARA', # 5
+            'KANKURO', # 7
+            'SHIKAMARU', # 9
+        ] 
 
     def __getitem__(self, index):
-        length = torch.randint(1, self.max_length + 1, (1,))
+        text_option = self.text_options[torch.randint(0, len(self.text_options), (1,))]
+        length = len(text_option)
         mask = torch.ones(self.max_length, dtype=torch.bool)
         mask[length:] = False
         data = torch.arange(self.max_length, dtype=torch.float32) + torch.randn(self.max_length) * .01
@@ -67,9 +80,7 @@ class MultimodalVariableLengthToyDataset(Dataset):
         data = data.unsqueeze(-1).expand(-1,3)
         
         # Get labels for the valid length
-        current_len = length.item()
-        labels_str = self.text[:current_len]
-        label = self.tokenizer.pad_tokenize(labels_str, self.max_length)
+        label = self.tokenizer.pad_tokenize(text_option, self.max_length)
         
         return {"x": data, "mask": mask, "y": label}
     def __len__(self):

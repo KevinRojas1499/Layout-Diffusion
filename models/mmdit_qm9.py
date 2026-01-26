@@ -415,7 +415,6 @@ class MMDiTQM9(nn.Module):
         insertion_rate = self.insertion_rate(cat_tokens, pos_time).squeeze(-1)  # [B, L]
         insertion_rate = F.softplus(insertion_rate)
         insertion_rate = insertion_rate * pos_mask
-        insertion_rate[:,0] = 0.0
 
         return MultimodalModelPrediction(
             clean_data=clean_data_pred,

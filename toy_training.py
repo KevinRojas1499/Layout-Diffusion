@@ -101,7 +101,6 @@ def training(**opts):
         mask_token=character_tokenizer.mask_token_id,
         pad_token=character_tokenizer.pad_token_id, 
         bos_token=character_tokenizer.bos_token_id,
-        eos_token=character_tokenizer.eos_token_id,
         euclidean_dim=3,
     )
     start_iter = 0
@@ -170,11 +169,11 @@ def training(**opts):
                 for i, sample in enumerate(samples):
                     plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
 
-                    os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
-                    pbar = tqdm(enumerate(sample.trajectory), leave=False)
-                    for j, trajectory in pbar:
-                        plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
-                        pbar.set_description(f'Saving trajectory {i} step {j}')
+                    # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
+                    # pbar = tqdm(enumerate(sample.trajectory), leave=False)
+                    # for j, trajectory in pbar:
+                    #     plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
+                    #     pbar.set_description(f'Saving trajectory {i} step {j}')
                 model.train()
 
     save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
