@@ -14,6 +14,9 @@ class QM9Dataset(Dataset):
             'data/qm9_preprocessed'
         )
         
+    def rotate_molecule(self, pos, rotation_matrix):
+        return pos @ rotation_matrix
+
     def __len__(self):
         return len(self.qm9_dataset)
 
@@ -22,11 +25,14 @@ class QM9Dataset(Dataset):
         if self.use_raw_dataset:
             atomic_symbols = data['original_atomic_symbols']
             pos = data['original_pos']
-        else:
-            atomic_symbols = data['atomic_symbols']
-            pos = data['pos']
-            atomic_symbols, pos = self.reorder_hydrogens_only(atomic_symbols, pos)
 
+        centroid = np.mean(pos, axis=0)
+        pos = pos - centroid
+        rotation_matrix = np.linalg.qr(np.random.randn(3, 3))[0]
+        rotation_matrix = rotation_matrix @ np.diag(np.sign(np.diag(rotation_matrix)))   # fix QR sign ambiguity
+        if np.linalg.det(rotation_matrix) < 0:
+            rotation_matrix[:, -1] *= -1
+        pos = self.rotate_molecule(pos, rotation_matrix)
         
         # Pad the atomic symbols and pos to the max length
         original_length = len(pos)
