@@ -47,8 +47,9 @@ def suppress_stderr():
 
 def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list: List[np.ndarray], 
                                    radius: int = 2, n_bits: int = 2048,
-                                   fingerprint_type: str = 'morgan',
-                                   filter_invalid: bool = True) -> Tuple[np.ndarray, List[int]]:
+                                   fingerprint_type: str = 'rdkit',
+                                   filter_invalid: bool = True,
+                                   return_stats: bool = False):
     """
     Compute molecular fingerprints for molecules using OpenBabel pipeline.
     Matches paper methodology: xyz → sdf (OpenBabel) → RDKit.
@@ -62,9 +63,10 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
         filter_invalid: If True, filter out invalid and not-fully-connected molecules
     
     Returns:
-        Tuple of (fingerprints, valid_indices):
+        Tuple of (fingerprints, valid_indices) or (fingerprints, valid_indices, stats) if return_stats:
         - fingerprints: numpy array of shape (num_molecules, n_bits) with binary fingerprints
         - valid_indices: List of original indices that passed filtering
+        - stats: dict with counts for total/valid/invalid/not_connected/failed
     """
     fingerprints = []
     valid_indices = []
@@ -91,12 +93,10 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
                     continue
             
             # Compute fingerprint based on type
-            if fingerprint_type.lower() == 'rdkit':
-                # RDKit fingerprint (standard RDKit topological fingerprint)
-                fp = Chem.RDKFingerprint(mol, maxPath=7, fpSize=n_bits)
-            else:
-                # Morgan fingerprint (default)
+            if fingerprint_type.lower() == 'morgan':
                 fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
+            else:
+                fp = Chem.RDKFingerprint(mol, maxPath=7, fpSize=n_bits)
             
             fingerprints.append(np.array(fp))
             valid_indices.append(idx)
@@ -109,9 +109,16 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
     if len(fingerprints) == 0:
         raise ValueError(f"No valid fingerprints computed (failed for all {len(symbols_list)} molecules)")
     
-    # Logging
+    # Logging + stats
     total_processed = len(symbols_list)
     total_valid = len(fingerprints)
+    stats = {
+        'total': total_processed,
+        'valid': total_valid,
+        'invalid': invalid_count,
+        'not_connected': not_connected_count,
+        'failed': failed_count
+    }
     if filter_invalid:
         print(f"Fingerprint computation summary:")
         print(f"  Total molecules: {total_processed}")
@@ -124,6 +131,8 @@ def compute_molecular_fingerprints(symbols_list: List[List[str]], positions_list
         if failed_count > 0:
             print(f"Successfully computed {total_valid} fingerprints ({failed_count} failed)")
     
+    if return_stats:
+        return np.array(fingerprints), valid_indices, stats
     return np.array(fingerprints), valid_indices
 
 
@@ -255,8 +264,8 @@ def _positions_to_molecule_via_openbabel(symbols: List[str], positions: np.ndarr
 
 
 def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2, 
-                          n_neighbors: int = 15, min_dist: float = 0.1, 
-                          random_state: int = 42) -> np.ndarray:
+                          n_neighbors: Optional[int] = None, min_dist: Optional[float] = None, 
+                          random_state: Optional[int] = None) -> np.ndarray:
     """
     Compute UMAP embedding of molecular fingerprints.
     
@@ -280,24 +289,19 @@ def compute_umap_embedding(fingerprints: np.ndarray, n_components: int = 2,
     Returns:
         numpy array of shape (N, n_components) with UMAP embedding
     """
-    # Set numpy random seed for additional reproducibility
-    # (UMAP uses numpy random internally)
-    np.random.seed(random_state)
-    
-    # Suppress UMAP warnings about Jaccard metric and n_jobs
+    # Suppress UMAP warnings about n_jobs when random_state is set
     with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='.*gradient function is not yet implemented.*')
         warnings.filterwarnings('ignore', message='.*n_jobs value.*overridden.*')
-        
-        reducer = umap.UMAP(
-            n_components=n_components,
-            n_neighbors=n_neighbors,
-            min_dist=min_dist,
-            random_state=random_state,
-            metric='jaccard',  # Jaccard distance is good for binary fingerprints
-            verbose=False,  # Suppress UMAP output for cleaner logs
-            n_jobs=1  # Explicitly set to avoid warning when random_state is set
-        )
+        umap_kwargs = {
+            'n_components': n_components,
+            'random_state': random_state,
+            'verbose': False
+        }
+        if n_neighbors is not None:
+            umap_kwargs['n_neighbors'] = n_neighbors
+        if min_dist is not None:
+            umap_kwargs['min_dist'] = min_dist
+        reducer = umap.UMAP(**umap_kwargs)
         
         embedding = reducer.fit_transform(fingerprints)
     
@@ -715,8 +719,8 @@ def evaluate_molecule_distributions(
     fingerprint_bits: int = 2048,
     real_smiles: Optional[List[str]] = None,
     generated_smiles: Optional[List[str]] = None,
-    fingerprint_type: str = 'morgan',
-    random_seed: int = 42,
+    fingerprint_type: str = 'rdkit',
+    random_seed: Optional[int] = None,
     filter_invalid: bool = True
 ):
     """
@@ -753,7 +757,7 @@ def evaluate_molecule_distributions(
             n_gen_samples = n_samples
     
     # Set random seed for reproducible sampling
-    rng = np.random.RandomState(random_seed)
+    rng = np.random.RandomState(random_seed) if random_seed is not None else np.random
     
     # Sample real molecules if n_real_samples is specified
     if n_real_samples is not None and len(real_symbols) > n_real_samples:
@@ -788,21 +792,32 @@ def evaluate_molecule_distributions(
     print("="*50)
     print(f"Using {fingerprint_type} fingerprints...")
     print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
-    real_fps, real_valid = compute_molecular_fingerprints(
+    real_fps, real_valid, real_fp_stats = compute_molecular_fingerprints(
         real_symbols, real_positions,
         radius=fingerprint_radius, n_bits=fingerprint_bits,
         fingerprint_type=fingerprint_type,
-        filter_invalid=filter_invalid
+        filter_invalid=filter_invalid,
+        return_stats=True
     )
     print(f"Valid real molecules: {len(real_fps)}")
     
     print(f"Computing fingerprints for {len(generated_symbols)} generated molecules...")
-    generated_fps, gen_valid = compute_molecular_fingerprints(
+    generated_fps, gen_valid, gen_fp_stats = compute_molecular_fingerprints(
         generated_symbols, generated_positions,
         radius=fingerprint_radius, n_bits=fingerprint_bits,
         fingerprint_type=fingerprint_type,
-        filter_invalid=filter_invalid
+        filter_invalid=filter_invalid,
+        return_stats=True
     )
+    print("\nPre-filter stats (all samples):")
+    print(f"  QM9 total: {real_fp_stats['total']} (failed={real_fp_stats['failed']})")
+    print(f"  Generated total: {gen_fp_stats['total']} (failed={gen_fp_stats['failed']})")
+    if filter_invalid:
+        print("\nFiltering summary (after xyz→sdf→RDKit):")
+        print(f"  QM9 valid: {real_fp_stats['valid']} / {real_fp_stats['total']} "
+              f"(invalid={real_fp_stats['invalid']}, not_connected={real_fp_stats['not_connected']})")
+        print(f"  Generated valid: {gen_fp_stats['valid']} / {gen_fp_stats['total']} "
+              f"(invalid={gen_fp_stats['invalid']}, not_connected={gen_fp_stats['not_connected']})")
     print(f"Valid generated molecules: {len(generated_fps)}")
     
     # 3. Compute atom counts on filtered molecules only (for consistency)
@@ -864,7 +879,6 @@ def evaluate_molecule_distributions(
     
     # Combine for joint UMAP fitting (better comparison)
     all_fps = np.vstack([real_fps, generated_fps])
-    # Use the same random seed for UMAP to ensure reproducibility
     all_embedding = compute_umap_embedding(all_fps, random_state=random_seed)
     
     # Split back

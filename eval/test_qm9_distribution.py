@@ -36,7 +36,7 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
         comparison_output: Directory to save full comparison results (optional)
         n_real_samples: Number of QM9 samples to use (default None = use n_samples, or all if n_samples not set)
         n_gen_samples: Number of generated samples to use (default None = use all available)
-        use_all_samples: If True, use all generated samples without filtering (overrides n_gen_samples, but not n_real_samples or n_samples)
+        use_all_samples: If True, use all generated samples (overrides n_gen_samples, but not n_real_samples or n_samples)
     """
     print("="*60)
     if generated_file:
@@ -48,7 +48,7 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
     # Setup tokenizer and dataset
     print(f"\n1. Loading QM9Dataset...")
     tokenizer = VocabTokenizer(vocab={'H', 'C', 'N', 'O', 'F'})
-    dataset = QM9Dataset(tokenizer, max_length=30, canonical_order=True)
+    dataset = QM9Dataset(tokenizer, max_length=30)
     print(f"   Dataset size: {len(dataset)}")
     
     # Determine how many QM9 samples to use
@@ -113,24 +113,42 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
                 print(f"   Using ALL {gen_n_samples} generated samples (--use_all_samples flag set)")
             else:
                 gen_n_samples = n_gen_samples if n_gen_samples is not None else len(gen_symbols)
-            
-            results = evaluate_molecule_distributions(
+            output_dir_all = os.path.join(comparison_output, 'all_samples')
+            output_dir_valid = os.path.join(comparison_output, 'valid_only')
+
+            print(f"\n   [All samples] Running report without filtering...")
+            results_all = evaluate_molecule_distributions(
                 real_symbols, real_positions,
                 gen_symbols, gen_positions,
-                output_dir=comparison_output,
-                n_real_samples=None,  # Use all QM9 samples we extracted (already sampled above)
-                n_gen_samples=gen_n_samples,  # Use specified or all generated samples
+                output_dir=output_dir_all,
+                n_real_samples=None,
+                n_gen_samples=gen_n_samples,
                 real_smiles=real_smiles,
-                fingerprint_type='morgan',  # Can change to 'rdkit' to match paper exactly
-                random_seed=42  # Fixed seed for reproducibility
+                fingerprint_type='rdkit',
+                random_seed=42,
+                filter_invalid=False
             )
-            print(f"\n   Comparison plots saved to:")
-            print(f"     - {comparison_output}/distribution_comparison_umap.png")
-            print(f"     - {comparison_output}/atom_count_distributions.png")
-            print(f"\n   Kolmogorov-Smirnov statistics (1-KSD):")
-            if 'ks_statistics' in results:
-                for atom_type, ks_val in results['ks_statistics'].items():
-                    print(f"     {atom_type:>5}: {ks_val:.4f}")
+            print(f"   All-samples plots saved to:")
+            print(f"     - {output_dir_all}/distribution_comparison_umap.png")
+            print(f"     - {output_dir_all}/atom_count_distributions.png")
+
+            print(f"\n   [Valid only] Running report with filtering...")
+            results_valid = evaluate_molecule_distributions(
+                real_symbols, real_positions,
+                gen_symbols, gen_positions,
+                output_dir=output_dir_valid,
+                n_real_samples=None,
+                n_gen_samples=gen_n_samples,
+                real_smiles=real_smiles,
+                fingerprint_type='rdkit',
+                random_seed=42,
+                filter_invalid=True
+            )
+            print(f"   Valid-only plots saved to:")
+            print(f"     - {output_dir_valid}/distribution_comparison_umap.png")
+            print(f"     - {output_dir_valid}/atom_count_distributions.png")
+
+            results = results_valid
         except Exception as e:
             print(f"   ERROR in comparison: {e}")
             import traceback
@@ -160,7 +178,9 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
         print(f"\n{step_num}. Computing molecular fingerprints for QM9...")
         try:
             real_fingerprints, real_valid = compute_molecular_fingerprints(
-                real_symbols, real_positions, radius=2, n_bits=2048
+                real_symbols, real_positions, radius=2, n_bits=2048,
+                fingerprint_type='rdkit',
+                filter_invalid=True
             )
             print(f"   Computed {len(real_fingerprints)} valid fingerprints")
             print(f"   Fingerprint shape: {real_fingerprints.shape}")
@@ -177,7 +197,9 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
             print(f"\n{step_num + 1}. Computing molecular fingerprints for generated molecules...")
             try:
                 gen_fingerprints, gen_valid = compute_molecular_fingerprints(
-                    gen_symbols, gen_positions, radius=2, n_bits=2048
+                    gen_symbols, gen_positions, radius=2, n_bits=2048,
+                    fingerprint_type='rdkit',
+                    filter_invalid=True
                 )
                 print(f"   Computed {len(gen_fingerprints)} valid fingerprints")
             except Exception as e:
@@ -345,7 +367,7 @@ Example usage:
     parser.add_argument('--n_gen_samples', type=int, default=None,
                        help='Number of generated samples to use (default: None = use all available)')
     parser.add_argument('--use_all_samples', action='store_true',
-                       help='Use all generated samples without filtering (overrides --n_gen_samples, but not --n_real_samples or --n_samples)')
+                       help='Use all generated samples (overrides --n_gen_samples, but not --n_real_samples or --n_samples)')
     parser.add_argument('--output', type=str, default='qm9_distribution_test.png',
                        help='Output file path for plot (default: qm9_distribution_test.png)')
     parser.add_argument('--generated', type=str, default=None,
