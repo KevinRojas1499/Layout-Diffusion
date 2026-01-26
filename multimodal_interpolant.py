@@ -71,7 +71,6 @@ class JointMultimodalInterpolantResult:
     y1: Tensor
     x1_ordered: Tensor
     y1_ordered: Tensor
-    yt_original_order: Tensor
 
     @property
     def y1_length(self) -> Tensor:
@@ -192,10 +191,8 @@ class MultimodalInterpolant():
             xt_original_order=full_xt, 
             mask_original_order=new_mask, 
             y1_ordered=y1_ordered,
-            yt_original_order=yt,
         )
 
-    # TODO: check if this formulation is correct
     def jump_kernel_elbo(self, x, y, eps=1e-6):
         # x_safe: true length
         # y_safe: predicted length
@@ -253,7 +250,7 @@ class MultimodalInterpolant():
         insertion_rate = prediction.insertion_rate
         gaps, gaps_mask = interpolant_sample.gaps_and_mask
         insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
-        insertion_loss = insertion_loss.sum() / (y1.shape[0] * self.max_length)
+        insertion_loss = insertion_loss.sum() / (y1.shape[0] * self.max_length) # This is not the best scaling factor
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
@@ -279,7 +276,7 @@ class MultimodalInterpolant():
     
     def get_drift(self, prediction: MultimodalModelPrediction, xt: Tensor, t: Tensor) -> Tensor:
         clean_data = prediction.clean_data 
-        return - (xt - clean_data) / self.alpha(t).view(-1, 1, 1)
+        return (clean_data - xt) / (1 - self.alpha(t).view(-1, 1, 1))
     
     def get_insertion_rate(self, prediction: MultimodalModelPrediction, t: Tensor) -> Tensor:
         coeff = self.dalpha(t) / (1 - self.alpha(t))
@@ -309,7 +306,7 @@ class MultimodalInterpolant():
         max_length: int,
         device: torch.device,
         return_trace: bool = False,
-    ) -> SamplingTrajectoryResult:
+    ) -> SamplingResult:
         # 1) Initialize all‑pad sequence and trace
         xt, yt, mask_t = self.get_prior_distribution(batch_size, max_length, device)
         
@@ -322,7 +319,7 @@ class MultimodalInterpolant():
                 xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
             ))
         torch.set_printoptions(precision=2, sci_mode=False)
-        for i in tqdm(range(steps), leave=False, disable=True):
+        for i in tqdm(range(steps), leave=False):
             prediction: MultimodalModelPrediction = model(
                 cat_tokens=yt,
                 euclidean_tokens=xt,
@@ -363,7 +360,7 @@ class MultimodalInterpolant():
             insertion_rate = self.get_insertion_rate(prediction, t)
             ext = torch.distributions.poisson.Poisson(insertion_rate * dt).sample()
 
-            seq_len = xt.shape[1]  # After padding, this is max_length + 2
+            seq_len = xt.shape[1]
             if i != steps - 1:
                 for j in range(batch_size):
                     # Add dimensions
@@ -393,9 +390,6 @@ class MultimodalInterpolant():
                     yt[j, 0] = self.bos_token
                     mask_t[j, :new_len] = True
                     mask_t[j, new_len:] = False
-                else:
-                    # Do something here 
-                    pass
 
             if return_trace:
                 trajectory.append(SamplingTrajectoryResult(
