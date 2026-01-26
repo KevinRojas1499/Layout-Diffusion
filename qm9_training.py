@@ -12,9 +12,9 @@ from multimodal_interpolant import MultimodalInterpolant
 from custom_datasets.qm9 import QM9Dataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
-from utils.optimizers import WarmUpScheduler
+from utils.optimizers import WarmUpScheduler, CombinedOptimizer
 from models.mmdit_qm9 import MMDiTQM9
-from visualize_dataset import plot_sample, plot_molecule
+from visualize_dataset import plot_sample, plot_molecule, plot_molecule_with_mask
 
 # This makes training on A100s faster
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -96,11 +96,17 @@ def training(**opts):
         dim_conds=[384, 384]
     ).to(device)
     ema = deepcopy(model)
-    # dim_2_params = [p for p in model.parameters() if p.ndim == 2] # Selects weights of Linear layers
-    # other_params = [p for p in model.parameters() if p.ndim != 2]
+    
+    # TODO: Implement Muon optimizer
+    # dim_2_params = [p for p in model.parameters() if p.ndim >= 2] # Selects weights of Linear layers
+    # other_params = [p for p in model.parameters() if p.ndim < 2]
+
+    # adam = torch.optim.AdamW(other_params, lr=opts.lr)
+    # muon = torch.optim.Muon(dim_2_params, lr=opts.lr)
+    # opt = CombinedOptimizer(adam, muon)
 
     opt = torch.optim.AdamW(model.parameters(),lr=opts.lr)
-    # muon  = torch.optim.Muon(dim_2_params,lr=opts.lr)
+
     scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler(device)
     
@@ -110,7 +116,6 @@ def training(**opts):
         mask_token=character_tokenizer.mask_token_id,
         pad_token=character_tokenizer.pad_token_id, 
         bos_token=character_tokenizer.bos_token_id,
-        eos_token=character_tokenizer.eos_token_id,
         euclidean_dim=3,
     )
     start_iter = 0
@@ -187,21 +192,52 @@ def training(**opts):
                 model.eval()
                 dist.barrier(device_ids=[device])
 
-                samples = interpolant.euclidean_sampling(model, 50, 5, dataset.max_length, device, return_trace=True)
+                samples = interpolant.euclidean_sampling(model, 50, 20, dataset.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
                     try:
                         plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
                         symbols = character_tokenizer.decode(sample.yt.cpu())
                         positions = sample.xt.cpu()[1:len(symbols)+1, :]
                         plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
+
+                        # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
+                        # os.makedirs(os.path.join(path, f'trajectory_sample_{i}'), exist_ok=True)
+                        
+                        # # Compute fixed axis limits from the final molecule for animation consistency
+                        # final_yt = sample.yt.cpu()
+                        # final_xt = sample.xt.cpu()
+                        # # Convert to numpy for axis limit computation
+                        # if isinstance(final_xt, torch.Tensor):
+                        #     final_xt_np = final_xt.cpu().numpy()
+                        # else:
+                        #     final_xt_np = np.array(final_xt)
+                        
+                        # pbar = tqdm(enumerate(sample.trajectory), leave=False)
+                        # for j, trajectory in pbar:
+                        #     # Get trajectory data - xt is [L+2, 3], yt is [L+2], mask_t is [L+2]
+                        #     cur_yt = trajectory.yt.cpu()  # Token IDs
+                        #     cur_xt = trajectory.xt.cpu()  # Positions [L+2, 3]
+                        #     cur_mask_t = trajectory.mask_t.cpu()  # Mask [L+2]
+                        #     cur_t = trajectory.t.cpu().item() if hasattr(trajectory.t, 'item') else trajectory.t
+                            
+                        #     # Determine which tokens are masked (mask_token_id)
+                        #     mask_token_id = character_tokenizer.mask_token_id
+                        #     is_masked = (cur_yt == mask_token_id).numpy()
+                            
+                        #     # Plot molecule with mask visualization and fixed axis limits
+                        #     plot_molecule_with_mask(
+                        #         cur_yt,  # Token IDs
+                        #         cur_xt,  # All positions including BOS/EOS
+                        #         is_masked,  # Which tokens are masked
+                        #         os.path.join(path, f'trajectory_{i}', f'step_{j}.png'),
+                        #         character_tokenizer,
+                        #         t=cur_t,
+                        #     )
+                        #     plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_sample_{i}', f'step_{j}.png'), character_tokenizer)
+                        #     pbar.set_description(f'Saving trajectory {i} step {j}')
                     except Exception as e:
                         print(f'Error plotting sample {i}')
-                    # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
-                    # pbar = tqdm(enumerate(sample.trajectory), leave=False)
 
-                    # for j, trajectory in pbar:
-                    #     plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
-                    #     pbar.set_description(f'Saving trajectory {i} step {j}')
                 model.train()
 
     if rank == 0:

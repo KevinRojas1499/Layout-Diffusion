@@ -79,7 +79,6 @@ def sampling(**opts):
         mask_token=character_tokenizer.mask_token_id,
         pad_token=character_tokenizer.pad_token_id, 
         bos_token=character_tokenizer.bos_token_id,
-        eos_token=character_tokenizer.eos_token_id,
         euclidean_dim=3,
     )
 
