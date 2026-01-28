@@ -16,3 +16,8 @@ sudo ln -s /usr/include/openbabel3 /usr/local/include/openbabel3
 # Then install
 uv add openbabel
 ```
+## Preprocess the dataset
+
+```{bash}
+PYTHONPATH=. uv run python -m custom_datasets.preprocess_qm9 --output_dir data/qm9_preprocessed
+```
