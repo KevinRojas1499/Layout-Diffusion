@@ -37,6 +37,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.option('--return_trace', type=bool, default=False)
 @click.option('--load_checkpoint',type=str, help='Directory where we can find the desired checkpoints')
 @click.option('--enable_plotting', is_flag=True, default=False)
+@click.option('--use_ema', is_flag=True, default=False)
 def sampling(**opts):
     opts = dotdict(opts)
     batch_size = opts.batch_size
@@ -64,14 +65,14 @@ def sampling(**opts):
     model = MMDiTQM9(
         euclidean_dim=3,
         vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=4,
-        positions_depth=4,
-        depth=4,
+        symbols_depth=6,
+        positions_depth=6,
+        depth=6,
         dim_modalities=[384, 384],
         dim_joint_attn=384,
         dim_conds=[384, 384]
     ).to(device)
-    model = load_checkpoint(opts, rank, device, model)
+    model = load_checkpoint(opts, rank, device, model, opts.use_ema)
     
     interpolant = MultimodalInterpolant(
         max_length=dataset.max_length,
@@ -162,10 +163,12 @@ def sampling(**opts):
     dist.barrier(device_ids=[device])
     dist.destroy_process_group()
 
-def load_checkpoint(opts, rank, device, model):
+def load_checkpoint(opts, rank, device, model, use_ema):
     print(f'Loading checkpoint from {opts.load_checkpoint} in rank {rank}')
     snapshot = torch.load(os.path.join(opts.load_checkpoint), weights_only=True, map_location=f'cuda:{device}')
-    model.load_state_dict(snapshot['model'],strict=False)
+    model_key = 'ema' if use_ema else 'model'
+    print(f'Loading {model_key} from checkpoint')
+    model.load_state_dict(snapshot[model_key],strict=False)
     return model
 
 
