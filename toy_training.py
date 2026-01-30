@@ -7,6 +7,7 @@ from copy import deepcopy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
+from custom_datasets.multimodal_math import EquationsDataset
 from utils.datasets import MultimodalVariableLengthToyDataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
@@ -39,6 +40,7 @@ def update_ema(ema_model, model, decay=0.9999):
 
 @click.command()
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
+@click.option('--dataset',type=click.Choice(['qm9', 'equations']), default='equations')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--ema_beta',type=float, default=.9999)
 @click.option('--lr', type=float, default=1e-4)
@@ -63,13 +65,21 @@ def training(**opts):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    character_tokenizer = VocabTokenizer(vocab={'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'})
+    if opts.dataset == 'qm9':
+        character_tokenizer = VocabTokenizer(vocab={'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'})
+        dataset = MultimodalVariableLengthToyDataset(character_tokenizer)
+        euclidean_dim = 3
+        hidden_dim = 66
+    elif opts.dataset == 'equations':
+        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.'})
+        dataset = EquationsDataset(character_tokenizer)
+        euclidean_dim = 1
+        hidden_dim = 384
     print('Vocab')
     print('--------------------------------')
     for token, id in character_tokenizer.atom_to_idx.items():
         print(f'{token}: {id}')
     print('--------------------------------')
-    dataset = MultimodalVariableLengthToyDataset(character_tokenizer)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=opts.num_workers, drop_last=True)
     
     wandb_enabled = opts.enable_wandb
@@ -77,14 +87,14 @@ def training(**opts):
         init_wandb(opts)
     
     model = MMDiTQM9(
-        euclidean_dim=3,
+        euclidean_dim=euclidean_dim,
         vocab_size=character_tokenizer.vocab_size,
         symbols_depth=4,
         positions_depth=4,
         depth=4,
-        dim_modalities=[66, 66],
-        dim_joint_attn=66,
-        dim_conds=[66, 66]
+        dim_modalities=[hidden_dim, hidden_dim],
+        dim_joint_attn=hidden_dim,
+        dim_conds=[hidden_dim, hidden_dim]
     ).to(device)
     ema = deepcopy(model)
     # dim_2_params = [p for p in model.parameters() if p.ndim == 2] # Selects weights of Linear layers
@@ -101,7 +111,7 @@ def training(**opts):
         mask_token=character_tokenizer.mask_token_id,
         pad_token=character_tokenizer.pad_token_id, 
         bos_token=character_tokenizer.bos_token_id,
-        euclidean_dim=3,
+        euclidean_dim=euclidean_dim,
     )
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -165,7 +175,7 @@ def training(**opts):
                 save_ckpt(model, ema, opt, scheduler, os.path.join(path, 'snapshot.pt'))
                 model.eval()
 
-                samples = interpolant.euclidean_sampling(model, 50, 5, dataset.max_length, device, return_trace=True)
+                samples = interpolant.euclidean_sampling(model, 50, 20, dataset.max_length+1, device, return_trace=True)
                 for i, sample in enumerate(samples):
                     plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
 
