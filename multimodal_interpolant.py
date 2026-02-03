@@ -307,6 +307,7 @@ class MultimodalInterpolant():
         device: torch.device,
         return_trace: bool = False,
     ) -> SamplingResult:
+        max_length = max_length + 1 # Plus one for the BOS token 
         # 1) Initialize all‑pad sequence and trace
         xt, yt, mask_t = self.get_prior_distribution(batch_size, max_length, device)
         
