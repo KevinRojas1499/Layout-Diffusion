@@ -65,7 +65,7 @@ def _format_template(template: str, itr: int) -> str:
 @click.option("--end-itr", type=int, default=None)
 @click.option("--step", type=int, default=5000, show_default=True)
 @click.option("--num-samples", type=int, default=10000, show_default=True)
-@click.option("--n-real-samples", type=int, default=20000, show_default=True)
+@click.option("--n-real-samples", type=int, default=10000, show_default=True)
 @click.option("--master-port", type=int, default=29502, show_default=True)
 @click.option(
     "--sample-dir-template",
@@ -87,7 +87,7 @@ def _format_template(template: str, itr: int) -> str:
 )
 @click.option("--use-ema", is_flag=True, default=False, show_default=True)
 @click.option("--dry-run", is_flag=True, default=False, show_default=True)
-@click.option("--skip-existing", is_flag=True, default=False, show_default=True)
+@click.option("--skip-existing", is_flag=True, default=True, show_default=True)
 def main(
     exp_dir: Path,
     start_itr: Optional[int],
