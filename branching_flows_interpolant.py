@@ -73,7 +73,6 @@ class DataPoint(abc.ABC):
 class MultimodalDataPoint(DataPoint):
     def __init__(self, x : Tensor, y : Tensor, mask_token : int):
         super().__init__()
-        print('creating point' , x, y, mask_token)
         self.x = x
         self.y = y
         self.mask_token = mask_token
@@ -109,12 +108,14 @@ class Node:
 
         self.splitting_time = None
     
+    def is_leaf(self) -> bool:
+        return self.right is None and self.left is None
     # Here I define subtree size as the number of leaves in the subtree
     def get_subtree_size(self) -> int:
         if self.computed_subtree_size:
             return self.subtree_size
         
-        if self.right is None and self.left is None:
+        if self.is_leaf():
             self.computed_subtree_size = True
             self.subtree_size = 1
             return 1
@@ -129,7 +130,7 @@ class Node:
             return subtree_size
         
     def _sort_nodes(self) -> List[Node]:
-        if self.right is None and self.left is None:
+        if self.is_leaf():
             return [self]
         else:
             return self.left._sort_nodes() + self.right._sort_nodes() + [self]
@@ -152,7 +153,7 @@ class Node:
                         y_str = f"y={y}"
                 else:
                     y_str = f"y={y}"
-                return f" [{x_str}, {y_str}]"
+                return f" [{x_str}, {y_str}, split_time={node.splitting_time}]"
             return f" [{dp}]"
 
         def rec(node, prefix: str, is_tail: bool, label: str) -> None:
@@ -184,6 +185,7 @@ class RandomTree:
         self.root = Node(None)
         self._construct_tree()
         self.root.get_subtree_size()
+        self._compute_splitting_time()
         self._compute_anchors(leaves)
     
     def _construct_tree(self, ):
@@ -207,8 +209,17 @@ class RandomTree:
             leaf_nodes.append(node.right)
             node_to_idx[node.right] = len(leaf_nodes) - 1
     
-    def _compute_splitting_time(self, node : Node) -> None:
-        pass
+    def _compute_splitting_time(self, node : Node = None, parent_time : float = 0.0) -> None:
+        if node is None:
+            node = self.root
+        if node.is_leaf():
+            node.splitting_time = parent_time
+        else:
+            u = random.random()
+            splitting_time = 1 - u**(1 / (node.get_subtree_size() - 1)) * (1 - parent_time)
+            node.splitting_time = splitting_time
+            self._compute_splitting_time(node.left, splitting_time)
+            self._compute_splitting_time(node.right, splitting_time)
 
 
     def _compute_anchors(self, leave_values) -> None:
@@ -226,14 +237,23 @@ class RandomTree:
     def __str__(self) -> str:
         return str(self.root)
     
+class BranchingFlowsInterpolant():
+    def __init__(self, tree : RandomTree):
+        self.tree = tree
+    
+    def sample_interpolant(self, t: Tensor, x1: Tensor, y1: Tensor, attn_mask: Tensor) -> BranchingFlowsInterpolantResult:
+        lengths = attn_mask.sum(dim=1)
+        
 
+
+
+    
 n = 5 # Number of leaves
 x = torch.arange(n, dtype=torch.float32)
 y = torch.arange(n)
 mask_token = 11
 
 leaves = [MultimodalDataPoint(x, y, mask_token) for x, y in zip(x, y)]
-print([str(leaf) for leaf in leaves])
 tree = RandomTree(n, leaves)
 print(tree)
 
