@@ -7,6 +7,7 @@ from copy import deepcopy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
+from branching_flows_interpolant import BranchingFlowsInterpolant
 from custom_datasets.multimodal_math import EquationsDataset
 from utils.datasets import MultimodalVariableLengthToyDataset
 from utils.misc import dotdict
@@ -41,6 +42,7 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.command()
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
 @click.option('--dataset',type=click.Choice(['qm9', 'equations']), default='equations')
+@click.option('--interpolant',type=click.Choice(['multimodal', 'branching']), default='multimodal')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--ema_beta',type=float, default=.9999)
 @click.option('--lr', type=float, default=1e-4)
@@ -105,7 +107,8 @@ def training(**opts):
     scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler()
     
-    interpolant = MultimodalInterpolant(
+    if opts.interpolant == 'multimodal':
+        interpolant = MultimodalInterpolant(
         max_length=dataset.max_length,
         vocab_size=character_tokenizer.vocab_size,
         mask_token=character_tokenizer.mask_token_id,
@@ -113,6 +116,12 @@ def training(**opts):
         bos_token=character_tokenizer.bos_token_id,
         euclidean_dim=euclidean_dim,
     )
+    elif opts.interpolant == 'branching':
+        interpolant = BranchingFlowsInterpolant(
+            vocab_size=character_tokenizer.vocab_size,
+            mask_token=character_tokenizer.mask_token_id,
+            pad_token=character_tokenizer.pad_token_id,
+        )
     start_iter = 0
     if opts.load_checkpoint is not None:
         start_iter = load_checkpoint(opts, device, model, ema, opt, scheduler)

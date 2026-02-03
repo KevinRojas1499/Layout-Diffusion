@@ -4,6 +4,7 @@ import click
 import torch
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
+from branching_flows_interpolant import BranchingFlowsInterpolant
 from utils.datasets import MultimodalVariableLengthToyDataset
 from custom_datasets.multimodal_math import EquationsDataset
 from utils.misc import dotdict
@@ -27,6 +28,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.command()
 @click.option('--num_samples', type=int, default=50)
 @click.option('--dataset',type=click.Choice(['qm9', 'equations']), default='equations')
+@click.option('--interpolant',type=click.Choice(['multimodal', 'branching']), default='multimodal')
 @click.option('--num_steps', type=int, default=100)
 @click.option('--batch_size', type=int, default=50)
 @click.option('--num_workers',type=int,default=2)
@@ -77,7 +79,8 @@ def sampling(**opts):
     ).to(device)
     model = load_checkpoint(opts, device, model)
     
-    interpolant = MultimodalInterpolant(
+    if opts.interpolant == 'multimodal':
+        interpolant = MultimodalInterpolant(
         max_length=dataset.max_length,
         vocab_size=character_tokenizer.vocab_size,
         mask_token=character_tokenizer.mask_token_id,
@@ -85,6 +88,10 @@ def sampling(**opts):
         bos_token=character_tokenizer.bos_token_id,
         euclidean_dim=euclidean_dim,
     )
+    elif opts.interpolant == 'branching':
+        interpolant = BranchingFlowsInterpolant(
+            mask_token=character_tokenizer.mask_token_id,
+        )
 
     
     model.train()
