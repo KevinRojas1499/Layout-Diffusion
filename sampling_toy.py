@@ -5,6 +5,7 @@ import torch
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
 from utils.datasets import MultimodalVariableLengthToyDataset
+from custom_datasets.multimodal_math import EquationsDataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from models.mmdit_qm9 import MMDiTQM9
@@ -25,6 +26,7 @@ class CustomJSONEncoder(JSONEncoder):
 
 @click.command()
 @click.option('--num_samples', type=int, default=50)
+@click.option('--dataset',type=click.Choice(['qm9', 'equations']), default='equations')
 @click.option('--num_steps', type=int, default=100)
 @click.option('--batch_size', type=int, default=50)
 @click.option('--num_workers',type=int,default=2)
@@ -45,23 +47,33 @@ def sampling(**opts):
     torch.cuda.set_device(device)
     print(f"Starting seed={seed}.")
 
-    character_tokenizer = VocabTokenizer(vocab={'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'})
+    if opts.dataset == 'qm9':
+        character_tokenizer = VocabTokenizer(vocab={'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'})
+        euclidean_dim = 3
+        hidden_dim = 66
+    elif opts.dataset == 'equations':
+        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.'})
+        euclidean_dim = 1
+        hidden_dim = 384
     print('Vocab')
     print('--------------------------------')
     for token, id in character_tokenizer.atom_to_idx.items():
         print(f'{token}: {id}')
     print('--------------------------------')
-    dataset = MultimodalVariableLengthToyDataset(character_tokenizer)
+    if opts.dataset == 'qm9':
+        dataset = MultimodalVariableLengthToyDataset(character_tokenizer)
+    elif opts.dataset == 'equations':
+        dataset = EquationsDataset(character_tokenizer)
 
     model = MMDiTQM9(
-        euclidean_dim=3,
+        euclidean_dim=euclidean_dim,
         vocab_size=character_tokenizer.vocab_size,
         symbols_depth=4,
         positions_depth=4,
         depth=4,
-        dim_modalities=[66, 66],
-        dim_joint_attn=66,
-        dim_conds=[66, 66]
+        dim_modalities=[hidden_dim, hidden_dim],
+        dim_joint_attn=hidden_dim,
+        dim_conds=[hidden_dim, hidden_dim]
     ).to(device)
     model = load_checkpoint(opts, device, model)
     
@@ -71,7 +83,7 @@ def sampling(**opts):
         mask_token=character_tokenizer.mask_token_id,
         pad_token=character_tokenizer.pad_token_id, 
         bos_token=character_tokenizer.bos_token_id,
-        euclidean_dim=3,
+        euclidean_dim=euclidean_dim,
     )
 
     
@@ -87,6 +99,7 @@ def sampling(**opts):
         for i, sample in enumerate(samples):
             symbols = character_tokenizer.decode(sample.yt.cpu())
             positions = sample.xt.cpu()[1:len(symbols)+1, :]
+            assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
             output_samples["molecules"].append({
                 'symbols': list(symbols),
                 'positions': positions.tolist()
