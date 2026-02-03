@@ -89,6 +89,7 @@ def training(**opts):
         init_wandb(opts)
     
     model = MMDiTQM9(
+        branching_flows=opts.interpolant == 'branching',
         euclidean_dim=euclidean_dim,
         vocab_size=character_tokenizer.vocab_size,
         symbols_depth=4,
@@ -145,7 +146,10 @@ def training(**opts):
             opt.zero_grad()
             
             losses = interpolant.compute_loss(model, data_)
-            loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["euclidean_unmasking_loss"] + losses["insertion_loss"]
+            if opts.interpolant == 'multimodal':
+                loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["euclidean_unmasking_loss"] + losses["insertion_loss"]
+            elif opts.interpolant == 'branching':
+                loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["insertion_loss"]
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -167,16 +171,28 @@ def training(**opts):
             loss = loss.detach().item()
             
             
-            pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Unmasking Loss: {losses["euclidean_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
+            if opts.interpolant == 'multimodal':
+                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Unmasking Loss: {losses["euclidean_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
+            elif opts.interpolant == 'branching':
+                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
             if wandb_enabled:
-                wandb.log({
-                'loss': loss,
-                'dsm_loss': losses["dsm_loss"],
-                'discrete_unmasking_loss': losses["discrete_unmasking_loss"],
-                'euclidean_unmasking_loss': losses["euclidean_unmasking_loss"],
-                'insertion_loss': losses["insertion_loss"],
-                'step': training_iter
-            })
+                if opts.interpolant == 'multimodal':
+                    wandb.log({
+                        'loss': loss,
+                        'dsm_loss': losses["dsm_loss"],
+                        'discrete_unmasking_loss': losses["discrete_unmasking_loss"],
+                        'euclidean_unmasking_loss': losses["euclidean_unmasking_loss"],
+                        'insertion_loss': losses["insertion_loss"],
+                        'step': training_iter
+                    })
+                elif opts.interpolant == 'branching':
+                    wandb.log({
+                        'loss': loss,
+                        'dsm_loss': losses["dsm_loss"],
+                        'discrete_unmasking_loss': losses["discrete_unmasking_loss"],
+                        'insertion_loss': losses["insertion_loss"],
+                        'step': training_iter
+                    })
             # Evaluate sample accuracy
             if training_iter%log_rate == 0 or training_iter == num_iters:
                 path = os.path.join(opts.dir, f'itr_{training_iter}/')

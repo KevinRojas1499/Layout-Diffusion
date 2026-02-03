@@ -16,9 +16,7 @@ class BranchingFlowsPrediction:
     clean_data: Tensor
     # This handles the unmasking
     label_logits: Tensor
-    clean_data_unmasking: Tensor
-    # This handles the insertions
-    insertion_rate: Tensor
+    split_rates: Tensor
 
 @dataclass
 class BranchingFlowsInterpolantResult:
@@ -423,6 +421,13 @@ class BranchingFlowsInterpolant():
         eps = 1e-5
         return torch.rand(batch_size, device=device) * (1 - eps)
 
+    def jump_kernel_elbo(self, x, y, eps=1e-6):
+        # x_safe: true length
+        # y_safe: predicted length
+        x_safe = torch.clamp(x, min=eps)
+        y_safe = torch.clamp(y, min=eps)
+
+        return y_safe - x_safe + x_safe * (torch.log(x_safe) - torch.log(y_safe))
     def compute_loss(self, model, batch):
         x1 = batch["x"]
         y1 = batch["y"]
@@ -430,7 +435,7 @@ class BranchingFlowsInterpolant():
         t = self.sample_time(x1.shape[0], x1.device)
         interpolant_sample = self.sample_interpolant(t, x1, y1, mask_1)
 
-        prediction: MultimodalModelPrediction = model(
+        prediction: BranchingFlowsPrediction = model(
             euclidean_tokens=interpolant_sample.xt,
             cat_tokens=interpolant_sample.yt,
             symbols_mask=interpolant_sample.mask_t,
@@ -438,42 +443,25 @@ class BranchingFlowsInterpolant():
             symbols_time=t,
             pos_time=t
         )
-        mask_t_shaped = interpolant_sample.mask_t.unsqueeze(-1)
+        mask_t = interpolant_sample.mask_t
 
-        masked_positions = (interpolant_sample.yt == self.mask_token)
-        
         # Euclidean loss
-        # We must only compute the loss for positions that are:
-        # not deleted: mask_t_shaped
-        # not masked: masked_positions.unsqueeze(-1)
-        dsm_loss = (interpolant_sample.x1_ordered - prediction.clean_data)**2 * mask_t_shaped
-        dsm_loss[:,0] = 0. # Don't take loss at the start of the sequence
-        dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions]
-        dsm_loss = dsm_loss.mean() / x1.shape[-1]
+        dsm_loss = (interpolant_sample.denoising_target - prediction.clean_data)**2 * mask_t.unsqueeze(-1)
+        dsm_loss = dsm_loss.sum() / mask_t.sum()
+
         # Insertion loss
-        insertion_rate = prediction.insertion_rate
-        gaps, gaps_mask = interpolant_sample.gaps_and_mask
-        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
-        insertion_loss = insertion_loss.sum() / (y1.shape[0] * self.max_length) # This is not the best scaling factor
+        insertion_loss = self.jump_kernel_elbo(interpolant_sample.split_rates[mask_t], prediction.split_rates[mask_t])
+        insertion_loss = insertion_loss.sum() / mask_t.sum()
+
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
-        logits_flat = prediction.label_logits[masked_positions]
-        targets_flat = interpolant_sample.y1_ordered[masked_positions]
+        logits_flat = prediction.label_logits[mask_t]
+        targets_flat = interpolant_sample.discrete_target[mask_t]
         tokens_loss = F.cross_entropy(logits_flat, targets_flat, reduction="none").mean()
-
-        # Predicted euclidean loss
-        # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y1 is [B, L] with vocab indices
-        y1_indices = interpolant_sample.y1_ordered.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x1.shape[-1])  # [B, L] -> [B, L, 1, D]
-        predicted_cond_y1 = prediction.clean_data_unmasking.gather(dim=2, index=y1_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
-        euclidean_loss = (predicted_cond_y1 - interpolant_sample.x1_ordered)**2
-        euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
-        euclidean_loss = euclidean_loss.mean() / x1.shape[-1]
-
 
         return {
             "dsm_loss": dsm_loss,
             "discrete_unmasking_loss": tokens_loss,
-            "euclidean_unmasking_loss": euclidean_loss,
             "insertion_loss": insertion_loss,
         }

@@ -1,24 +1,12 @@
 from __future__ import annotations
 from typing import Tuple
-from euclidean_interpolant import EuclideanFixedSizeInterpolant
-from huggingface_hub import PyTorchModelHubMixin
+from branching_flows_interpolant import BranchingFlowsPrediction
 
 import torch
 import math
 import numpy as np
 from torch import nn
-from torch import Tensor
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList
-
-from einops import rearrange, pack, unpack
-from einops.layers.torch import Rearrange
-
-from x_transformers.attend import Attend
-from x_transformers import (
-    RMSNorm,
-    FeedForward
-)
 
 from models.mmdit import MMDiT, FinalLayer
 from multimodal_interpolant import MultimodalModelPrediction
@@ -210,7 +198,7 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 class MMDiTQM9(nn.Module):
-    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, **kwargs):
+    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, branching_flows: bool = False, **kwargs):
         super().__init__()
         self.euclidean_dim = euclidean_dim
         self.vocab_size = vocab_size
@@ -218,7 +206,7 @@ class MMDiTQM9(nn.Module):
         self.dim_conds = kwargs['dim_conds']
         self.dim_symbols = self.dim_modalities[0]
         self.dim_positions = self.dim_modalities[1]
-
+        self.branching_flows = branching_flows
         # Extract attention parameters for rotary embeddings
         self.dim_head = kwargs.get('dim_head', 64)
         self.heads = kwargs.get('heads', 8)
@@ -272,7 +260,8 @@ class MMDiTQM9(nn.Module):
         self.insertion_rate = FinalLayer(self.dim_positions, 1)
         self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
         self.positions_pred_layer = FinalLayer(self.dim_positions, euclidean_dim)
-        self.positions_unmask_pred = FinalLayer(self.dim_positions, euclidean_dim * vocab_size)
+        if not self.branching_flows:
+            self.positions_unmask_pred = FinalLayer(self.dim_positions, euclidean_dim * vocab_size)
 
 
     def freeze_last_block(self, idx):
@@ -409,17 +398,25 @@ class MMDiTQM9(nn.Module):
         # Clean data prediction
         clean_data_pred = self.positions_pred_layer(euclidean_tokens, pos_time)
         # Clean data prediction for the insertion
-        clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
+        if not self.branching_flows:
+            clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
         # Insertion rate prediction
         # TODO : Maybe the insertion rate could use both cat tokens and euclidean ones
         insertion_rate = self.insertion_rate(cat_tokens, pos_time).squeeze(-1)  # [B, L]
         insertion_rate = F.softplus(insertion_rate)
         insertion_rate = insertion_rate * pos_mask
 
-        return MultimodalModelPrediction(
-            clean_data=clean_data_pred,
-            label_logits=label_logits,
-            insertion_rate=insertion_rate,
-            clean_data_unmasking=clean_data_unmasking
-        )
+        if self.branching_flows:
+            return BranchingFlowsPrediction(
+                clean_data=clean_data_pred,
+                label_logits=label_logits,
+                split_rates=insertion_rate,
+            )
+        else:
+            return MultimodalModelPrediction(
+                clean_data=clean_data_pred,
+                label_logits=label_logits,
+                insertion_rate=insertion_rate,
+                clean_data_unmasking=clean_data_unmasking
+            )
 
