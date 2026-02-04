@@ -122,6 +122,7 @@ def training(**opts):
             vocab_size=character_tokenizer.vocab_size,
             mask_token=character_tokenizer.mask_token_id,
             pad_token=character_tokenizer.pad_token_id,
+            euclidean_dim=euclidean_dim,
         )
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -200,7 +201,7 @@ def training(**opts):
                 save_ckpt(model, ema, opt, scheduler, os.path.join(path, 'snapshot.pt'))
                 model.eval()
 
-                samples = interpolant.euclidean_sampling(model, 50, 20, dataset.max_length+1, device, return_trace=True)
+                samples = interpolant.sampling(model, 50, 20, dataset.max_length+1, device, return_trace=True)
                 for i, sample in enumerate(samples):
                     plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
 

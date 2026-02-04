@@ -298,7 +298,7 @@ class MultimodalInterpolant():
         return xt, yt, mask_t
     
     @torch.no_grad()
-    def euclidean_sampling(
+    def sampling(
         self,
         model: torch.nn.Module,
         steps: int,

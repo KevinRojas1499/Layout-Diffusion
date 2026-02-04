@@ -351,10 +351,11 @@ def plot_tree(root: Node, out_path: Optional[str] = None, show: bool = False) ->
     plt.close(fig)
     
 class BranchingFlowsInterpolant():
-    def __init__(self, mask_token: int, pad_token: int, vocab_size: int):
+    def __init__(self, mask_token: int, pad_token: int, vocab_size: int, euclidean_dim: int):
         self.mask_token = mask_token
         self.pad_token = pad_token
         self.vocab_size = vocab_size
+        self.euclidean_dim = euclidean_dim
     
     def alpha(self, t: Tensor) -> Tensor:
         return t
@@ -378,7 +379,7 @@ class BranchingFlowsInterpolant():
             anchors, tree_sizes = tree.get_data_at_t(t[i])
             data_x = torch.stack([anchor.x for anchor in anchors])
             data_y = torch.stack([anchor.y for anchor in anchors])
-            split_rates_i = self.dalpha(t[i]) / (1 - self.alpha(t[i])) * torch.tensor(tree_sizes, device=x1.device)
+            split_rates_i = torch.tensor(tree_sizes, device=x1.device)
 
             # Pad the data to the same length
             num_pads = x1.shape[1] - data_x.shape[0]
@@ -465,3 +466,122 @@ class BranchingFlowsInterpolant():
             "discrete_unmasking_loss": tokens_loss,
             "insertion_loss": insertion_loss,
         }
+
+    def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tuple[Tensor, Tensor, Tensor]:
+        xt = torch.zeros((batch_size, max_length, self.euclidean_dim), device=device)
+        yt = torch.ones((batch_size, max_length), device=device, dtype=torch.long) * self.pad_token
+        yt[:,0] = self.mask_token
+        mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
+        mask_t[:, 0] = True # Only the start is active
+        return xt, yt, mask_t
+    
+    def get_split_rates(self, prediction: BranchingFlowsPrediction, t: Tensor) -> Tensor:
+        alpha = self.alpha(t)
+        return prediction.split_rates / (1 - alpha).view(-1, 1) # normally woul have dalpha as well
+    
+    def get_denoising_rates(self, prediction: BranchingFlowsPrediction, t: Tensor) -> Tensor:
+        alpha = self.alpha(t)
+        prob = prediction.label_logits.softmax(dim=-1) 
+        return prob / (1 - alpha).view(-1, 1, 1)
+
+    def get_drift(self, prediction: BranchingFlowsPrediction, xt: Tensor, t: Tensor) -> Tensor:
+        clean_data = prediction.clean_data 
+        return (clean_data - xt) / (1 - self.alpha(t).view(-1, 1, 1))
+
+    @torch.no_grad()
+    def sampling(
+        self,
+        model: torch.nn.Module,
+        steps: int,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        return_trace: bool = False,
+    ) -> SamplingResult:
+        # 1) Initialize all‑pad sequence and trace
+        xt, yt, mask_t = self.get_prior_distribution(batch_size, max_length, device)
+        
+        dt = 1.0 / steps
+        t = torch.zeros(batch_size, device=device)
+
+        trajectory = []
+        if return_trace:
+            trajectory.append(SamplingTrajectoryResult(
+                xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
+            ))
+        torch.set_printoptions(precision=2, sci_mode=False)
+        for i in tqdm(range(steps), leave=False):
+            prediction: BranchingFlowsPrediction = model(
+                cat_tokens=yt,
+                euclidean_tokens=xt,
+                symbols_mask=mask_t,
+                pos_mask=mask_t,
+                symbols_time=t,
+                pos_time=t
+            )
+            # Denoise
+            masked_positions = (yt == self.mask_token)
+            drift = self.get_drift(prediction, xt, t)
+            xt = xt + (drift * dt)
+            xt = torch.where(mask_t.unsqueeze(-1), xt, 0.)
+
+            # Unmasking
+            denoising_rate = self.get_denoising_rates(prediction, t)
+            denoising_nums = torch.distributions.poisson.Poisson(denoising_rate * dt).sample()
+            num_jumps = denoising_nums.sum(dim=-1)
+            if i != steps - 1:
+                change_pos = (num_jumps == 1) & (mask_t) & (masked_positions)
+                denoising_nums = denoising_nums * change_pos.unsqueeze(-1)
+                new_sample = denoising_nums.argmax(dim=-1)
+            else:
+                # verify this is correct
+                change_pos = masked_positions
+                new_sample = denoising_rate.argmax(dim=-1)
+            
+            yt = torch.where(change_pos, new_sample, yt)
+            
+            # Perform insertions
+            split_rates = self.get_split_rates(prediction, t)
+            ext = torch.distributions.poisson.Poisson(split_rates * dt).sample()
+
+            seq_len = xt.shape[1]
+            if i != steps - 1:
+                for j in range(batch_size):
+                    # Add dimensions
+                    new_xt_j = []
+                    new_yt_j = []
+                    for k in range(seq_len):
+                        if not mask_t[j, k]:
+                            break
+                        new_xt_j.append(xt[j, k:k+1, :])
+                        new_yt_j.append(yt[j, k].item())
+                        # Insert new token after position k if ext[j, k] > 0
+                        if ext[j, k] > 0:
+                            new_xt_j.append(xt[j, k:k+1, :])
+                            new_yt_j.append(yt[j, k].item())
+                    
+                    # Ensure we don't exceed the tensor size
+                    new_len = min(len(new_xt_j), max_length) 
+                    new_xt_tensor = torch.cat(new_xt_j[:new_len], dim=0)
+                    new_yt_tensor = torch.tensor(new_yt_j[:new_len], device=device, dtype=yt.dtype)
+                    xt[j, :new_len, :] = new_xt_tensor
+                    yt[j, :new_len] = new_yt_tensor
+                    mask_t[j, :new_len] = True
+                    mask_t[j, new_len:] = False
+
+            if return_trace:
+                trajectory.append(SamplingTrajectoryResult(
+                    xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
+                ))
+            t = t + dt
+
+        return SamplingResult(
+            xt=xt, yt=yt, mask_t=mask_t, trajectory=trajectory
+        )
+
+def sample_categorical(categorical_probs, method="hard"):
+    if method == "hard":
+        gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()
+        return (categorical_probs / gumbel_norm).argmax(dim=-1)
+    else:
+        raise ValueError(f"Method {method} for sampling categorical variables is not valid.")

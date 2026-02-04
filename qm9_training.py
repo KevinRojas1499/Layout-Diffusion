@@ -192,7 +192,7 @@ def training(**opts):
                 model.eval()
                 dist.barrier(device_ids=[device])
 
-                samples = interpolant.euclidean_sampling(model, 50, 20, dataset.max_length, device, return_trace=True)
+                samples = interpolant.sampling(model, 50, 20, dataset.max_length, device, return_trace=True)
                 for i, sample in enumerate(samples):
                     try:
                         plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)

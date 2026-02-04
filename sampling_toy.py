@@ -102,7 +102,7 @@ def sampling(**opts):
 
     output_samples = {"molecules": []}
     for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
-        samples = interpolant.euclidean_sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace)
+        samples = interpolant.sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace)
         for i, sample in enumerate(samples):
             symbols = character_tokenizer.decode(sample.yt.cpu())
             positions = sample.xt.cpu()[1:len(symbols)+1, :]
