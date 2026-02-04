@@ -457,7 +457,8 @@ class BranchingFlowsInterpolant():
         }
 
     def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tuple[Tensor, Tensor, Tensor]:
-        xt = torch.zeros((batch_size, max_length, self.euclidean_dim), device=device)
+        xt = torch.randn((batch_size, max_length, self.euclidean_dim), device=device)
+        xt[:, 1:] = 0.
         yt = torch.ones((batch_size, max_length), device=device, dtype=torch.long) * self.pad_token
         yt[:,0] = self.mask_token
         mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
