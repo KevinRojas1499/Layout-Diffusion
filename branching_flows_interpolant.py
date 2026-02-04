@@ -73,10 +73,6 @@ class DataPoint(abc.ABC):
         super().__init__()
     
     @abc.abstractmethod
-    def merge_data(self, points : List[DataPoint]):
-        pass
-    
-    @abc.abstractmethod
     def fuse(self, other : DataPoint) -> DataPoint:
         pass
 
@@ -89,13 +85,6 @@ class MultimodalDataPoint(DataPoint):
     
     def __str__(self) -> str:
         return f"x={self.x}, y={self.y}"
-    
-    def merge_data(self,  points : MultimodalDataPoint) -> MultimodalDataPoint:
-        return {
-            'x', torch.stack([point.x for point in points]), 
-            'y', torch.cat([point.y for point in points], dim=0), 
-            'mask', torch.cat([point.mask for point in points], dim=0)
-        }
     
     def fuse(self, other : MultimodalDataPoint) -> MultimodalDataPoint:
         new_x = (self.x  + other.x) / 2
@@ -248,13 +237,13 @@ class RandomTree:
         node = self.root
         data = []
         tree_sizes = []
-        def construct_active_anchors(node: Node, t: float) -> List[DataPoint]:
+        def construct_active_anchors(node: Node, t: float):
             if node.is_leaf():
                 tree_sizes.append(node.get_subtree_size())
-                return data.append(node.data_point)
+                data.append(node.data_point)
             else:
                 if t < node.splitting_time:
-                    tree_sizes.append(node.left.get_subtree_size())
+                    tree_sizes.append(node.get_subtree_size())
                     data.append(node.data_point)
                 else:
                     construct_active_anchors(node.left, t)
@@ -401,7 +390,7 @@ class BranchingFlowsInterpolant():
         mask_t = torch.stack(masks)
         split_rates = torch.stack(split_rates)
         # Euclidean data
-        xt = t.view(-1,1,1) * x1s + (1 - t.view(-1,1,1)) * x1s
+        xt = t.view(-1,1,1) * x1s + (1 - t.view(-1,1,1)) * torch.randn_like(x1s)
         xt = torch.where(mask_t.unsqueeze(-1), xt, 0.)
         # Discrete data
         random_vals = torch.randint_like(y1s, 0, self.vocab_size)
@@ -557,7 +546,7 @@ class BranchingFlowsInterpolant():
                         new_yt_j.append(yt[j, k].item())
                         # Insert new token after position k if ext[j, k] > 0
                         if ext[j, k] > 0:
-                            new_xt_j.append(xt[j, k:k+1, :])
+                            new_xt_j.append(xt[j, k:k+1, :].clone())
                             new_yt_j.append(yt[j, k].item())
                     
                     # Ensure we don't exceed the tensor size
