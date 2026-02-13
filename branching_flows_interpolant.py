@@ -20,7 +20,7 @@ class BranchingFlowsPrediction:
 
 @dataclass
 class BranchingFlowsInterpolantResult:
-    xt: Tensor # Shape [Batch, Length]
+    xt: Tensor # Shape [Batch, Length, D]
     yt: Tensor # Shape [Batch, Length]
     mask_t: Tensor # Shape [Batch, Length]
     t: Tensor # Shape [Batch]
@@ -86,8 +86,8 @@ class MultimodalDataPoint(DataPoint):
     def __str__(self) -> str:
         return f"x={self.x}, y={self.y}"
     
-    def fuse(self, other : MultimodalDataPoint) -> MultimodalDataPoint:
-        new_x = (self.x  + other.x) / 2
+    def fuse(self, other : MultimodalDataPoint, weight : float = 0.5) -> MultimodalDataPoint:
+        new_x = weight * self.x  + (1 - weight) * other.x
         new_y = torch.ones_like(self.y) * self.mask_token
         return MultimodalDataPoint(
             x = new_x,
@@ -231,7 +231,10 @@ class RandomTree:
                 node.data_point = leave_values[leaf_index]
                 leaf_index += 1
             else:
-                node.data_point = node.left.data_point.fuse(node.right.data_point)
+                num_left = node.left.get_subtree_size()
+                num_right = node.right.get_subtree_size()
+                weight = num_left / (num_left + num_right)
+                node.data_point = node.left.data_point.fuse(node.right.data_point, weight)
 
     def get_data_at_t(self, t: float) -> Tuple[List[DataPoint], List[int]]:
         node = self.root
@@ -360,15 +363,16 @@ class BranchingFlowsInterpolant():
         masks = []
         split_rates = []
         for i in range(x1.shape[0]):
-            # Branching flows can't be interpolated that well
-            leaves = [MultimodalDataPoint(x1[i,j, :], y1[i,j], self.mask_token) for j in range(lengths[i])]
-            tree = RandomTree(lengths[i], leaves)
+            # Branching flows can't be batchified that well
+            leaves = [MultimodalDataPoint(x1[i,j, :], y1[i,j], self.mask_token) for j in range(lengths[i].item())]
+            tree = RandomTree(lengths[i].item(), leaves)
+
 
             # Extract the data at time t
             anchors, tree_sizes = tree.get_data_at_t(t[i])
             data_x = torch.stack([anchor.x for anchor in anchors])
             data_y = torch.stack([anchor.y for anchor in anchors])
-            split_rates_i = torch.tensor(tree_sizes, device=x1.device)
+            split_rates_i = torch.tensor(tree_sizes, device=x1.device, dtype=torch.float32) - 1
 
             # Pad the data to the same length
             num_pads = x1.shape[1] - data_x.shape[0]
@@ -390,10 +394,15 @@ class BranchingFlowsInterpolant():
         mask_t = torch.stack(masks)
         split_rates = torch.stack(split_rates)
         # Euclidean data
-        xt = t.view(-1,1,1) * x1s + (1 - t.view(-1,1,1)) * torch.randn_like(x1s)
+        # x0 = torch.randn_like(x1s)
+        # If using just one noise 
+        x0 = torch.randn_like(x1s[:,:1,:])
+        xt = t.view(-1,1,1) * x1s + (1 - t.view(-1,1,1)) * x0
         xt = torch.where(mask_t.unsqueeze(-1), xt, 0.)
         # Discrete data
-        random_vals = torch.randint_like(y1s, 0, self.vocab_size)
+        # random_vals = torch.randint_like(y1s, 0, self.vocab_size)
+        # If using just one noise 
+        random_vals = torch.randint_like(y1s[:,:1], 0, self.vocab_size)
         pos_to_change = (t.unsqueeze(-1) <= torch.rand_like(y1s,dtype=torch.float32))
         yt = torch.where(pos_to_change, random_vals, y1s) 
 
@@ -459,7 +468,7 @@ class BranchingFlowsInterpolant():
     def get_prior_distribution(self, batch_size: int, max_length: int, device: torch.device) -> Tuple[Tensor, Tensor, Tensor]:
         xt = torch.randn((batch_size, max_length, self.euclidean_dim), device=device)
         xt[:, 1:] = 0.
-        yt = torch.ones((batch_size, max_length), device=device, dtype=torch.long) * self.pad_token
+        yt = torch.randint(0, self.vocab_size, (batch_size, max_length), device=device, dtype=torch.long)
         yt[:,0] = self.mask_token
         mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
         mask_t[:, 0] = True # Only the start is active
@@ -467,7 +476,7 @@ class BranchingFlowsInterpolant():
     
     def get_split_rates(self, prediction: BranchingFlowsPrediction, t: Tensor) -> Tensor:
         alpha = self.alpha(t)
-        return prediction.split_rates / (1 - alpha).view(-1, 1) # normally woul have dalpha as well
+        return prediction.split_rates / (1 - alpha).view(-1, 1)
     
     def get_denoising_rates(self, prediction: BranchingFlowsPrediction, t: Tensor) -> Tensor:
         alpha = self.alpha(t)
@@ -520,7 +529,7 @@ class BranchingFlowsInterpolant():
             denoising_nums = torch.distributions.poisson.Poisson(denoising_rate * dt).sample()
             num_jumps = denoising_nums.sum(dim=-1)
             if i != steps - 1:
-                change_pos = (num_jumps == 1) & (mask_t) & (masked_positions)
+                change_pos = (num_jumps == 1) & (mask_t)
                 denoising_nums = denoising_nums * change_pos.unsqueeze(-1)
                 new_sample = denoising_nums.argmax(dim=-1)
             else:
@@ -547,8 +556,9 @@ class BranchingFlowsInterpolant():
                         new_yt_j.append(yt[j, k].item())
                         # Insert new token after position k if ext[j, k] > 0
                         if ext[j, k] > 0:
-                            new_xt_j.append(xt[j, k:k+1, :].clone())
-                            new_yt_j.append(yt[j, k].item())
+                            for _ in range(ext[j, k].long().item()):
+                                new_xt_j.append(xt[j, k:k+1, :].clone())
+                                new_yt_j.append(yt[j, k].item())
                     
                     # Ensure we don't exceed the tensor size
                     new_len = min(len(new_xt_j), max_length) 
@@ -568,10 +578,3 @@ class BranchingFlowsInterpolant():
         return SamplingResult(
             xt=xt, yt=yt, mask_t=mask_t, trajectory=trajectory
         )
-
-def sample_categorical(categorical_probs, method="hard"):
-    if method == "hard":
-        gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()
-        return (categorical_probs / gumbel_norm).argmax(dim=-1)
-    else:
-        raise ValueError(f"Method {method} for sampling categorical variables is not valid.")
