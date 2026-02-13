@@ -21,3 +21,11 @@ uv add openbabel
 ```{bash}
 PYTHONPATH=. uv run python -m custom_datasets.preprocess_qm9 --output_dir data/qm9_preprocessed
 ```
+
+### Math dataset
+
+```{bash}
+python custom_datasets/create_dataset.py -L 10 --decimals 2 \
+  --min-terms 1 --max-terms 8 \
+  --length-dist "1:0.05,2:0.1,3:0.2,4:0.25,5:0.2,6:0.1,7:0.07,8:0.03"
+```

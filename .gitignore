@@ -8,3 +8,5 @@ results/
 results_*/
 data/
 results-grid-search/
+*.jsonl
+*.pdf
