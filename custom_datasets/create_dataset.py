@@ -1,228 +1,190 @@
+"""Generate arithmetic equation datasets in JSONL format."""
+
 import argparse
+import json
 import random
-import bisect
-from typing import Dict, List, Tuple
+from pathlib import Path
 
 
-def eval_expr(terms: List[Tuple[int, int]]) -> int:
-    total = 0
-    for sign, value in terms:
-        total += sign * value
-    return total
+def parse_length_dist(
+    text: str | None,
+    min_terms: int,
+    max_terms: int,
+) -> tuple[list[int], list[float]] | None:
+    if not text:
+        return None
+    lengths: list[int] = []
+    weights: list[float] = []
+    for raw in text.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            length_str, weight_str = raw.split(":")
+            length = int(length_str)
+            weight = float(weight_str)
+        except ValueError as exc:
+            raise ValueError(f"Invalid length distribution entry: '{raw}'") from exc
+        if length < min_terms or length > max_terms:
+            raise ValueError(
+                f"Length {length} outside range [{min_terms}, {max_terms}]"
+            )
+        if weight <= 0:
+            raise ValueError(f"Weight must be positive for length {length}")
+        lengths.append(length)
+        weights.append(weight)
+    if not lengths:
+        return None
+    total = sum(weights)
+    weights = [w / total for w in weights]
+    return lengths, weights
 
 
-def format_expr(terms: List[Tuple[int, int]]) -> str:
-    if not terms:
-        raise ValueError("Expression must contain at least one term.")
-    pieces = [str(terms[0][1])]  # first term is always positive in our generator
-    for sign, value in terms[1:]:
-        op = "+" if sign > 0 else "-"
-        pieces.append(f"{op}{value}")
-    return "".join(pieces)
-
-
-def generate_expression(
-    num_terms: int,
-    max_value: int,
+def generate_equation(
+    min_terms: int,
+    max_terms: int,
+    min_value: float,
+    max_value: float,
     rng: random.Random,
-    force_positive_first: bool = True,
-) -> List[Tuple[int, int]]:
-    if num_terms < 1:
-        raise ValueError("num_terms must be >= 1")
-    terms: List[Tuple[int, int]] = []
-    first = rng.randint(1, max_value)
-    terms.append((1, first))
-    for _ in range(1, num_terms):
-        value = rng.randint(1, max_value)
-        sign = rng.choice([1, -1])
-        terms.append((sign, value))
-    return terms
+    decimals: int,
+    length_dist: tuple[list[int], list[float]] | None,
+) -> dict:
+    """Generate a random equation with terms in [min_value, max_value].
+    
+    Returns dict with:
+        - equation: string representation (e.g., "3-2=5-4.")
+        - numbers: list of operands as parsed (first term signed, rest unsigned)
+        - symbols: list of operators/punctuation
+        - result: the value both sides equal
+        - length: number of terms
+    """
+    max_attempts = 500
+    
+    min_abs = 10 ** (-decimals)
 
+    def sample_value() -> float:
+        val = rng.uniform(min_value, max_value)
+        while abs(val) < min_abs:
+            val = rng.uniform(min_value, max_value)
+        return round(val, decimals)
 
-def generate_expression_for_target(
-    target: int,
-    num_terms: int,
-    max_value: int,
-    rng: random.Random,
-    max_attempts: int = 500,
-) -> List[Tuple[int, int]]:
-    if num_terms < 1:
-        raise ValueError("num_terms must be >= 1")
-    if num_terms == 1:
-        if 1 <= target <= max_value:
-            return [(1, target)]
-        raise ValueError("Target out of range for single-term expression.")
+    def format_value(val: float) -> str:
+        if abs(val) < 1e-6:
+            return "0"
+        text = f"{abs(val):.{decimals}f}".rstrip("0").rstrip(".")
+        return text if text else "0"
 
     for _ in range(max_attempts):
-        terms: List[Tuple[int, int]] = []
-        first = rng.randint(1, max_value)
-        terms.append((1, first))
-        running = first
-        for _ in range(num_terms - 2):
-            value = rng.randint(1, max_value)
-            sign = rng.choice([1, -1])
-            terms.append((sign, value))
-            running += sign * value
-
-        remaining = target - running
-        if remaining == 0:
-            # Avoid zero terms; retry.
-            continue
-
-        sign = 1 if remaining > 0 else -1
-        value = abs(remaining)
-        if 1 <= value <= max_value:
-            terms.append((sign, value))
-            return terms
-
-    raise RuntimeError("Failed to generate expression for target within constraints.")
-
-
-def generate_all_expressions(
-    min_terms: int,
-    max_terms: int,
-    max_value: int,
-) -> Dict[int, List[str]]:
-    if min_terms < 1 or max_terms < min_terms:
-        raise ValueError("Invalid term range.")
-    if max_value < 1:
-        raise ValueError("max_value must be >= 1")
-
-    expressions_by_value: Dict[int, List[str]] = {}
-
-    def build_terms(remaining: int, current: List[Tuple[int, int]]) -> None:
-        if remaining == 0:
-            expr = format_expr(current)
-            value = eval_expr(current)
-            expressions_by_value.setdefault(value, []).append(expr)
-            return
-
-        if not current:
-            for value in range(1, max_value + 1):
-                build_terms(remaining - 1, current + [(1, value)])
+        if length_dist:
+            lengths, weights = length_dist
+            left_n = rng.choices(lengths, weights=weights, k=1)[0]
+            right_n = rng.choices(lengths, weights=weights, k=1)[0]
         else:
-            for sign in (1, -1):
-                for value in range(1, max_value + 1):
-                    build_terms(remaining - 1, current + [(sign, value)])
-
-    for num_terms in range(min_terms, max_terms + 1):
-        build_terms(num_terms, [])
-
-    return expressions_by_value
-
-
-def generate_equations_exhaustive(
-    expressions_by_value: Dict[int, List[str]],
-    num_equations: int,
-    rng: random.Random,
-) -> List[str]:
-    values = sorted(expressions_by_value.keys())
-    prefix_ends = []
-    total_pairs = 0
-    for value in values:
-        m = len(expressions_by_value[value])
-        total_pairs += m * m  # ordered pairs
-        prefix_ends.append(total_pairs)
-
-    if total_pairs == 0:
-        raise RuntimeError("No expressions generated; check constraints.")
-    if num_equations > total_pairs:
-        raise ValueError(
-            f"Requested {num_equations} equations, but only {total_pairs} unique pairs exist."
-        )
-
-    selected = rng.sample(range(total_pairs), num_equations)
-    equations = []
-    for idx in selected:
-        group_idx = bisect.bisect_right(prefix_ends, idx)
-        start = 0 if group_idx == 0 else prefix_ends[group_idx - 1]
-        offset = idx - start
-        value = values[group_idx]
-        group = expressions_by_value[value]
-        m = len(group)
-        left_idx, right_idx = divmod(offset, m)
-        equations.append(f"{group[left_idx]}={group[right_idx]}.")
-
-    return equations
-
-
-def build_equation(
-    min_terms: int,
-    max_terms: int,
-    max_value: int,
-    rng: random.Random,
-) -> str:
-    max_equation_attempts = 500
-    for _ in range(max_equation_attempts):
-        left_terms = rng.randint(min_terms, max_terms)
-        right_terms = rng.randint(min_terms, max_terms)
-
-        left = generate_expression(left_terms, max_value, rng)
-        target = eval_expr(left)
-
-        min_target = 1 - (right_terms - 1) * max_value
-        max_target = right_terms * max_value
-        if target < min_target or target > max_target:
+            left_n = rng.randint(min_terms, max_terms)
+            right_n = rng.randint(min_terms, max_terms)
+        
+        # Generate left side terms as (sign, abs_value)
+        left_terms = []
+        for _ in range(left_n):
+            val = sample_value()
+            left_terms.append((1 if val >= 0 else -1, abs(val)))
+        
+        target = sum(s * v for s, v in left_terms)
+        
+        # Try to generate right side that equals target
+        right_terms = []
+        running = 0
+        for i in range(right_n - 1):
+            val = sample_value()
+            right_terms.append((1 if val >= 0 else -1, abs(val)))
+            running += val
+        
+        # Last term must make right side equal target
+        last = round(target - running, decimals)
+        if abs(last) < min_abs or not (min_value <= last <= max_value):
             continue
+        right_terms.append((1 if last >= 0 else -1, abs(last)))
+        
+        # Build equation string
+        def format_side(terms):
+            s, v = terms[0]
+            pieces = [f"-{format_value(v)}" if s < 0 else format_value(v)]
+            for sign, val in terms[1:]:
+                pieces.append(f"+{format_value(val)}" if sign > 0 else f"-{format_value(val)}")
+            return "".join(pieces)
+        
+        equation = f"{format_side(left_terms)}={format_side(right_terms)}."
+        
+        # Build parsed representation
+        numbers = []
+        symbols = []
+        
+        for i, (sign, val) in enumerate(left_terms):
+            if i == 0:
+                numbers.append(sign * val)
+            else:
+                symbols.append('+' if sign > 0 else '-')
+                numbers.append(val)
+        
+        symbols.append('=')
+        
+        for i, (sign, val) in enumerate(right_terms):
+            if i == 0:
+                numbers.append(sign * val)
+            else:
+                symbols.append('+' if sign > 0 else '-')
+                numbers.append(val)
+        
+        symbols.append('.')
+        
+        return {
+            "equation": equation,
+            "numbers": numbers,
+            "symbols": symbols,
+            "result": target,
+            "length": len(numbers),
+        }
+    
+    raise RuntimeError("Failed to generate equation")
 
-        try:
-            right = generate_expression_for_target(target, right_terms, max_value, rng)
-        except RuntimeError:
-            continue
 
-        return f"{format_expr(left)}={format_expr(right)}."
-
-    raise RuntimeError("Failed to build a valid equation within constraints.")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate variable-length arithmetic equations with + and -."
+def main():
+    parser = argparse.ArgumentParser(description="Generate arithmetic equations dataset")
+    parser.add_argument("-n", "--num-equations", type=int, default=50000)
+    parser.add_argument("-L", "--value-range", type=float, default=10.0,
+                        help="Values drawn from [-L, L]")
+    parser.add_argument("--decimals", type=int, default=2,
+                        help="Number of decimal places for sampled values.")
+    parser.add_argument("--min-terms", type=int, default=1)
+    parser.add_argument("--max-terms", type=int, default=8)
+    parser.add_argument(
+        "--length-dist",
+        type=str,
+        default=None,
+        help="Comma-separated length:prob pairs, e.g. '1:0.1,2:0.3,3:0.6'.",
     )
-    parser.add_argument("--num-equations", type=int, default=1000)
-    parser.add_argument("--min-terms", type=int, default=2)
-    parser.add_argument("--max-terms", type=int, default=4)
-    parser.add_argument("--max-value", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["exhaustive", "random"],
-        default="exhaustive",
-        help="Exhaustive uses all expressions then samples pairs; random builds each equation on the fly.",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="data/equations_varlen.txt",
-        help="Output file path.",
-    )
+    parser.add_argument("-o", "--output", type=str, default="data/equations.jsonl")
     args = parser.parse_args()
 
-    if args.min_terms < 1 or args.max_terms < args.min_terms:
-        raise ValueError("Invalid term range.")
-    if args.max_value < 1:
-        raise ValueError("max-value must be >= 1")
-
     rng = random.Random(args.seed)
+    length_dist = parse_length_dist(args.length_dist, args.min_terms, args.max_terms)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.mode == "exhaustive":
-        expressions_by_value = generate_all_expressions(
-            args.min_terms, args.max_terms, args.max_value
-        )
-        equations = generate_equations_exhaustive(
-            expressions_by_value, args.num_equations, rng
-        )
-    else:
-        equations = []
+    print(f"Generating {args.num_equations} equations with values in [-{args.value_range}, {args.value_range}]")
+    
+    with open(output, "w") as f:
         for _ in range(args.num_equations):
-            equations.append(
-                build_equation(args.min_terms, args.max_terms, args.max_value, rng)
+            eq = generate_equation(
+                args.min_terms, args.max_terms,
+                -args.value_range, args.value_range, rng,
+                args.decimals,
+                length_dist,
             )
-
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.write("\n".join(equations))
-        f.write("\n")
+            f.write(json.dumps(eq) + "\n")
+    
+    print(f"Saved to {output}")
 
 
 if __name__ == "__main__":
