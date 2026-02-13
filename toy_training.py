@@ -76,7 +76,7 @@ def training(**opts):
         character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.'})
         dataset = EquationsDataset(character_tokenizer)
         euclidean_dim = 1
-        hidden_dim = 384
+        hidden_dim = 256
     print('Vocab')
     print('--------------------------------')
     for token, id in character_tokenizer.atom_to_idx.items():

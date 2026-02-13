@@ -56,7 +56,7 @@ def sampling(**opts):
     elif opts.dataset == 'equations':
         character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.'})
         euclidean_dim = 1
-        hidden_dim = 384
+        hidden_dim = 256
     print('Vocab')
     print('--------------------------------')
     for token, id in character_tokenizer.atom_to_idx.items():
@@ -100,24 +100,30 @@ def sampling(**opts):
     if not os.path.exists(opts.dir):
         os.makedirs(opts.dir)
 
-    output_samples = {"molecules": []}
+    output_samples = []
     for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
         samples = interpolant.sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace)
         for i, sample in enumerate(samples):
             symbols = character_tokenizer.decode(sample.yt.cpu())
             positions = sample.xt.cpu()[1:len(symbols)+1, :]
             assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
-            output_samples["molecules"].append({
+            if euclidean_dim == 1:
+                numbers = positions.squeeze(-1).tolist()
+            else:
+                numbers = positions.tolist()
+            output_samples.append({
+                'numbers': numbers,
                 'symbols': list(symbols),
-                'positions': positions.tolist()
+                'length': len(symbols)
             })
             if opts.enable_plotting:
                 plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
             
-    b = json.dumps(output_samples, indent=2, separators=(',', ':'), cls=CustomJSONEncoder)
-    b = b.replace('"##<', "").replace('>##"', "")
-    with open(os.path.join(opts.dir, 'samples.json'), 'w') as f:
-        f.write(b)
+    output_path = os.path.join(opts.dir, 'samples.jsonl')
+    with open(output_path, 'w') as f:
+        for sample in output_samples:
+            f.write(json.dumps(sample, separators=(',', ':'), cls=CustomJSONEncoder))
+            f.write('\n')
 
 def load_checkpoint(opts, device, model):
     print(f'Loading checkpoint from {opts.load_checkpoint}')

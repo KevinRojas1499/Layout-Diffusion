@@ -108,7 +108,7 @@ def count_equation_symbols_from_text(text: str) -> int:
     "input_path",
     type=click.Path(exists=True, dir_okay=False, readable=True),
     required=True,
-    help="Path to samples.json produced by sampling_toy.py",
+    help="Path to samples.json or samples.jsonl produced by sampling_toy.py",
 )
 @click.option(
     "--delta",
@@ -159,7 +159,7 @@ def count_equation_symbols_from_text(text: str) -> int:
 @click.option(
     "--gt-file",
     type=click.Path(exists=True, dir_okay=False, readable=True),
-    default="data/equations_varlen.txt",
+    default="data/equations.jsonl",
     show_default=True,
     help="Ground-truth equations file to compare length distribution.",
 )
@@ -174,10 +174,19 @@ def main(
     len_hist_out: str,
     gt_file: str,
 ) -> None:
+    samples = []
     with open(input_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    samples = data.get("molecules", [])
+        content = f.read().strip()
+        if not content:
+            raise RuntimeError("Input file is empty.")
+        if "\n" in content and content.lstrip().startswith("{") and not content.lstrip().startswith("{\"molecules\""):
+            for line in content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                samples.append(json.loads(line))
+        else:
+            data = json.loads(content)
     total = len(samples)
     if total == 0:
         raise RuntimeError("No samples found in input file.")
@@ -190,7 +199,7 @@ def main(
 
     for idx, sample in enumerate(samples):
         symbols = sample.get("symbols", [])
-        positions = sample.get("positions", [])
+        positions = sample.get("positions", sample.get("numbers", []))
         gen_lengths.append(count_equation_symbols(symbols))
         try:
             left, right = parse_equation(
@@ -265,7 +274,7 @@ def main(
         )
         with open(gt_file, "r", encoding="utf-8") as f:
             gt_lines = [line.strip() for line in f if line.strip()]
-        gt_lengths = [count_equation_symbols_from_text(line) for line in gt_lines]
+        gt_lengths = [len(json.loads(line)["numbers"]) for line in gt_lines]
         if gt_lengths:
             max_len = max(max_len, max(gt_lengths))
             bins = np.arange(1, max_len + 2) - 0.5
