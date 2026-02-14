@@ -15,7 +15,7 @@ from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler
 from models.mmdit_qm9 import MMDiTQM9, MMDiTBothVar
-from visualize_dataset import plot_sample
+from visualize_dataset import plot_sample, plot_sample_2
 from multimodal_interpolant_both_var import MultimodalInterpolantBoth
 
 
@@ -244,7 +244,10 @@ def training(**opts):
 
                 samples = interpolant.sampling(model, 50, 20, dataset.max_length+1, device, return_trace=True)
                 for i, sample in enumerate(samples):
-                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                    if opts.interpolant == 'multimodal':
+                        plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                    elif opts.interpolant == 'multimodal_both':
+                        plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
 
                     # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
                     # pbar = tqdm(enumerate(sample.trajectory), leave=False)

@@ -113,6 +113,98 @@ def plot_sample(data, yt, mask, out_file_name, character_tokenizer : VocabTokeni
     plt.savefig(out_file_name)
     plt.close()
 
+def plot_sample_2(data, yt, x_mask, y_mask, out_file_name, character_tokenizer : VocabTokenizer, max_category=100):
+    # Convert to numpy for plotting
+    data_np = data.detach().cpu().numpy() if isinstance(data, torch.Tensor) else np.array(data)
+    yt_np = yt.detach().cpu().numpy() if isinstance(yt, torch.Tensor) else np.array(yt)
+    x_mask_np = x_mask.detach().cpu().numpy() if isinstance(x_mask, torch.Tensor) else np.array(x_mask)
+    y_mask_np = y_mask.detach().cpu().numpy() if isinstance(y_mask, torch.Tensor) else np.array(y_mask)
+
+    # Detokenize: convert token IDs to symbol names
+    yt_detokenized = np.array([character_tokenizer.idx_to_atom[int(token)] for token in yt_np], dtype=object)
+
+    # Reshape 1D data for heatmap visualization if necessary
+    if data_np.ndim == 1:
+        data_viz = data_np[:, None]
+        x_mask_viz = x_mask_np[:, None]
+    else:
+        data_viz = data_np
+        x_mask_viz = x_mask_np
+        if x_mask_viz.ndim == 1:
+            x_mask_viz = np.tile(x_mask_viz[:, None], (1, data_viz.shape[1]))
+
+    # Modalities can have different valid lengths
+    valid_len_x = int(x_mask_np.sum())
+    valid_len_y = int(y_mask_np.sum())
+
+    # Plotting - similar to plot_sample but with one mask per modality
+    plt.figure(figsize=(18, 6))
+    max_len = data_np.shape[0]
+
+    # Plot 1: Euclidean data
+    plt.subplot(1, 4, 1)
+    sns.heatmap(
+        data_viz,
+        cmap='viridis',
+        cbar=True,
+        annot=True,
+        fmt='.2f',
+        vmin=-1,
+        vmax=max_len + 1,
+        mask=~x_mask_viz,
+    )
+    plt.title(f'Data Vector (Valid Length: {valid_len_x})')
+    plt.xlabel('Feature Dimension (1)')
+    plt.ylabel('Sequence Length')
+    plt.axhline(y=valid_len_x, color='r', linestyle='--', linewidth=2)
+
+    # Plot 2: Categorical values (yt)
+    plt.subplot(1, 4, 2)
+    yt_viz = yt_detokenized[:, None] if yt_detokenized.ndim == 1 else yt_detokenized
+    yt_mask_viz = ~y_mask_np[:, None] if yt_viz.ndim == 2 else ~y_mask_np
+    if yt_viz.ndim == 1:
+        yt_mask_viz = yt_mask_viz[:, None]
+
+    valid_atoms = yt_detokenized[y_mask_np]
+    unique_atoms = np.unique(valid_atoms) if len(valid_atoms) > 0 else np.array(['<pad>'], dtype=object)
+    atom_to_code = {atom: idx for idx, atom in enumerate(unique_atoms)}
+    yt_codes = np.array([atom_to_code.get(atom, -1) for atom in yt_detokenized])
+    yt_codes_viz = yt_codes[:, None] if yt_codes.ndim == 1 else yt_codes
+
+    sns.heatmap(
+        yt_codes_viz,
+        cmap='Set3',
+        cbar=True,
+        annot=yt_viz,
+        fmt='',
+        mask=yt_mask_viz,
+        cbar_kws={'label': 'Token Type'},
+    )
+    plt.title(f'Categorical Values (Valid Length: {valid_len_y})')
+    plt.xlabel('Feature Dimension (1)')
+    plt.ylabel('Sequence Length')
+    plt.axhline(y=valid_len_y, color='r', linestyle='--', linewidth=2)
+
+    # Plot 3: x mask
+    plt.subplot(1, 4, 3)
+    from matplotlib.colors import ListedColormap
+    cmap_mask = ListedColormap(['#FFB6C1', '#ADD8E6'])  # Pad, Valid
+    sns.heatmap(x_mask_np[:, None], cmap=cmap_mask, cbar=False, annot=True, vmin=0, vmax=1)
+    plt.title('x_mask (Blue=Valid, Red=Pad)')
+    plt.ylabel('Sequence Length')
+    plt.xticks([])
+
+    # Plot 4: y mask
+    plt.subplot(1, 4, 4)
+    sns.heatmap(y_mask_np[:, None], cmap=cmap_mask, cbar=False, annot=True, vmin=0, vmax=1)
+    plt.title('y_mask (Blue=Valid, Red=Pad)')
+    plt.ylabel('Sequence Length')
+    plt.xticks([])
+
+    plt.tight_layout()
+    plt.savefig(out_file_name)
+    plt.close()
+
 def plot_molecule(symbols, positions, out_file_name, smiles=None):
     """
     Plots a molecule in 3D with accurate bond detection using OpenBabel pipeline.

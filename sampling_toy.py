@@ -7,11 +7,12 @@ from multimodal_interpolant import MultimodalInterpolant
 from branching_flows_interpolant import BranchingFlowsInterpolant
 from utils.datasets import MultimodalVariableLengthToyDataset
 from custom_datasets.multimodal_math import EquationsDataset
+from custom_datasets.multimodal_math import ParenthesizedEquationsDataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
-from models.mmdit_qm9 import MMDiTQM9
-from visualize_dataset import plot_sample
-
+from models.mmdit_qm9 import MMDiTQM9, MMDiTBothVar
+from visualize_dataset import plot_sample, plot_sample_2
+from multimodal_interpolant_both_var import MultimodalInterpolantBoth
 import json
 from json import JSONEncoder
 
@@ -27,10 +28,12 @@ class CustomJSONEncoder(JSONEncoder):
 
 @click.command()
 @click.option('--num_samples', type=int, default=50)
-@click.option('--dataset',type=click.Choice(['qm9', 'equations']), default='equations')
-@click.option('--interpolant',type=click.Choice(['multimodal', 'branching']), default='multimodal')
+@click.option('--dataset',type=click.Choice(['qm9', 'equations', 'parenthesis']), default='equations')
+@click.option('--data_path',type=str, default=None)
+@click.option('--model',type=click.Choice(['MMDiTBothVar', 'DiT']), default='DiT')
+@click.option('--interpolant',type=click.Choice(['multimodal', 'branching', 'multimodal_both']), default='multimodal')
 @click.option('--num_steps', type=int, default=100)
-@click.option('--batch_size', type=int, default=50)
+@click.option('--batch_size', type=int, default=100)
 @click.option('--num_workers',type=int,default=2)
 @click.option('--seed',type=int,default=42)
 @click.option('--dir',type=str)
@@ -54,7 +57,11 @@ def sampling(**opts):
         euclidean_dim = 3
         hidden_dim = 66
     elif opts.dataset == 'equations':
-        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.'})
+        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.', '(', ')'})
+        euclidean_dim = 1
+        hidden_dim = 256
+    elif opts.dataset == 'parenthesis':
+        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.', '(', ')'})
         euclidean_dim = 1
         hidden_dim = 256
     print('Vocab')
@@ -65,9 +72,11 @@ def sampling(**opts):
     if opts.dataset == 'qm9':
         dataset = MultimodalVariableLengthToyDataset(character_tokenizer)
     elif opts.dataset == 'equations':
-        dataset = EquationsDataset(character_tokenizer)
-
-    model = MMDiTQM9(
+        dataset = EquationsDataset(character_tokenizer, max_length=18)
+    elif opts.dataset == 'parenthesis':
+        dataset = ParenthesizedEquationsDataset(character_tokenizer, data_path=opts.data_path)
+    if opts.model == 'MMDiTBothVar':
+        model = MMDiTBothVar(
         euclidean_dim=euclidean_dim,
         vocab_size=character_tokenizer.vocab_size,
         symbols_depth=4,
@@ -77,6 +86,17 @@ def sampling(**opts):
         dim_joint_attn=hidden_dim,
         dim_conds=[hidden_dim, hidden_dim]
     ).to(device)
+    elif opts.model == 'DiT':
+        model = MMDiTQM9(
+            euclidean_dim=euclidean_dim,
+            vocab_size=character_tokenizer.vocab_size,
+            symbols_depth=4,
+            positions_depth=4,
+            depth=4,
+            dim_modalities=[hidden_dim, hidden_dim],
+            dim_joint_attn=hidden_dim,
+            dim_conds=[hidden_dim, hidden_dim]
+        ).to(device)
     model = load_checkpoint(opts, device, model)
     
     if opts.interpolant == 'multimodal':
@@ -92,7 +112,15 @@ def sampling(**opts):
         interpolant = BranchingFlowsInterpolant(
             mask_token=character_tokenizer.mask_token_id,
         )
-
+    elif opts.interpolant == 'multimodal_both':
+        interpolant = MultimodalInterpolantBoth(
+            max_length=dataset.max_length,
+            vocab_size=character_tokenizer.vocab_size,
+            mask_token=character_tokenizer.mask_token_id,
+            pad_token=character_tokenizer.pad_token_id, 
+            bos_token=character_tokenizer.bos_token_id,
+            euclidean_dim=euclidean_dim,
+        )
     
     model.train()
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)//1e6} M")
@@ -117,7 +145,10 @@ def sampling(**opts):
                 'length': len(symbols)
             })
             if opts.enable_plotting:
-                plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
+                if opts.interpolant == 'multimodal':
+                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
+                elif opts.interpolant == 'multimodal_both':
+                    plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
             
     output_path = os.path.join(opts.dir, 'samples.jsonl')
     with open(output_path, 'w') as f:
