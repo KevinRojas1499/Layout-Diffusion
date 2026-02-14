@@ -9,12 +9,14 @@ from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
 from branching_flows_interpolant import BranchingFlowsInterpolant
 from custom_datasets.multimodal_math import EquationsDataset
+from custom_datasets.multimodal_math import ParenthesizedEquationsDataset
 from utils.datasets import MultimodalVariableLengthToyDataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler
-from models.mmdit_qm9 import MMDiTQM9
+from models.mmdit_qm9 import MMDiTQM9, MMDiTBothVar
 from visualize_dataset import plot_sample
+from multimodal_interpolant_both_var import MultimodalInterpolantBoth
 
 
 def init_wandb(opts):
@@ -40,9 +42,10 @@ def update_ema(ema_model, model, decay=0.9999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 @click.command()
-@click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
-@click.option('--dataset',type=click.Choice(['qm9', 'equations']), default='equations')
-@click.option('--interpolant',type=click.Choice(['multimodal', 'branching']), default='multimodal')
+@click.option('--model',type=click.Choice(['radd', 'DiT', 'MMDiTBothVar']), default='DiT')
+@click.option('--dataset',type=click.Choice(['qm9', 'equations', 'parenthesis']), default='equations')
+@click.option('--data_path',type=str, default=None)
+@click.option('--interpolant',type=click.Choice(['multimodal', 'branching', 'multimodal_both']), default='multimodal')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--ema_beta',type=float, default=.9999)
 @click.option('--lr', type=float, default=1e-4)
@@ -73,8 +76,13 @@ def training(**opts):
         euclidean_dim = 3
         hidden_dim = 66
     elif opts.dataset == 'equations':
-        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.'})
-        dataset = EquationsDataset(character_tokenizer)
+        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.', '(', ')'})
+        dataset = EquationsDataset(character_tokenizer, data_path=opts.data_path)
+        euclidean_dim = 1
+        hidden_dim = 256
+    elif opts.dataset == 'parenthesis':
+        character_tokenizer = VocabTokenizer(vocab={'+','-','*', '=', '.', '(', ')'})
+        dataset = ParenthesizedEquationsDataset(character_tokenizer, data_path=opts.data_path)
         euclidean_dim = 1
         hidden_dim = 256
     print('Vocab')
@@ -88,17 +96,29 @@ def training(**opts):
     if wandb_enabled:
         init_wandb(opts)
     
-    model = MMDiTQM9(
-        branching_flows=opts.interpolant == 'branching',
-        euclidean_dim=euclidean_dim,
-        vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=4,
-        positions_depth=4,
-        depth=4,
-        dim_modalities=[hidden_dim, hidden_dim],
-        dim_joint_attn=hidden_dim,
-        dim_conds=[hidden_dim, hidden_dim]
-    ).to(device)
+    if opts.model == 'MMDiTBothVar':
+        model = MMDiTBothVar(
+            euclidean_dim=euclidean_dim,
+            vocab_size=character_tokenizer.vocab_size,
+            symbols_depth=4,
+            positions_depth=4,
+            depth=4,
+            dim_modalities=[hidden_dim, hidden_dim],
+            dim_joint_attn=hidden_dim,
+            dim_conds=[hidden_dim, hidden_dim]
+        ).to(device)
+    elif opts.model == 'DiT':
+        model = MMDiTQM9(
+            branching_flows=opts.interpolant == 'branching',
+            euclidean_dim=euclidean_dim,
+            vocab_size=character_tokenizer.vocab_size,
+            symbols_depth=4,
+            positions_depth=4,
+            depth=4,
+            dim_modalities=[hidden_dim, hidden_dim],
+            dim_joint_attn=hidden_dim,
+            dim_conds=[hidden_dim, hidden_dim]
+        ).to(device)
     ema = deepcopy(model)
     # dim_2_params = [p for p in model.parameters() if p.ndim == 2] # Selects weights of Linear layers
     # other_params = [p for p in model.parameters() if p.ndim != 2]
@@ -117,6 +137,15 @@ def training(**opts):
         bos_token=character_tokenizer.bos_token_id,
         euclidean_dim=euclidean_dim,
     )
+    elif opts.interpolant == 'multimodal_both':
+        interpolant = MultimodalInterpolantBoth(
+            max_length=dataset.max_length,
+            vocab_size=character_tokenizer.vocab_size,
+            mask_token=character_tokenizer.mask_token_id,
+            pad_token=character_tokenizer.pad_token_id, 
+            bos_token=character_tokenizer.bos_token_id,
+            euclidean_dim=euclidean_dim,
+        )
     elif opts.interpolant == 'branching':
         interpolant = BranchingFlowsInterpolant(
             vocab_size=character_tokenizer.vocab_size,
@@ -149,6 +178,8 @@ def training(**opts):
             losses = interpolant.compute_loss(model, data_)
             if opts.interpolant == 'multimodal':
                 loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["euclidean_unmasking_loss"] + losses["insertion_loss"]
+            elif opts.interpolant == 'multimodal_both':
+                loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["euc_insertion_loss"] + losses["disc_insertion_loss"]
             elif opts.interpolant == 'branching':
                 loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["insertion_loss"]
 
@@ -174,6 +205,8 @@ def training(**opts):
             
             if opts.interpolant == 'multimodal':
                 pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Unmasking Loss: {losses["euclidean_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
+            elif opts.interpolant == 'multimodal_both':
+                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Insertion Loss: {losses["euc_insertion_loss"] :6.4f}, Discrete Insertion Loss: {losses["disc_insertion_loss"] :6.4f}')
             elif opts.interpolant == 'branching':
                 pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
             if wandb_enabled:
@@ -182,8 +215,16 @@ def training(**opts):
                         'loss': loss,
                         'dsm_loss': losses["dsm_loss"],
                         'discrete_unmasking_loss': losses["discrete_unmasking_loss"],
-                        'euclidean_unmasking_loss': losses["euclidean_unmasking_loss"],
                         'insertion_loss': losses["insertion_loss"],
+                        'step': training_iter
+                    })
+                elif opts.interpolant == 'multimodal_both':
+                    wandb.log({
+                        'loss': loss,
+                        'dsm_loss': losses["dsm_loss"],
+                        'discrete_unmasking_loss': losses["discrete_unmasking_loss"],
+                        'euc_insertion_loss': losses["euc_insertion_loss"],
+                        'disc_insertion_loss': losses["disc_insertion_loss"],
                         'step': training_iter
                     })
                 elif opts.interpolant == 'branching':
