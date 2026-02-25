@@ -296,6 +296,46 @@ class MultimodalInterpolant():
         mask_t = torch.zeros((batch_size, max_length), dtype=torch.bool, device=device)
         mask_t[:, 0] = True # Only the start is active
         return xt, yt, mask_t
+
+    def update_xt_yt(
+        self,
+        prediction: MultimodalModelPrediction,
+        xt: Tensor,
+        yt: Tensor,
+        mask_t: Tensor,
+        t: Tensor,
+        dt: float,
+        is_last_step: bool,
+    ) -> tuple[Tensor, Tensor]:
+        # Denoise
+        masked_positions = (yt == self.mask_token)
+        drift = self.get_drift(prediction, xt, t)
+        xt = xt + (drift * dt)
+        xt = torch.where(mask_t.unsqueeze(-1), xt, 0.)
+        xt[:,0] = 0. # Don't corrupt begginning of the sequence
+        xt = torch.where(masked_positions.unsqueeze(-1), 0., xt)
+
+        # Unmasking
+        unmasking_rate = self.get_unmasking_rate(prediction, t)
+        unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
+        num_jumps = unmasking_nums.sum(dim=-1)
+        if not is_last_step:
+            change_pos = (num_jumps == 1) & (mask_t) & (masked_positions)
+            unmasking_nums = unmasking_nums * change_pos.unsqueeze(-1)
+            new_sample = unmasking_nums.argmax(dim=-1)
+        else:
+            change_pos = masked_positions
+            new_sample = unmasking_rate.argmax(dim=-1)
+
+        indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
+        mean_cond_y1 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
+
+        yt = torch.where(change_pos, new_sample, yt)
+        alpha_t = self.alpha(t).view(-1, 1, 1)
+        new_xt = alpha_t * mean_cond_y1 + (1 - alpha_t) * torch.randn_like(xt)
+        xt = torch.where(change_pos.unsqueeze(-1), new_xt, xt)
+
+        return xt, yt
     
     @torch.no_grad()
     def sampling(
@@ -329,32 +369,15 @@ class MultimodalInterpolant():
                 symbols_time=t,
                 pos_time=t
             )
-            # Denoise
-            masked_positions = (yt == self.mask_token)
-            drift = self.get_drift(prediction, xt, t)
-            xt = xt + (drift * dt)
-            xt = torch.where(mask_t.unsqueeze(-1), xt, 0.)
-            xt[:,0] = 0. # Don't corrupt begginning of the sequence
-            xt = torch.where(masked_positions.unsqueeze(-1), 0., xt)
-
-            # Unmasking
-            unmasking_rate = self.get_unmasking_rate(prediction, t)
-            unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate * dt).sample()
-            num_jumps = unmasking_nums.sum(dim=-1)
-            if i != steps - 1:
-                change_pos = (num_jumps == 1) & (mask_t) & (masked_positions)
-                unmasking_nums = unmasking_nums * change_pos.unsqueeze(-1)
-                new_sample = unmasking_nums.argmax(dim=-1)
-            else:
-                change_pos = masked_positions
-                new_sample = unmasking_rate.argmax(dim=-1)
-            
-            indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
-            mean_cond_y1 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
-
-            yt = torch.where(change_pos, new_sample, yt)
-            new_xt = self.alpha(t).view(-1, 1, 1) * mean_cond_y1 + (1 - self.alpha(t).view(-1, 1, 1)) * torch.randn_like(xt)
-            xt = torch.where(change_pos.unsqueeze(-1), new_xt, xt)
+            xt, yt = self.update_xt_yt(
+                prediction=prediction,
+                xt=xt,
+                yt=yt,
+                mask_t=mask_t,
+                t=t,
+                dt=dt,
+                is_last_step=(i == steps - 1),
+            )
 
 
             # Perform insertions
