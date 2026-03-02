@@ -86,7 +86,7 @@ def sampling(**opts):
 
     dist.barrier(device_ids=[device])
     
-    model.train()
+    model.eval()
     model = DDP(model)
     
     if rank == 0:
@@ -177,7 +177,7 @@ def load_checkpoint(opts, rank, device, model, use_ema):
     snapshot = torch.load(os.path.join(opts.load_checkpoint), weights_only=True, map_location=f'cuda:{device}')
     model_key = 'ema' if use_ema else 'model'
     print(f'Loading {model_key} from checkpoint')
-    model.load_state_dict(snapshot[model_key],strict=False)
+    model.load_state_dict(snapshot[model_key],strict=True)
     return model
 
 
