@@ -337,6 +337,53 @@ class MultimodalInterpolant():
 
         return xt, yt
     
+    def perform_insertions(
+        self,
+        prediction: MultimodalModelPrediction,
+        xt: Tensor,
+        yt: Tensor,
+        mask_t: Tensor,
+        t: Tensor,
+        dt: float,
+        max_length: int,
+        is_last_step: bool,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        insertion_rate = self.get_insertion_rate(prediction, t)
+        ext = torch.distributions.poisson.Poisson(insertion_rate * dt).sample()
+
+        if is_last_step:
+            return xt, yt, mask_t
+
+        batch_size, seq_len = xt.shape[:2]
+        device = xt.device
+        for j in range(batch_size):
+            # Build sequence j with sampled insertions while preserving active prefix order.
+            new_xt_j = []
+            new_yt_j = []
+            for k in range(seq_len):
+                if not mask_t[j, k]:
+                    break
+                new_xt_j.append(xt[j, k:k+1, :])
+                new_yt_j.append(yt[j, k].item())
+                if ext[j, k] > 0:
+                    for _ in range(int(ext[j, k].item())):
+                        new_sample = torch.zeros_like(xt[0, :1, :])
+                        new_xt_j.append(new_sample.clone())
+                        new_yt_j.append(self.mask_token)
+
+            # Ensure we don't exceed the tensor size
+            new_len = min(len(new_xt_j), max_length)
+            new_xt_tensor = torch.cat(new_xt_j[:new_len], dim=0)
+            new_yt_tensor = torch.tensor(new_yt_j[:new_len], device=device, dtype=yt.dtype)
+            xt[j, :new_len, :] = new_xt_tensor
+            yt[j, :new_len] = new_yt_tensor
+            xt[j, 0] = 0.
+            yt[j, 0] = self.bos_token
+            mask_t[j, :new_len] = True
+            mask_t[j, new_len:] = False
+
+        return xt, yt, mask_t
+    
     @torch.no_grad()
     def sampling(
         self,
@@ -346,6 +393,7 @@ class MultimodalInterpolant():
         max_length: int,
         device: torch.device,
         return_trace: bool = False,
+        sampler: str = 'split',
     ) -> SamplingResult:
         max_length = max_length + 1 # Plus one for the BOS token 
         # 1) Initialize all‑pad sequence and trace
@@ -361,65 +409,86 @@ class MultimodalInterpolant():
             ))
         torch.set_printoptions(precision=2, sci_mode=False)
         for i in tqdm(range(steps), leave=False):
+            t0 = t
+            t_mid = t0 + dt / 2
+            t1 = t0 + dt
+
+            is_last_step = (i == steps - 1)
+
             prediction: MultimodalModelPrediction = model(
                 cat_tokens=yt,
                 euclidean_tokens=xt,
                 symbols_mask=mask_t,
                 pos_mask=mask_t,
-                symbols_time=t,
-                pos_time=t
+                symbols_time=t0,
+                pos_time=t0
             )
+            if sampler == 'euler':
+                step_size = dt
+            else:
+                step_size = dt if is_last_step else dt/2
             xt, yt = self.update_xt_yt(
                 prediction=prediction,
                 xt=xt,
                 yt=yt,
                 mask_t=mask_t,
-                t=t,
-                dt=dt,
-                is_last_step=(i == steps - 1),
+                t=t0,
+                dt=step_size,
+                is_last_step=is_last_step,
             )
-
-
-            # Perform insertions
-            insertion_rate = self.get_insertion_rate(prediction, t)
-            ext = torch.distributions.poisson.Poisson(insertion_rate * dt).sample()
-
-            seq_len = xt.shape[1]
-            if i != steps - 1:
-                for j in range(batch_size):
-                    # Add dimensions
-                    new_xt_j = []
-                    new_yt_j = []
-                    for k in range(seq_len):
-                        if not mask_t[j, k]:
-                            break
-                        new_xt_j.append(xt[j, k:k+1, :])
-                        new_yt_j.append(yt[j, k].item())
-                        # Insert new token after position k if ext[j, k] > 0
-                        if ext[j, k] > 0:
-                            # Consider doing a for loop here
-                            # print('------------- Position ', k, ' -------------')
-                            for _ in range(int(ext[j, k].item())):
-                                new_sample = torch.zeros_like(xt[0, :1, :])
-                                new_xt_j.append(new_sample.clone())
-                                new_yt_j.append(self.mask_token)
-                    
-                    # Ensure we don't exceed the tensor size
-                    new_len = min(len(new_xt_j), max_length) 
-                    new_xt_tensor = torch.cat(new_xt_j[:new_len], dim=0)
-                    new_yt_tensor = torch.tensor(new_yt_j[:new_len], device=device, dtype=yt.dtype)
-                    xt[j, :new_len, :] = new_xt_tensor
-                    yt[j, :new_len] = new_yt_tensor
-                    xt[j, 0] = 0.
-                    yt[j, 0] = self.bos_token
-                    mask_t[j, :new_len] = True
-                    mask_t[j, new_len:] = False
+            if sampler == 'euler':
+                xt, yt, mask_t = self.perform_insertions(
+                    prediction=prediction,
+                    xt=xt,
+                    yt=yt,
+                    mask_t=mask_t,
+                    t=t0,
+                    dt=dt,
+                    max_length=max_length,
+                    is_last_step=is_last_step,
+                )
+            elif not is_last_step:
+                prediction_2: MultimodalModelPrediction = model(
+                    cat_tokens=yt,
+                    euclidean_tokens=xt,
+                    symbols_mask=mask_t,
+                    pos_mask=mask_t,
+                    symbols_time=t_mid,
+                    pos_time=t_mid
+                )
+                xt, yt, mask_t = self.perform_insertions(
+                    prediction=prediction_2,
+                    xt=xt,
+                    yt=yt,
+                    mask_t=mask_t,
+                    t=t_mid,
+                    dt=dt,
+                    max_length=max_length,
+                    is_last_step=is_last_step,
+                )
+                prediction_3: MultimodalModelPrediction = model(
+                    cat_tokens=yt,
+                    euclidean_tokens=xt,
+                    symbols_mask=mask_t,
+                    pos_mask=mask_t,
+                    symbols_time=t1,
+                    pos_time=t1
+                )
+                xt, yt = self.update_xt_yt(
+                    prediction=prediction_3,
+                    xt=xt,
+                    yt=yt,
+                    mask_t=mask_t,
+                    t=t1,
+                    dt=dt/2,
+                    is_last_step=is_last_step,
+                )
+            t = t1
 
             if return_trace:
                 trajectory.append(SamplingTrajectoryResult(
                     xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
                 ))
-            t = t + dt
 
         return SamplingResult(
             xt=xt, yt=yt, mask_t=mask_t, trajectory=trajectory
