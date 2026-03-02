@@ -110,13 +110,13 @@ def training(**opts):
     muon_params = param_groups['muon_params']
     adam_params = param_groups['adam_params']
     if opts.optimizer == 'muon':
-        muon_opt = torch.optim.Muon(muon_params, lr=0.02)
+        muon_opt = torch.optim.Muon(muon_params, lr=0.02, weight_decay=0.01, adjust_lr="match_rms_adamw")
         adam_opt = torch.optim.AdamW(adam_params, lr=opts.lr)
         opt = CombinedOptimizer(muon_opt, adam_opt)
     elif opts.optimizer == 'adamw':
-        opt = torch.optim.AdamW(adam_params, lr=opts.lr)
+        opt = torch.optim.AdamW(model.parameters(), lr=opts.lr)
     elif opts.optimizer == 'adam':
-        opt = torch.optim.Adam(adam_params, lr=opts.lr)
+        opt = torch.optim.Adam(model.parameters(), lr=opts.lr)
     else:
         raise ValueError(f'Invalid optimizer: {opts.optimizer}')
 
