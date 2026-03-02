@@ -30,6 +30,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.command()
 @click.option('--num_samples', type=int, default=50)
 @click.option('--num_steps', type=int, default=100)
+@click.option('--sampler', type=click.Choice(['euler', 'split']), default='split')
 @click.option('--batch_size', type=int, default=50)
 @click.option('--num_workers',type=int,default=2)
 @click.option('--seed',type=int,default=42)
@@ -96,7 +97,15 @@ def sampling(**opts):
 
     output_samples = {"molecules": []}
     for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
-        samples = interpolant.sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace)
+        samples = interpolant.sampling(
+            model,
+            num_steps,
+            batch_size,
+            dataset.max_length,
+            device,
+            return_trace=opts.return_trace,
+            sampler=opts.sampler,
+        )
         for i, sample in enumerate(samples):
             symbols = character_tokenizer.decode(sample.yt.cpu())
             positions = sample.xt.cpu()[1:len(symbols)+1, :]

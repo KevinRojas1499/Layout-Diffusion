@@ -181,6 +181,7 @@ class MultimodalInterpolantBoth():
         # Discrete data
         mask_positions = (t_shaped_disc <= unmasking_time_disc) & attn_mask_y
         yt = torch.where(mask_positions, self.mask_token, y1) # Change to mask id
+        yt[:,0] = self.bos_token # Don't corrupt begginning of the sequence
 
         # Set up attention mask of deleted data
         new_mask = attn_mask_y & (t_shaped_disc >= deletion_time_disc)
@@ -258,15 +259,13 @@ class MultimodalInterpolantBoth():
         )
         x_mask_t_shaped = interpolant_sample.x_mask_t.unsqueeze(-1)
 
-        masked_positions = (interpolant_sample.yt == self.mask_token)
-        
         # Euclidean loss
         # We must only compute the loss for positions that are:
         # not deleted: mask_t_shaped
         # we compute the loss even for masked positions, to model the jumps like that
         dsm_loss = (interpolant_sample.x_targets - prediction.clean_data)**2 * x_mask_t_shaped
         dsm_loss[:,0] = 0. # Don't take loss at the start of the sequence
-        dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions]
+        dsm_loss = dsm_loss.sum(dim=-1)
         dsm_loss = dsm_loss.mean() / x1.shape[-1]
         # Insertion loss
         gaps_x, gaps_mask_x = interpolant_sample.gaps_and_mask(interpolant_sample.x_mask_1, interpolant_sample.x_mask_t)
@@ -279,6 +278,7 @@ class MultimodalInterpolantBoth():
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
+        masked_positions = (interpolant_sample.yt == self.mask_token)
         logits_flat = prediction.label_logits[masked_positions]
         targets_flat = interpolant_sample.y_targets[masked_positions]
         tokens_loss = F.cross_entropy(logits_flat, targets_flat, reduction="none").mean()
@@ -370,6 +370,8 @@ class MultimodalInterpolantBoth():
             else:
                 change_pos = masked_positions_euc
             xt = torch.where(change_pos, new_xt, xt)
+            xt = torch.where(x_mask_t.unsqueeze(-1), xt, 0.)
+            xt[:,0] = 0. # Don't corrupt begginning of the sequence
 
             # Unmask discrete data
             unmasking_nums_disc = torch.distributions.poisson.Poisson(unmasking_rate_disc * dt).sample()
@@ -382,6 +384,7 @@ class MultimodalInterpolantBoth():
                 change_pos = masked_positions_disc
                 new_sample = unmasking_rate_disc.argmax(dim=-1)
             yt = torch.where(change_pos, new_sample, yt)
+            yt[:,0] = self.bos_token # Don't corrupt begginning of the sequence
 
             # Perform insertions
             insertion_rate_euc, insertion_rate_disc = self.get_insertion_rate(prediction, t)
@@ -394,8 +397,10 @@ class MultimodalInterpolantBoth():
                     new_xt_j = []
                     new_yt_j = []
                     for k in range(max_length):
-                        new_xt_j.append(xt[j, k:k+1, :])
-                        new_yt_j.append(yt[j, k].item())
+                        if x_mask_t[j, k]:
+                            new_xt_j.append(xt[j, k:k+1, :])
+                        if y_mask_t[j, k]:
+                            new_yt_j.append(yt[j, k].item())
                         # Insert new token after position k if ext[j, k] > 0
                         if ext_euc[j, k] > 0 and x_mask_t[j, k]:
                             for _ in range(int(ext_euc[j, k].item())):

@@ -25,13 +25,16 @@ class EquationsDataset(Dataset):
         self.tokenizer = tokenizer
         
         self.data = []
+        self.max_length = 0
         with open(data_path) as f:
             for line in f:
                 item = json.loads(line)
+                self.max_length = max(self.max_length, len(item["symbols"]))
                 self.data.append({
                     "numbers": item["numbers"],
                     "symbols": item["symbols"],
                 })
+
 
     def __len__(self) -> int:
         return len(self.data)

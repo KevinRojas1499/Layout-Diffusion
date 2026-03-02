@@ -32,6 +32,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.option('--data_path',type=str, default=None)
 @click.option('--model',type=click.Choice(['MMDiTBothVar', 'DiT']), default='DiT')
 @click.option('--interpolant',type=click.Choice(['multimodal', 'branching', 'multimodal_both']), default='multimodal')
+@click.option('--sampler',type=click.Choice(['euler', 'split']), default='split')
 @click.option('--num_steps', type=int, default=100)
 @click.option('--batch_size', type=int, default=100)
 @click.option('--num_workers',type=int,default=2)
@@ -122,39 +123,45 @@ def sampling(**opts):
             euclidean_dim=euclidean_dim,
         )
     
-    model.train()
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)//1e6} M")
     
     if not os.path.exists(opts.dir):
         os.makedirs(opts.dir)
 
-    output_samples = []
-    for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
-        samples = interpolant.sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace)
-        for i, sample in enumerate(samples):
-            symbols = character_tokenizer.decode(sample.yt.cpu())
-            positions = sample.xt.cpu()[1:len(symbols)+1, :]
-            assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
-            if euclidean_dim == 1:
-                numbers = positions.squeeze(-1).tolist()
-            else:
-                numbers = positions.tolist()
-            output_samples.append({
-                'numbers': numbers,
-                'symbols': list(symbols),
-                'length': len(symbols)
-            })
-            if opts.enable_plotting:
-                if opts.interpolant == 'multimodal':
-                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
-                elif opts.interpolant == 'multimodal_both':
-                    plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
-            
     output_path = os.path.join(opts.dir, 'samples.jsonl')
     with open(output_path, 'w') as f:
-        for sample in output_samples:
-            f.write(json.dumps(sample, separators=(',', ':'), cls=CustomJSONEncoder))
-            f.write('\n')
+        for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
+            samples = interpolant.sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace, sampler=opts.sampler)
+            for i, sample in enumerate(samples):
+                symbols = character_tokenizer.decode(sample.yt.cpu())
+                if opts.interpolant == 'multimodal':
+                    positions = sample.xt.cpu()[1:len(symbols)+1, :]
+                    assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
+                else:
+                    x_length = sample.x_mask_t.cpu().sum(dim=-1).tolist()
+                    y_length = sample.y_mask_t.cpu().sum(dim=-1).tolist()
+                    positions = sample.xt.cpu()[1:x_length, :]
+                    print(f'x_length: {x_length}, y_length: {y_length}')
+                    print(sample.xt.cpu())
+
+                if opts.interpolant == 'multimodal':
+                    assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
+                if euclidean_dim == 1:
+                    numbers = positions.squeeze(-1).tolist()
+                else:
+                    numbers = positions.tolist()
+                f.write(json.dumps({
+                    'numbers': numbers,
+                    'symbols': list(symbols),
+                    'length': len(symbols)
+                }, separators=(',', ':'), cls=CustomJSONEncoder))
+                f.write('\n')
+                if opts.enable_plotting:
+                    if opts.interpolant == 'multimodal':
+                        plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
+                    elif opts.interpolant == 'multimodal_both':
+                        plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
+            f.flush()
 
 def load_checkpoint(opts, device, model):
     print(f'Loading checkpoint from {opts.load_checkpoint}')
