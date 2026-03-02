@@ -6,7 +6,7 @@ import wandb
 from collections import OrderedDict
 from copy import deepcopy
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
 from custom_datasets.qm9 import QM9Dataset
@@ -79,7 +79,15 @@ def training(**opts):
         print(f'{token}: {id}')
     print('--------------------------------')
     dataset = QM9Dataset(character_tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=opts.num_workers, drop_last=True)
+    per_rank_batch_size = batch_size // world_size
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=per_rank_batch_size,
+        sampler=sampler,
+        num_workers=opts.num_workers,
+        drop_last=True,
+    )
     
     wandb_enabled = opts.enable_wandb and rank == 0 # We only want to log once
     if wandb_enabled:
@@ -88,9 +96,9 @@ def training(**opts):
     model = MMDiTQM9(
         euclidean_dim=3,
         vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=4,
-        positions_depth=4,
-        depth=4,
+        symbols_depth=6,
+        positions_depth=6,
+        depth=6,
         dim_modalities=[384, 384],
         dim_joint_attn=384,
         dim_conds=[384, 384]
@@ -137,7 +145,10 @@ def training(**opts):
 
     training_iter = start_iter
     log_rate = opts.log_rate
+    epoch = 0
     while training_iter < num_iters:
+        sampler.set_epoch(epoch)
+        epoch += 1
         pbar = tqdm(dataloader,total=len(dataloader),leave=False) if rank == 0 else dataloader
         for data_ in pbar:
             if training_iter > num_iters:
@@ -153,92 +164,69 @@ def training(**opts):
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
 
-            update_ema(ema, model.module, decay=opts.ema_beta)
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-            
             for param in model.parameters():
                 if param.grad is not None:
                     torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
             
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+            
             scaler.step(opt)
             scaler.update()
             scheduler.step()
+
+            update_ema(ema, model.module, decay=opts.ema_beta)
             
             training_iter += 1
             
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-            loss = loss.detach().item()/world_size
-            
+            reduced_losses = {
+                "loss": loss.detach().clone(),
+                "dsm_loss": losses["dsm_loss"].detach().clone(),
+                "discrete_unmasking_loss": losses["discrete_unmasking_loss"].detach().clone(),
+                "euclidean_unmasking_loss": losses["euclidean_unmasking_loss"].detach().clone(),
+                "insertion_loss": losses["insertion_loss"].detach().clone(),
+            }
+            for key in reduced_losses:
+                dist.all_reduce(reduced_losses[key], op=dist.ReduceOp.SUM)
+                reduced_losses[key] = (reduced_losses[key] / world_size).item()
             
             if rank == 0:
-                pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Unmasking Loss: {losses["euclidean_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
+                pbar.set_description(
+                    f'Iter {training_iter} --- DSM Loss: {reduced_losses["dsm_loss"]:6.4f}, '
+                    f'Discrete Unmasking Loss: {reduced_losses["discrete_unmasking_loss"]:6.4f}, '
+                    f'Euclidean Unmasking Loss: {reduced_losses["euclidean_unmasking_loss"]:6.4f}, '
+                    f'Insertion Loss: {reduced_losses["insertion_loss"]:6.4f}'
+                )
             if wandb_enabled:
                 wandb.log({
-                'loss': loss/world_size,
-                'dsm_loss': losses["dsm_loss"]/world_size,
-                'discrete_unmasking_loss': losses["discrete_unmasking_loss"]/world_size,
-                'euclidean_unmasking_loss': losses["euclidean_unmasking_loss"]/world_size,
-                'insertion_loss': losses["insertion_loss"]/world_size,
+                'loss': reduced_losses["loss"],
+                'dsm_loss': reduced_losses["dsm_loss"],
+                'discrete_unmasking_loss': reduced_losses["discrete_unmasking_loss"],
+                'euclidean_unmasking_loss': reduced_losses["euclidean_unmasking_loss"],
+                'insertion_loss': reduced_losses["insertion_loss"],
                 'step': training_iter
             })
-            dist.barrier(device_ids=[device])
             # Evaluate sample accuracy
             if training_iter%log_rate == 0 or training_iter == num_iters:
-                path = os.path.join(opts.dir, f'itr_{training_iter}/')
-                os.makedirs(path, exist_ok=True)
-                if rank == 0:
-                    save_ckpt(model, ema, opt, scheduler, os.path.join(path, 'snapshot.pt'))
-                model.eval()
                 dist.barrier(device_ids=[device])
+                if rank == 0:
+                    path = os.path.join(opts.dir, f'itr_{training_iter}/')
+                    os.makedirs(path, exist_ok=True)
+                    save_ckpt(model, ema, opt, scheduler, os.path.join(path, 'snapshot.pt'))
+                    model.eval()
 
-                samples = interpolant.sampling(model, 50, 20, dataset.max_length, device, return_trace=True)
-                for i, sample in enumerate(samples):
-                    try:
-                        plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
-                        symbols = character_tokenizer.decode(sample.yt.cpu())
-                        positions = sample.xt.cpu()[1:len(symbols)+1, :]
-                        plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
+                    samples = interpolant.sampling(model, 50, 20, dataset.max_length, device, return_trace=True)
+                    for i, sample in enumerate(samples):
+                        try:
+                            plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                            symbols = character_tokenizer.decode(sample.yt.cpu())
+                            positions = sample.xt.cpu()[1:len(symbols)+1, :]
+                            plot_molecule(symbols, positions, os.path.join(path, f'molecule_{i}.png'))
 
-                        # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
-                        # os.makedirs(os.path.join(path, f'trajectory_sample_{i}'), exist_ok=True)
-                        
-                        # # Compute fixed axis limits from the final molecule for animation consistency
-                        # final_yt = sample.yt.cpu()
-                        # final_xt = sample.xt.cpu()
-                        # # Convert to numpy for axis limit computation
-                        # if isinstance(final_xt, torch.Tensor):
-                        #     final_xt_np = final_xt.cpu().numpy()
-                        # else:
-                        #     final_xt_np = np.array(final_xt)
-                        
-                        # pbar = tqdm(enumerate(sample.trajectory), leave=False)
-                        # for j, trajectory in pbar:
-                        #     # Get trajectory data - xt is [L+2, 3], yt is [L+2], mask_t is [L+2]
-                        #     cur_yt = trajectory.yt.cpu()  # Token IDs
-                        #     cur_xt = trajectory.xt.cpu()  # Positions [L+2, 3]
-                        #     cur_mask_t = trajectory.mask_t.cpu()  # Mask [L+2]
-                        #     cur_t = trajectory.t.cpu().item() if hasattr(trajectory.t, 'item') else trajectory.t
-                            
-                        #     # Determine which tokens are masked (mask_token_id)
-                        #     mask_token_id = character_tokenizer.mask_token_id
-                        #     is_masked = (cur_yt == mask_token_id).numpy()
-                            
-                        #     # Plot molecule with mask visualization and fixed axis limits
-                        #     plot_molecule_with_mask(
-                        #         cur_yt,  # Token IDs
-                        #         cur_xt,  # All positions including BOS/EOS
-                        #         is_masked,  # Which tokens are masked
-                        #         os.path.join(path, f'trajectory_{i}', f'step_{j}.png'),
-                        #         character_tokenizer,
-                        #         t=cur_t,
-                        #     )
-                        #     plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_sample_{i}', f'step_{j}.png'), character_tokenizer)
-                        #     pbar.set_description(f'Saving trajectory {i} step {j}')
-                    except Exception as e:
-                        print(f'Error plotting sample {i}')
+                        except Exception as e:
+                            print(f'Error plotting sample {i}: {e}')
 
-                model.train()
+                    model.train()
+                dist.barrier(device_ids=[device])
 
     if rank == 0:
         save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
