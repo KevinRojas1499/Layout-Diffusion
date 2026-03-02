@@ -16,6 +16,19 @@ sudo ln -s /usr/include/openbabel3 /usr/local/include/openbabel3
 # Then install
 uv add openbabel
 ```
+
+For vast ai server using apt
+```bash
+sudo apt install openbabel openbabel-gui
+sudo apt install libopenbabel-dev
+sudo apt install python3-openbabel
+sudo apt install swig
+sudo mkdir -p /usr/local/include
+sudo ln -s /usr/include/openbabel3 /usr/local/include/openbabel3
+uv sync
+```
+
+
 ## Preprocess the dataset
 
 ```{bash}

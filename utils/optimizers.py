@@ -1,4 +1,5 @@
 from torch.optim.lr_scheduler import _LRScheduler
+from torch.optim import Optimizer
 
 class WarmUpScheduler(_LRScheduler):
     def __init__(self, optimizer, warmup_steps, last_epoch=-1):
@@ -9,7 +10,7 @@ class WarmUpScheduler(_LRScheduler):
         step = self.last_epoch + 1
         return [base_lr * min(step / self.warmup_steps, 1.0) for base_lr in self.base_lrs]
 
-class CombinedOptimizer:
+class CombinedOptimizer(Optimizer):
     def __init__(self, optimizer1, optimizer2):
         self.optimizer1 = optimizer1
         self.optimizer2 = optimizer2

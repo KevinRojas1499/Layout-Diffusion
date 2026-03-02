@@ -264,6 +264,48 @@ class MMDiTQM9(nn.Module):
         if not self.branching_flows:
             self.positions_unmask_pred = FinalLayer(self.dim_positions, euclidean_dim * vocab_size)
 
+    def split_params_by_size(self, params):
+        muon_params = []
+        adam_params = []
+        for p in params:
+            if p.ndim == 2:
+                muon_params.append(p)
+            else:
+                adam_params.append(p)
+        return muon_params, adam_params
+
+    def get_muon_adam_params(self):
+        adam_params = []
+        # Embedding layers
+        adam_params.extend(list(self.symbols_time_encoder.mlp.parameters()))
+        adam_params.extend(list(self.positions_time_encoder.mlp.parameters()))
+        adam_params.extend(list(self.symbols_embedder.parameters()))
+        adam_params.extend(list(self.gaussian_fourier_projs.parameters()))
+        adam_params.extend(list(self.euclidean_proj.parameters()))
+        # Final layers
+        adam_params.extend(list(self.insertion_rate.parameters()))
+        adam_params.extend(list(self.symbols_pred_layer.parameters()))
+        adam_params.extend(list(self.positions_pred_layer.parameters()))
+        if not self.branching_flows:
+            adam_params.extend(list(self.positions_unmask_pred.parameters()))
+
+        muon_params = []
+        # Joint Embedding
+        muon_params_, adam_params_ = self.split_params_by_size(self.joint_embedding.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        # Single Embeddings
+        muon_params_, adam_params_ = self.split_params_by_size(self.symbols_dit.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        muon_params_, adam_params_ = self.split_params_by_size(self.positions_dit.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        # Spatial Bias
+        muon_params_, adam_params_ = self.split_params_by_size(self.spatial_bias.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        return {'muon_params': muon_params, 'adam_params': adam_params}
 
     def freeze_last_block(self, idx):
         last_block = self.joint_embedding.blocks[-1]

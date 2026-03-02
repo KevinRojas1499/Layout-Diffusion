@@ -44,7 +44,7 @@ def update_ema(ema_model, model, decay=0.9999):
 
 @click.command()
 @click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
-@click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
+@click.option('--optimizer',type=click.Choice(['adam','adamw','muon']), default='adam')
 @click.option('--ema_beta',type=float, default=.9999)
 @click.option('--lr', type=float, default=1e-4)
 @click.option('--batch_size', type=int, default=128)
@@ -106,14 +106,19 @@ def training(**opts):
     ema = deepcopy(model)
     
     # TODO: Implement Muon optimizer
-    # dim_2_params = [p for p in model.parameters() if p.ndim >= 2] # Selects weights of Linear layers
-    # other_params = [p for p in model.parameters() if p.ndim < 2]
-
-    # adam = torch.optim.AdamW(other_params, lr=opts.lr)
-    # muon = torch.optim.Muon(dim_2_params, lr=opts.lr)
-    # opt = CombinedOptimizer(adam, muon)
-
-    opt = torch.optim.AdamW(model.parameters(),lr=opts.lr)
+    param_groups = model.get_muon_adam_params()
+    muon_params = param_groups['muon_params']
+    adam_params = param_groups['adam_params']
+    if opts.optimizer == 'muon':
+        muon_opt = torch.optim.Muon(muon_params, lr=0.02)
+        adam_opt = torch.optim.AdamW(adam_params, lr=opts.lr)
+        opt = CombinedOptimizer(muon_opt, adam_opt)
+    elif opts.optimizer == 'adamw':
+        opt = torch.optim.AdamW(adam_params, lr=opts.lr)
+    elif opts.optimizer == 'adam':
+        opt = torch.optim.Adam(adam_params, lr=opts.lr)
+    else:
+        raise ValueError(f'Invalid optimizer: {opts.optimizer}')
 
     scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler(device)
