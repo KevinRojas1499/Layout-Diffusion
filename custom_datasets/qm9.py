@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 from utils.tokenizer import VocabTokenizer
 
 class QM9Dataset(Dataset):
-    def __init__(self, tokenizer: VocabTokenizer, max_length=30, use_raw_dataset=True):
+    def __init__(self, tokenizer: VocabTokenizer, max_length=30, use_raw_dataset=False):
         self.max_length = max_length
         self.tokenizer = tokenizer
         self.use_raw_dataset = use_raw_dataset
@@ -22,10 +22,14 @@ class QM9Dataset(Dataset):
 
     def __getitem__(self, index):
         data = self.qm9_dataset[index]
-        if self.use_raw_dataset:
+        if self.use_raw_dataset and 'original_atomic_symbols' in data and 'original_pos' in data:
             atomic_symbols = data['original_atomic_symbols']
             pos = data['original_pos']
+        else:
+            atomic_symbols = data['atomic_symbols']
+            pos = data['pos']
 
+        pos = np.asarray(pos, dtype=np.float32)
         centroid = np.mean(pos, axis=0)
         pos = pos - centroid
         rotation_matrix = np.linalg.qr(np.random.randn(3, 3))[0]
