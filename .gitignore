@@ -6,6 +6,7 @@ experiments/
 *.json
 results/
 results_*/
+results*/
 data/
 results-grid-search/
 *.jsonl

@@ -165,6 +165,7 @@ class MultimodalInterpolant():
 
         # Discrete data
         mask_positions = (t_shaped_disc <= masking_time) & attn_mask
+        mask_positions[:, 0] = False  # Keep BOS visible; sampling keeps BOS fixed.
         yt = torch.where(mask_positions, self.mask_token, y1) # Change to mask id
 
         # Euclidean data
