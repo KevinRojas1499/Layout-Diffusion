@@ -98,7 +98,7 @@ class JointMultimodalInterpolantResult:
         idx = torch.arange(gaps.size(1), device=self.xt.device).unsqueeze(
             0
         )  # shape [1, max_gap]
-        mask = idx <= self.yt_length.unsqueeze(1)
+        mask = idx < self.yt_length.unsqueeze(1)
         gaps[~mask] = 0
 
         return gaps, mask
