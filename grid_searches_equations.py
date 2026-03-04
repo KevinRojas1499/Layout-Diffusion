@@ -50,9 +50,9 @@ def run_one(length_value: int) -> None:
             "--load_checkpoint",
             f"{str(run_dir.relative_to(ROOT))}/final_checkpoint.pt",
             "--dir",
-            str(f'samples_toy/equations_l{length_value}_euler_{steps}/'),
+            str(f'samples_toy/equations_l{length_value}_staggered_{steps}/'),
             "--sampler",
-            "euler"
+            "staggered"
         ]
         subprocess.run(cmd, cwd=str(ROOT), env=os.environ.copy(), check=True)
 

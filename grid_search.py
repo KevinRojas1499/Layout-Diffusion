@@ -131,7 +131,7 @@ def main(
     if not itrs:
         raise click.ClickException("No checkpoint iterations found.")
 
-    for itr in itrs:
+    for itr in reversed(itrs):
         checkpoint = exp_dir / f"itr_{itr}" / "snapshot.pt"
         if not checkpoint.exists():
             click.echo(f"Skipping itr={itr}: missing checkpoint {checkpoint}")
@@ -264,7 +264,7 @@ def grid_search_equations_samplers(
     if not itrs:
         raise click.ClickException("No checkpoint iterations found.")
 
-    for itr in itrs:
+    for itr in reversed(itrs):
         checkpoint = exp_dir / f"itr_{itr}" / "snapshot.pt"
         if not checkpoint.exists():
             click.echo(f"Skipping itr={itr}: missing checkpoint {checkpoint}")

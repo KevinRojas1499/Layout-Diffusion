@@ -396,6 +396,10 @@ class MultimodalInterpolant():
         return_trace: bool = False,
         sampler: str = 'split',
     ) -> SamplingResult:
+        if sampler == 'staggered':
+            return self.staggered_sampler(model, steps, batch_size, max_length, device, return_trace)
+
+        
         max_length = max_length + 1 # Plus one for the BOS token 
         # 1) Initialize all‑pad sequence and trace
         xt, yt, mask_t = self.get_prior_distribution(batch_size, max_length, device)
@@ -495,6 +499,103 @@ class MultimodalInterpolant():
             xt=xt, yt=yt, mask_t=mask_t, trajectory=trajectory
         )
 
+    @torch.no_grad()
+    def staggered_sampler(
+        self,
+        model: torch.nn.Module,
+        steps: int,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        return_trace: bool = False,
+    ) -> SamplingResult:
+        max_length = max_length + 1 # Plus one for the BOS token 
+        # 1) Initialize all‑pad sequence and trace
+        xt, yt, mask_t = self.get_prior_distribution(batch_size, max_length, device)
+        
+        dt = 1.0 / steps
+        t = torch.zeros(batch_size, device=device)
+
+        trajectory = []
+        if return_trace:
+            trajectory.append(SamplingTrajectoryResult(
+                xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
+            ))
+        torch.set_printoptions(precision=2, sci_mode=False)
+
+        t1 = t 
+        t2 = t + dt/2
+        prediction_0: MultimodalModelPrediction = model(
+            cat_tokens=yt,
+            euclidean_tokens=xt,
+            symbols_mask=mask_t,
+            pos_mask=mask_t,
+            symbols_time=t1,
+            pos_time=t1
+        )
+        xt, yt = self.update_xt_yt(
+            prediction=prediction_0,
+            xt=xt,
+            yt=yt,
+            mask_t=mask_t,
+            t=t1,
+            dt=dt/2,
+            is_last_step=False,
+        )
+
+
+        for i in tqdm(range(steps), leave=False):
+            is_last_step = (i == steps - 1)
+            # is_last_step = False # Perhaps this is not needed now
+            # print(f'Staggered sampler t1: {t1[0].item()}, t2: {t2[0].item()}')
+
+            prediction: MultimodalModelPrediction = model(
+                cat_tokens=yt,
+                euclidean_tokens=xt,
+                symbols_mask=mask_t,
+                pos_mask=mask_t,
+                symbols_time=t2,
+                pos_time=t2
+            )
+            xt, yt, mask_t = self.perform_insertions(
+                prediction=prediction,
+                xt=xt,
+                yt=yt,
+                mask_t=mask_t,
+                t=t2,
+                dt=dt,
+                max_length=max_length,
+                is_last_step=is_last_step,
+            )
+            prediction_2: MultimodalModelPrediction = model(
+                cat_tokens=yt,
+                euclidean_tokens=xt,
+                symbols_mask=mask_t,
+                pos_mask=mask_t,
+                symbols_time=t1,
+                pos_time=t1
+            )
+            step_size = dt/2 if is_last_step else dt
+            xt, yt = self.update_xt_yt(
+                prediction=prediction_2,
+                xt=xt,
+                yt=yt,
+                mask_t=mask_t,
+                t=t1,
+                dt=step_size,
+                is_last_step=is_last_step,
+            )
+            t1 = t1 + step_size
+            t2 = t2 + dt
+
+            if return_trace:
+                trajectory.append(SamplingTrajectoryResult(
+                    xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t
+                ))
+
+        return SamplingResult(
+            xt=xt, yt=yt, mask_t=mask_t, trajectory=trajectory
+        )
 def sample_categorical(categorical_probs, method="hard"):
     if method == "hard":
         gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()

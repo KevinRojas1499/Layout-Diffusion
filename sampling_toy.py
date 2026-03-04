@@ -32,7 +32,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.option('--data_path',type=str, default=None)
 @click.option('--model',type=click.Choice(['MMDiTBothVar', 'DiT']), default='DiT')
 @click.option('--interpolant',type=click.Choice(['multimodal', 'branching', 'multimodal_both']), default='multimodal')
-@click.option('--sampler',type=click.Choice(['euler', 'split']), default='split')
+@click.option('--sampler',type=click.Choice(['euler', 'split', 'staggered']), default='split')
 @click.option('--num_steps', type=int, default=100)
 @click.option('--batch_size', type=int, default=100)
 @click.option('--num_workers',type=int,default=2)
