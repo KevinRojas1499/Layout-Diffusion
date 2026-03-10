@@ -306,6 +306,15 @@ class MMDiTQM9(nn.Module):
         muon_params_, adam_params_ = self.split_params_by_size(self.positions_dit.parameters())
         muon_params.extend(muon_params_)
         adam_params.extend(adam_params_)
+        # Fusing layers
+        muon_params_, adam_params_ = self.split_params_by_size(self.label_fuse.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        muon_params_, adam_params_ = self.split_params_by_size(self.insert_fuse.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        muon_params_, adam_params_ = self.split_params_by_size(self.euclidean_fuse.parameters())
+        muon_params.extend(muon_params_)
         # Spatial Bias
         muon_params_, adam_params_ = self.split_params_by_size(self.spatial_bias.parameters())
         muon_params.extend(muon_params_)
