@@ -199,7 +199,7 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 class MMDiTQM9(nn.Module):
-    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, branching_flows: bool = False, **kwargs):
+    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, branching_flows: bool = False, improved=True, **kwargs):
         super().__init__()
         self.euclidean_dim = euclidean_dim
         self.vocab_size = vocab_size
@@ -256,6 +256,11 @@ class MMDiTQM9(nn.Module):
         block_kwargs = {k: v for k, v in kwargs.items() if k not in sep_keys}
         self.symbols_dit = MMDiT(depth = symbols_depth, dim_modalities = [self.dim_symbols], dim_conds = [self.dim_symbols], **block_kwargs)
         self.positions_dit = MMDiT(depth = positions_depth, dim_modalities = [self.dim_positions], dim_conds = [self.dim_positions], **block_kwargs)
+
+        # Fusing layers
+        self.label_fuse = nn.Sequential(nn.Linear(self.dim_symbols + self.dim_positions, self.dim_symbols), nn.SiLU())
+        self.insert_fuse = nn.Sequential(nn.Linear(self.dim_symbols + self.dim_positions, self.dim_symbols), nn.SiLU())
+        self.euclidean_fuse = nn.Sequential(nn.Linear(self.dim_symbols + self.dim_positions, self.dim_positions), nn.SiLU())
 
         # Final Layers
         self.insertion_rate = FinalLayer(self.dim_positions, 1)
@@ -429,8 +434,6 @@ class MMDiTQM9(nn.Module):
             rotary_pos_emb = ((text_cos, text_sin),),
         )[0]
 
-        # Predict unmasking probabilities for symbols
-        label_logits = self.symbols_pred_layer(cat_tokens, symbols_time)
 
         euclidean_tokens = self.positions_dit(
             modality_tokens = (euclidean_tokens_hidden,),
@@ -438,14 +441,22 @@ class MMDiTQM9(nn.Module):
             time_cond = (pos_time,),
             rotary_pos_emb = ((image_cos, image_sin),),
         )[0]
+        # Fuse the tokens
+        hidden_representation = torch.cat([cat_tokens, euclidean_tokens], dim=-1)
+        label_representation = self.label_fuse(hidden_representation)
+        insert_representation = self.insert_fuse(hidden_representation)
+        euclidean_representation = self.euclidean_fuse(hidden_representation)
+
+        # Predict unmasking probabilities for symbols
+        label_logits = self.symbols_pred_layer(label_representation, symbols_time)
         # Clean data prediction
-        clean_data_pred = self.positions_pred_layer(euclidean_tokens, pos_time)
+        clean_data_pred = self.positions_pred_layer(euclidean_representation, pos_time)
         # Clean data prediction for the insertion
         if not self.branching_flows:
-            clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
+            clean_data_unmasking= self.positions_unmask_pred(euclidean_representation, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
         # Insertion rate prediction
         # TODO : Maybe the insertion rate could use both cat tokens and euclidean ones
-        insertion_rate = self.insertion_rate(cat_tokens, pos_time).squeeze(-1)  # [B, L]
+        insertion_rate = self.insertion_rate(insert_representation, pos_time).squeeze(-1)  # [B, L]
         insertion_rate = F.softplus(insertion_rate)
         insertion_rate = insertion_rate * pos_mask
 
