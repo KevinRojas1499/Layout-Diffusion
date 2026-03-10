@@ -56,3 +56,6 @@ uv run torchrun --master-port 29502 toy_training.py --interpolant multimodal_bot
 ### Parenthesis sampling
 
 uv run torchrun sampling_toy.py --num_samples 10000 --dataset parenthesis --data_path data/parenthesis/equations_l10.jsonl --interpolant multimodal_both --num_steps 1000 --dir samples-parenthesis/l10 --load_checkpoint experiments/parenthesis_l10/itr_100000/snapshot.pt --model MMDiTBothVar
+
+### Samplers Grid Search Figure 3
+uv run python run_equations_grid_search.py --steps-min 50 --steps-max 500 --steps-num 5 --nfe-min 50 --nfe-max 1500 --nfe-num 5 --num-samples 10000 --seed 1 --seed 2 --seed 3

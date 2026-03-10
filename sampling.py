@@ -30,7 +30,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.command()
 @click.option('--num_samples', type=int, default=50)
 @click.option('--num_steps', type=int, default=100)
-@click.option('--sampler', type=click.Choice(['euler', 'split']), default='split')
+@click.option('--sampler', type=click.Choice(['euler', 'split', 'staggered']), default='staggered')
 @click.option('--batch_size', type=int, default=50)
 @click.option('--num_workers',type=int,default=2)
 @click.option('--seed',type=int,default=42)
