@@ -38,16 +38,32 @@ def run_one(
     output_dir: Path,
     dry_run: bool,
     skip_existing: bool,
+    nproc_per_node: int = 1,
+    master_port: int = 29500,
 ) -> bool:
     if skip_existing and (output_dir / "samples.jsonl").exists():
         print(f"[L={length_value}] {sampler} {steps} steps seed={seed}: skip (exists)")
         return True
 
-    cmd = [
-        "uv",
-        "run",
-        "python",
-        "sampling_toy.py",
+    if nproc_per_node > 1:
+        cmd = [
+            "uv",
+            "run",
+            "torchrun",
+            "--nproc_per_node",
+            str(nproc_per_node),
+            "--master_port",
+            str(master_port),
+            "sampling_toy.py",
+        ]
+    else:
+        cmd = [
+            "uv",
+            "run",
+            "python",
+            "sampling_toy.py",
+        ]
+    cmd.extend([
         "--dataset",
         "equations",
         "--num_samples",
@@ -62,7 +78,7 @@ def run_one(
         sampler,
         "--seed",
         str(seed),
-    ]
+    ])
 
     print(f"[L={length_value}] {sampler} {steps} steps seed={seed}: {' '.join(cmd)}")
     if dry_run:
@@ -165,6 +181,18 @@ def main() -> None:
         help="Checkpoint filename under experiments/equations_l{L}/.",
     )
     parser.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=None,
+        help="GPUs per node for distributed sampling (uses torchrun). Default: 1 (single process).",
+    )
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=29500,
+        help="Port for torchrun when using --nproc-per-node.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         action="append",
@@ -244,6 +272,8 @@ def main() -> None:
                         output_dir=output_dir,
                         dry_run=args.dry_run,
                         skip_existing=args.skip_existing,
+                        nproc_per_node=args.nproc_per_node or 1,
+                        master_port=args.master_port,
                     )
 
     print(f"\nDone. Samples under {args.samples_dir}. Use test.ipynb collect_results_for_length + plot_results_vs_steps.")

@@ -2,6 +2,7 @@ import os
 import json
 import click
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
 from branching_flows_interpolant import BranchingFlowsInterpolant
@@ -46,12 +47,33 @@ def sampling(**opts):
     batch_size = opts.batch_size
     num_samples = opts.num_samples
     num_steps = opts.num_steps
-    
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    seed = opts.seed
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting seed={seed}.")
+
+    # Distributed: init when RANK is set (torchrun); else single GPU
+    use_distributed = "RANK" in os.environ
+    if use_distributed:
+        dist.init_process_group("nccl")
+
+    # Distributed: use torchrun; else single GPU
+    if use_distributed and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+        seed = opts.seed * world_size + rank
+        torch.manual_seed(seed)
+        torch.cuda.set_device(device)
+        if rank == 0:
+            print(f"Starting distributed: rank={rank}, world_size={world_size}, seed={seed}.")
+    else:
+        rank = 0
+        world_size = 1
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        seed = opts.seed
+        torch.manual_seed(seed)
+        torch.cuda.set_device(device)
+        print(f"Starting seed={seed}.")
+
+    if world_size > 1:
+        assert batch_size % world_size == 0, "Batch size must be divisible by world size."
 
     if opts.dataset == 'qm9':
         character_tokenizer = VocabTokenizer(vocab={'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'})
@@ -123,45 +145,67 @@ def sampling(**opts):
             euclidean_dim=euclidean_dim,
         )
     
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)//1e6} M")
-    
-    if not os.path.exists(opts.dir):
-        os.makedirs(opts.dir)
+    if rank == 0:
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)//1e6} M")
 
-    output_path = os.path.join(opts.dir, 'samples.jsonl')
-    with open(output_path, 'w') as f:
-        for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
-            samples = interpolant.sampling(model, num_steps, batch_size, dataset.max_length, device, return_trace=opts.return_trace, sampler=opts.sampler)
-            for i, sample in enumerate(samples):
-                symbols = character_tokenizer.decode(sample.yt.cpu())
-                if opts.interpolant == 'multimodal':
-                    positions = sample.xt.cpu()[1:len(symbols)+1, :]
-                    assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
-                else:
-                    x_length = sample.x_mask_t.cpu().sum(dim=-1).tolist()
-                    y_length = sample.y_mask_t.cpu().sum(dim=-1).tolist()
-                    positions = sample.xt.cpu()[1:x_length, :]
+    if rank == 0 and not os.path.exists(opts.dir):
+        os.makedirs(opts.dir)
+    if world_size > 1:
+        dist.barrier()
+
+    n_per_rank = (num_samples + world_size - 1) // world_size
+    local_batch = batch_size // world_size if world_size > 1 else batch_size
+    n_iters = (n_per_rank + local_batch - 1) // local_batch
+
+    rank_output = os.path.join(opts.dir, f"_rank_{rank}.jsonl") if world_size > 1 else os.path.join(opts.dir, "samples.jsonl")
+    f = open(rank_output, "w")
+
+    for _ in tqdm(range(n_iters), desc="Sampling", disable=(rank != 0)):
+        samples = interpolant.sampling(model, num_steps, local_batch, dataset.max_length, device, return_trace=opts.return_trace, sampler=opts.sampler)
+        for i, sample in enumerate(samples):
+            symbols = character_tokenizer.decode(sample.yt.cpu())
+            if opts.interpolant == 'multimodal':
+                positions = sample.xt.cpu()[1:len(symbols)+1, :]
+                assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
+            else:
+                x_length = sample.x_mask_t.cpu().sum(dim=-1).tolist()
+                y_length = sample.y_mask_t.cpu().sum(dim=-1).tolist()
+                positions = sample.xt.cpu()[1:x_length, :]
+                if rank == 0:
                     print(f'x_length: {x_length}, y_length: {y_length}')
                     print(sample.xt.cpu())
 
+            if opts.interpolant == 'multimodal':
+                assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
+            if euclidean_dim == 1:
+                numbers = positions.squeeze(-1).tolist()
+            else:
+                numbers = positions.tolist()
+            f.write(json.dumps({
+                'numbers': numbers,
+                'symbols': list(symbols),
+                'length': len(symbols)
+            }, separators=(',', ':'), cls=CustomJSONEncoder))
+            f.write('\n')
+            if opts.enable_plotting and rank == 0:
                 if opts.interpolant == 'multimodal':
-                    assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
-                if euclidean_dim == 1:
-                    numbers = positions.squeeze(-1).tolist()
-                else:
-                    numbers = positions.tolist()
-                f.write(json.dumps({
-                    'numbers': numbers,
-                    'symbols': list(symbols),
-                    'length': len(symbols)
-                }, separators=(',', ':'), cls=CustomJSONEncoder))
-                f.write('\n')
-                if opts.enable_plotting:
-                    if opts.interpolant == 'multimodal':
-                        plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
-                    elif opts.interpolant == 'multimodal_both':
-                        plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
-            f.flush()
+                    plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
+                elif opts.interpolant == 'multimodal_both':
+                    plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
+        f.flush()
+
+    f.close()
+
+    if world_size > 1:
+        dist.barrier()
+        if rank == 0:
+            with open(os.path.join(opts.dir, "samples.jsonl"), "w") as out:
+                for r in range(world_size):
+                    with open(os.path.join(opts.dir, f"_rank_{r}.jsonl"), "r") as inp:
+                        out.write(inp.read())
+                    os.remove(os.path.join(opts.dir, f"_rank_{r}.jsonl"))
+        dist.barrier()
+        dist.destroy_process_group()
 
 def load_checkpoint(opts, device, model):
     print(f'Loading checkpoint from {opts.load_checkpoint}')
