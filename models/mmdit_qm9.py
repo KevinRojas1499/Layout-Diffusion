@@ -452,9 +452,9 @@ class MMDiTQM9(nn.Module):
         )[0]
         # Fuse the tokens
         hidden_representation = torch.cat([cat_tokens, euclidean_tokens], dim=-1)
-        label_representation = self.label_fuse(hidden_representation)
-        insert_representation = self.insert_fuse(hidden_representation)
-        euclidean_representation = self.euclidean_fuse(hidden_representation)
+        label_representation = cat_tokens + self.label_fuse(hidden_representation)
+        insert_representation = cat_tokens + self.insert_fuse(hidden_representation)
+        euclidean_representation = euclidean_tokens + self.euclidean_fuse(hidden_representation)
 
         # Predict unmasking probabilities for symbols
         label_logits = self.symbols_pred_layer(label_representation, symbols_time)
