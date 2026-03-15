@@ -1,0 +1,9 @@
+defaults:
+  - base_model
+
+name: DiT
+euclidean_dim: 4
+symbols_depth: 4
+positions_depth: 4
+depth: 4
+hidden_dim: 256

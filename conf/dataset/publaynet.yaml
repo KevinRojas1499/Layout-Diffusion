@@ -1,0 +1,8 @@
+defaults:
+  - base_dataset
+
+name: publaynet
+max_length: 25
+split: train
+max_samples: null
+data_path: null

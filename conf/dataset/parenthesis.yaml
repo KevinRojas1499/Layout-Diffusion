@@ -1,0 +1,6 @@
+defaults:
+  - base_dataset
+
+name: parenthesis
+max_length: 18
+data_path: data/equations_l5.jsonl
