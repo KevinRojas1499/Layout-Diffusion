@@ -315,7 +315,112 @@ class MultimodalInterpolantBoth():
         x_mask_t[:, 0] = True # Only the start is active
         y_mask_t[:, 0] = True # Only the start is active
         return xt, yt, x_mask_t, y_mask_t
-    
+
+    def update_xt_yt(
+        self,
+        prediction: MultimodalModelPredictionBothVar,
+        xt: Tensor,
+        yt: Tensor,
+        x_mask_t: Tensor,
+        y_mask_t: Tensor,
+        t: Tensor,
+        dt: float,
+        is_last_step: bool,
+    ) -> tuple[Tensor, Tensor]:
+        """Denoise and unmask both euclidean and discrete. Does not modify masks."""
+        masked_positions_disc = (yt == self.mask_token)
+        masked_positions_euc = (xt == 0.)  # TODO: Keep better track of the mask
+
+        # Denoise euclidean
+        drift = self.get_drift(prediction, xt, t)
+        xt = xt + (drift * dt)
+        xt = torch.where(x_mask_t.unsqueeze(-1), xt, 0.)
+        xt[:, 0] = 0.
+        xt = torch.where(masked_positions_euc, 0., xt)
+
+        # Unmask euclidean
+        unmasking_rate_euc, unmasking_rate_disc = self.get_unmasking_rate(prediction, t)
+        unmasking_rate_euc = unmasking_rate_euc.unsqueeze(-1).expand(-1, xt.shape[1]).unsqueeze(-1)
+        unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate_euc * dt).sample()
+        new_xt = self.alpha(t).view(-1, 1, 1) * prediction.clean_data + (1 - self.alpha(t).view(-1, 1, 1)) * torch.randn_like(xt)
+
+        if not is_last_step:
+            change_pos = (unmasking_nums >= 1) & (x_mask_t.unsqueeze(-1)) & (masked_positions_euc)
+            unmasking_nums = unmasking_nums * change_pos
+        else:
+            change_pos = masked_positions_euc
+        xt = torch.where(change_pos, new_xt, xt)
+        xt = torch.where(x_mask_t.unsqueeze(-1), xt, 0.)
+        xt[:, 0] = 0.
+
+        # Unmask discrete
+        unmasking_nums_disc = torch.distributions.poisson.Poisson(unmasking_rate_disc * dt).sample()
+        num_jumps = unmasking_nums_disc.sum(dim=-1)
+        if not is_last_step:
+            change_pos = (num_jumps == 1) & (y_mask_t) & (masked_positions_disc)
+            unmasking_nums_disc = unmasking_nums_disc * change_pos.unsqueeze(-1)
+            new_sample = unmasking_nums_disc.argmax(dim=-1)
+        else:
+            change_pos = masked_positions_disc
+            new_sample = unmasking_rate_disc.argmax(dim=-1)
+        yt = torch.where(change_pos, new_sample, yt)
+        yt[:, 0] = self.bos_token
+
+        return xt, yt
+
+    def perform_insertions(
+        self,
+        prediction: MultimodalModelPredictionBothVar,
+        xt: Tensor,
+        yt: Tensor,
+        x_mask_t: Tensor,
+        y_mask_t: Tensor,
+        t: Tensor,
+        dt: float,
+        max_length: int,
+        is_last_step: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Perform insertions for both euclidean and discrete. Returns (xt, yt, x_mask_t, y_mask_t)."""
+        insertion_rate_euc, insertion_rate_disc = self.get_insertion_rate(prediction, t)
+        ext_euc = torch.distributions.poisson.Poisson(insertion_rate_euc * dt).sample()
+        ext_disc = torch.distributions.poisson.Poisson(insertion_rate_disc * dt).sample()
+
+        if is_last_step:
+            return xt, yt, x_mask_t, y_mask_t
+
+        batch_size = xt.shape[0]
+        device = xt.device
+        for j in range(batch_size):
+            new_xt_j = []
+            new_yt_j = []
+            for k in range(max_length):
+                if x_mask_t[j, k]:
+                    new_xt_j.append(xt[j, k:k+1, :])
+                if y_mask_t[j, k]:
+                    new_yt_j.append(yt[j, k].item())
+                if ext_euc[j, k] > 0 and x_mask_t[j, k]:
+                    for _ in range(int(ext_euc[j, k].item())):
+                        new_sample = torch.zeros_like(xt[0, :1, :])
+                        new_xt_j.append(new_sample.clone())
+                if ext_disc[j, k] > 0 and y_mask_t[j, k]:
+                    for _ in range(int(ext_disc[j, k].item())):
+                        new_yt_j.append(self.mask_token)
+
+            new_len_x = min(len(new_xt_j), max_length)
+            new_len_y = min(len(new_yt_j), max_length)
+            new_xt_tensor = torch.cat(new_xt_j[:new_len_x], dim=0)
+            new_yt_tensor = torch.tensor(new_yt_j[:new_len_y], device=device, dtype=yt.dtype)
+            xt[j, :new_len_x, :] = new_xt_tensor
+            yt[j, :new_len_y] = new_yt_tensor
+            xt[j, 0] = 0.
+            yt[j, 0] = self.bos_token
+            x_mask_t[j, :new_len_x] = True
+            y_mask_t[j, :new_len_y] = True
+            x_mask_t[j, new_len_x:] = False
+            y_mask_t[j, new_len_y:] = False
+
+        return xt, yt, x_mask_t, y_mask_t
+
     @torch.no_grad()
     def sampling(
         self,
@@ -325,11 +430,14 @@ class MultimodalInterpolantBoth():
         max_length: int,
         device: torch.device,
         return_trace: bool = False,
+        sampler: str = 'split',
     ) -> SamplingResult:
-        max_length = max_length + 1 # Plus one for the BOS token 
-        # 1) Initialize all‑pad sequence and trace
+        if sampler == 'staggered':
+            return self.staggered_sampler(model, steps, batch_size, max_length, device, return_trace)
+
+        max_length = max_length + 1  # Plus one for the BOS token
         xt, yt, x_mask_t, y_mask_t = self.get_prior_distribution(batch_size, max_length, device)
-        
+
         dt = 1.0 / steps
         t = torch.zeros(batch_size, device=device)
 
@@ -339,100 +447,194 @@ class MultimodalInterpolantBoth():
                 xt=xt.clone(), yt=yt.clone(), x_mask_t=x_mask_t.clone(), y_mask_t=y_mask_t.clone(), t=t
             ))
         torch.set_printoptions(precision=2, sci_mode=False)
+
         for i in tqdm(range(steps), leave=False):
+            t0 = t
+            t_mid = t0 + dt / 2
+            t1 = t0 + dt
+            is_last_step = (i == steps - 1)
+
             prediction: MultimodalModelPredictionBothVar = model(
                 cat_tokens=yt,
                 euclidean_tokens=xt,
                 symbols_mask=y_mask_t,
                 pos_mask=x_mask_t,
-                symbols_time=t,
-                pos_time=t
+                symbols_time=t0,
+                pos_time=t0
             )
-            # Denoise
-            masked_positions_disc = (yt == self.mask_token)
-            masked_positions_euc = (xt == 0.) # TODO: Keep better track of the mask
-            drift = self.get_drift(prediction, xt, t)
-            xt = xt + (drift * dt)
-            xt = torch.where(x_mask_t.unsqueeze(-1), xt, 0.)
-            xt[:,0] = 0. # Don't corrupt begginning of the sequence
-            xt = torch.where(masked_positions_euc, 0., xt)
-
-            # Unmasking
-            unmasking_rate_euc, unmasking_rate_disc = self.get_unmasking_rate(prediction, t)
-            unmasking_rate_euc = unmasking_rate_euc.unsqueeze(-1).expand(-1, xt.shape[1]).unsqueeze(-1)
-            unmasking_nums = torch.distributions.poisson.Poisson(unmasking_rate_euc * dt).sample()
-            # Unmask continuous data
-            new_xt = self.alpha(t).view(-1, 1, 1) * prediction.clean_data + (1 - self.alpha(t).view(-1, 1, 1)) * torch.randn_like(xt)
-
-            if i != steps - 1:
-                change_pos = (unmasking_nums >= 1) & (x_mask_t.unsqueeze(-1)) & (masked_positions_euc)
-                unmasking_nums = unmasking_nums * change_pos
+            if sampler == 'euler':
+                step_size = dt
             else:
-                change_pos = masked_positions_euc
-            xt = torch.where(change_pos, new_xt, xt)
-            xt = torch.where(x_mask_t.unsqueeze(-1), xt, 0.)
-            xt[:,0] = 0. # Don't corrupt begginning of the sequence
+                step_size = dt if is_last_step else dt / 2
+            xt, yt = self.update_xt_yt(
+                prediction=prediction,
+                xt=xt,
+                yt=yt,
+                x_mask_t=x_mask_t,
+                y_mask_t=y_mask_t,
+                t=t0,
+                dt=step_size,
+                is_last_step=is_last_step,
+            )
 
-            # Unmask discrete data
-            unmasking_nums_disc = torch.distributions.poisson.Poisson(unmasking_rate_disc * dt).sample()
-            num_jumps = unmasking_nums_disc.sum(dim=-1)
-            if i != steps - 1:
-                change_pos = (num_jumps == 1) & (y_mask_t) & (masked_positions_disc)
-                unmasking_nums_disc = unmasking_nums_disc * change_pos.unsqueeze(-1)
-                new_sample = unmasking_nums_disc.argmax(dim=-1)
-            else:
-                change_pos = masked_positions_disc
-                new_sample = unmasking_rate_disc.argmax(dim=-1)
-            yt = torch.where(change_pos, new_sample, yt)
-            yt[:,0] = self.bos_token # Don't corrupt begginning of the sequence
-
-            # Perform insertions
-            insertion_rate_euc, insertion_rate_disc = self.get_insertion_rate(prediction, t)
-            ext_euc = torch.distributions.poisson.Poisson(insertion_rate_euc * dt).sample()
-            ext_disc = torch.distributions.poisson.Poisson(insertion_rate_disc * dt).sample()
-
-            if i != steps - 1:
-                for j in range(batch_size):
-                    # Add dimensions
-                    new_xt_j = []
-                    new_yt_j = []
-                    for k in range(max_length):
-                        if x_mask_t[j, k]:
-                            new_xt_j.append(xt[j, k:k+1, :])
-                        if y_mask_t[j, k]:
-                            new_yt_j.append(yt[j, k].item())
-                        # Insert new token after position k if ext[j, k] > 0
-                        if ext_euc[j, k] > 0 and x_mask_t[j, k]:
-                            for _ in range(int(ext_euc[j, k].item())):
-                                new_sample = torch.zeros_like(xt[0, :1, :])
-                                new_xt_j.append(new_sample.clone())
-                        if ext_disc[j, k] > 0 and y_mask_t[j, k]:
-                            for _ in range(int(ext_disc[j, k].item())):
-                                new_yt_j.append(self.mask_token)
-                    
-                    # Ensure we don't exceed the tensor size
-                    new_len_x = min(len(new_xt_j), max_length) 
-                    new_len_y = min(len(new_yt_j), max_length) 
-                    new_xt_tensor = torch.cat(new_xt_j[:new_len_x], dim=0)
-                    new_yt_tensor = torch.tensor(new_yt_j[:new_len_y], device=device, dtype=yt.dtype)
-                    xt[j, :new_len_x, :] = new_xt_tensor
-                    yt[j, :new_len_y] = new_yt_tensor
-                    xt[j, 0] = 0.
-                    yt[j, 0] = self.bos_token
-                    x_mask_t[j, :new_len_x] = True
-                    y_mask_t[j, :new_len_y] = True
-                    x_mask_t[j, new_len_x:] = False
-                    y_mask_t[j, new_len_y:] = False
+            if sampler == 'euler':
+                xt, yt, x_mask_t, y_mask_t = self.perform_insertions(
+                    prediction=prediction,
+                    xt=xt,
+                    yt=yt,
+                    x_mask_t=x_mask_t,
+                    y_mask_t=y_mask_t,
+                    t=t0,
+                    dt=dt,
+                    max_length=max_length,
+                    is_last_step=is_last_step,
+                )
+            elif not is_last_step:
+                prediction_2: MultimodalModelPredictionBothVar = model(
+                    cat_tokens=yt,
+                    euclidean_tokens=xt,
+                    symbols_mask=y_mask_t,
+                    pos_mask=x_mask_t,
+                    symbols_time=t_mid,
+                    pos_time=t_mid
+                )
+                xt, yt, x_mask_t, y_mask_t = self.perform_insertions(
+                    prediction=prediction_2,
+                    xt=xt,
+                    yt=yt,
+                    x_mask_t=x_mask_t,
+                    y_mask_t=y_mask_t,
+                    t=t_mid,
+                    dt=dt,
+                    max_length=max_length,
+                    is_last_step=is_last_step,
+                )
+                prediction_3: MultimodalModelPredictionBothVar = model(
+                    cat_tokens=yt,
+                    euclidean_tokens=xt,
+                    symbols_mask=y_mask_t,
+                    pos_mask=x_mask_t,
+                    symbols_time=t1,
+                    pos_time=t1
+                )
+                xt, yt = self.update_xt_yt(
+                    prediction=prediction_3,
+                    xt=xt,
+                    yt=yt,
+                    x_mask_t=x_mask_t,
+                    y_mask_t=y_mask_t,
+                    t=t1,
+                    dt=dt / 2,
+                    is_last_step=is_last_step,
+                )
+            t = t1
 
             if return_trace:
                 trajectory.append(SamplingTrajectoryResult(
                     xt=xt.clone(), yt=yt.clone(), x_mask_t=x_mask_t.clone(), y_mask_t=y_mask_t.clone(), t=t
                 ))
-            t = t + dt
 
         return SamplingResult(
             xt=xt, yt=yt, x_mask_t=x_mask_t, y_mask_t=y_mask_t, trajectory=trajectory
         )
+
+    @torch.no_grad()
+    def staggered_sampler(
+        self,
+        model: torch.nn.Module,
+        steps: int,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        return_trace: bool = False,
+    ) -> SamplingResult:
+        max_length = max_length + 1  # Plus one for the BOS token
+        xt, yt, x_mask_t, y_mask_t = self.get_prior_distribution(batch_size, max_length, device)
+
+        dt = 1.0 / steps
+        t = torch.zeros(batch_size, device=device)
+
+        trajectory = []
+        if return_trace:
+            trajectory.append(SamplingTrajectoryResult(
+                xt=xt.clone(), yt=yt.clone(), x_mask_t=x_mask_t.clone(), y_mask_t=y_mask_t.clone(), t=t
+            ))
+        torch.set_printoptions(precision=2, sci_mode=False)
+
+        t1 = t
+        t2 = t + dt / 2
+        prediction_0: MultimodalModelPredictionBothVar = model(
+            cat_tokens=yt,
+            euclidean_tokens=xt,
+            symbols_mask=y_mask_t,
+            pos_mask=x_mask_t,
+            symbols_time=t1,
+            pos_time=t1
+        )
+        xt, yt = self.update_xt_yt(
+            prediction=prediction_0,
+            xt=xt,
+            yt=yt,
+            x_mask_t=x_mask_t,
+            y_mask_t=y_mask_t,
+            t=t1,
+            dt=dt / 2,
+            is_last_step=False,
+        )
+
+        for i in tqdm(range(steps), leave=False):
+            is_last_step = (i == steps - 1)
+
+            prediction: MultimodalModelPredictionBothVar = model(
+                cat_tokens=yt,
+                euclidean_tokens=xt,
+                symbols_mask=y_mask_t,
+                pos_mask=x_mask_t,
+                symbols_time=t2,
+                pos_time=t2
+            )
+            xt, yt, x_mask_t, y_mask_t = self.perform_insertions(
+                prediction=prediction,
+                xt=xt,
+                yt=yt,
+                x_mask_t=x_mask_t,
+                y_mask_t=y_mask_t,
+                t=t2,
+                dt=dt,
+                max_length=max_length,
+                is_last_step=is_last_step,
+            )
+            prediction_2: MultimodalModelPredictionBothVar = model(
+                cat_tokens=yt,
+                euclidean_tokens=xt,
+                symbols_mask=y_mask_t,
+                pos_mask=x_mask_t,
+                symbols_time=t1,
+                pos_time=t1
+            )
+            step_size = dt / 2 if is_last_step else dt
+            xt, yt = self.update_xt_yt(
+                prediction=prediction_2,
+                xt=xt,
+                yt=yt,
+                x_mask_t=x_mask_t,
+                y_mask_t=y_mask_t,
+                t=t1,
+                dt=step_size,
+                is_last_step=is_last_step,
+            )
+            t1 = t1 + step_size
+            t2 = t2 + dt
+
+            if return_trace:
+                trajectory.append(SamplingTrajectoryResult(
+                    xt=xt.clone(), yt=yt.clone(), x_mask_t=x_mask_t.clone(), y_mask_t=y_mask_t.clone(), t=t1
+                ))
+
+        return SamplingResult(
+            xt=xt, yt=yt, x_mask_t=x_mask_t, y_mask_t=y_mask_t, trajectory=trajectory
+        )
+
 
 def sample_categorical(categorical_probs, method="hard"):
     if method == "hard":
