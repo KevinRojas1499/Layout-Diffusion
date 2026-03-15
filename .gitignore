@@ -11,4 +11,5 @@ data/
 results-grid-search/
 *.jsonl
 *.pdf
-ablations_qm9
+ablation_qm9/
+outputs/
