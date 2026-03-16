@@ -265,8 +265,6 @@ def main(cfg: LayoutConfigSchema) -> None:
                 data_[key] = value.to(device=device)
 
             opt.zero_grad()
-            for key, value in data_.items():
-                print(key, value.shape)
             losses = interpolant.compute_loss(model, data_)
 
             if int_name == "multimodal":

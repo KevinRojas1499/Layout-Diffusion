@@ -93,12 +93,7 @@ def grid_search_equations():
     type=str,
     default="samples/qm9-matching-{itr_k}k-10k",
     show_default=True,
-)
-@click.option(
-    "--generated-template",
-    type=str,
-    default="samples/qm9-matching-{itr_k}k-10k/samples.json",
-    show_default=True,
+    help="Use {itr} for full iteration (e.g. 250000) or {itr_k} for thousands (e.g. 250).",
 )
 @click.option(
     "--comparison-output-template",
@@ -109,7 +104,19 @@ def grid_search_equations():
 @click.option("--use-ema", is_flag=True, default=False, show_default=True)
 @click.option("--num-steps", type=int, default=125, show_default=True)
 @click.option("--dry-run", is_flag=True, default=False, show_default=True)
-@click.option("--skip-existing", is_flag=True, default=True, show_default=True)
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=True,
+    show_default=True,
+    help="Skip iterations where evaluation output already exists.",
+)
+@click.option(
+    "--eval-only",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Only run evaluation; skip sampling (use when samples already exist).",
+)
 def main(
     exp_dir: Path,
     start_itr: Optional[int],
@@ -120,12 +127,12 @@ def main(
     n_real_samples: int,
     master_port: int,
     sample_dir_template: str,
-    generated_template: str,
     comparison_output_template: str,
     use_ema: bool,
     num_steps: int,
     dry_run: bool,
     skip_existing: bool,
+    eval_only: bool,
 ) -> None:
     itrs = _build_itr_list(exp_dir, start_itr, end_itr, step, use_all_folders)
     if not itrs:
@@ -133,15 +140,21 @@ def main(
 
     for itr in reversed(itrs):
         checkpoint = exp_dir / f"itr_{itr}" / "snapshot.pt"
-        if not checkpoint.exists():
-            click.echo(f"Skipping itr={itr}: missing checkpoint {checkpoint}")
-            continue
-
         sample_dir = Path(_format_template(sample_dir_template, itr))
-        generated = Path(_format_template(generated_template, itr))
+        # Sampling always writes to {sample_dir}/samples.json, so eval must read from there
+        generated = sample_dir / "samples.json"
         comparison_output = Path(_format_template(comparison_output_template, itr))
 
-        if skip_existing and generated.exists() and comparison_output.exists():
+        if eval_only:
+            if not generated.exists():
+                click.echo(f"Skipping itr={itr}: no samples at {generated}")
+                continue
+        else:
+            if not checkpoint.exists():
+                click.echo(f"Skipping itr={itr}: missing checkpoint {checkpoint}")
+                continue
+
+        if skip_existing and comparison_output.exists():
             click.echo(f"Skipping itr={itr}: outputs already exist.")
             continue
 
@@ -159,7 +172,7 @@ def main(
             "--dir",
             str(sample_dir),
             "--sampler",
-            "split",
+            "euler",
             "--num_steps",
             str(num_steps),
         ]
@@ -180,7 +193,8 @@ def main(
         ]
 
         click.echo(f"\n=== Iteration {itr} ===")
-        _run(sampling_cmd, dry_run)
+        if not eval_only:
+            _run(sampling_cmd, dry_run)
         _run(eval_cmd, dry_run)
 
 
@@ -211,12 +225,6 @@ def main(
     show_default=True,
 )
 @click.option(
-    "--generated-template",
-    type=str,
-    default="samples/qm9-matching-{itr_k}k-10k-{sampler}-{steps}steps/samples.json",
-    show_default=True,
-)
-@click.option(
     "--comparison-output-template",
     type=str,
     default="results/results-matching-{itr_k}-10k-{sampler}-{steps}steps",
@@ -241,7 +249,12 @@ def main(
 )
 @click.option("--use-ema", is_flag=True, default=False, show_default=True)
 @click.option("--dry-run", is_flag=True, default=False, show_default=True)
-@click.option("--skip-existing", is_flag=True, default=True, show_default=True)
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=True,
+    show_default=True,
+    help="Skip iterations where evaluation output already exists.",
+)
 def grid_search_equations_samplers(
     exp_dir: Path,
     start_itr: Optional[int],
@@ -252,7 +265,6 @@ def grid_search_equations_samplers(
     n_real_samples: int,
     master_port: int,
     sample_dir_template: str,
-    generated_template: str,
     comparison_output_template: str,
     samplers: tuple[str, ...],
     step_counts: tuple[int, ...],
@@ -273,7 +285,8 @@ def grid_search_equations_samplers(
         for sampler in samplers:
             for steps in step_counts:
                 sample_dir = Path(_format_template(sample_dir_template, itr, sampler, steps))
-                generated = Path(_format_template(generated_template, itr, sampler, steps))
+                # Sampling always writes to {sample_dir}/samples.json, so eval must read from there
+                generated = sample_dir / "samples.json"
                 comparison_output = Path(_format_template(comparison_output_template, itr, sampler, steps))
                 if skip_existing and generated.exists() and comparison_output.exists():
                     click.echo(f"Skipping itr={itr} with sampler {sampler} and steps {steps}: outputs already exist.")
