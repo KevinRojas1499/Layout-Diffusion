@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
+from autoregressive_interpolant import MultimodalInterpolant as AutoregressiveInterpolant
 from branching_flows_interpolant import BranchingFlowsInterpolant
 from utils.datasets import MultimodalVariableLengthToyDataset
 from custom_datasets.multimodal_math import EquationsDataset
@@ -32,7 +33,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.option('--dataset',type=click.Choice(['qm9', 'equations', 'parenthesis']), default='equations')
 @click.option('--data_path',type=str, default=None)
 @click.option('--model',type=click.Choice(['MMDiTBothVar', 'DiT']), default='DiT')
-@click.option('--interpolant',type=click.Choice(['multimodal', 'branching', 'multimodal_both']), default='multimodal')
+@click.option('--interpolant',type=click.Choice(['multimodal', 'autoregressive', 'branching', 'multimodal_both']), default='multimodal')
 @click.option('--sampler',type=click.Choice(['euler', 'split', 'staggered']), default='split')
 @click.option('--num_steps', type=int, default=100)
 @click.option('--batch_size', type=int, default=100)
@@ -135,6 +136,15 @@ def sampling(**opts):
         interpolant = BranchingFlowsInterpolant(
             mask_token=character_tokenizer.mask_token_id,
         )
+    elif opts.interpolant == 'autoregressive':
+        interpolant = AutoregressiveInterpolant(
+            max_length=dataset.max_length,
+            vocab_size=character_tokenizer.vocab_size,
+            mask_token=character_tokenizer.mask_token_id,
+            pad_token=character_tokenizer.pad_token_id,
+            bos_token=character_tokenizer.bos_token_id,
+            euclidean_dim=euclidean_dim,
+        )
     elif opts.interpolant == 'multimodal_both':
         interpolant = MultimodalInterpolantBoth(
             max_length=dataset.max_length,
@@ -164,7 +174,7 @@ def sampling(**opts):
         samples = interpolant.sampling(model, num_steps, local_batch, dataset.max_length, device, return_trace=opts.return_trace, sampler=opts.sampler)
         for i, sample in enumerate(samples):
             symbols = character_tokenizer.decode(sample.yt.cpu())
-            if opts.interpolant == 'multimodal':
+            if opts.interpolant in ('multimodal', 'autoregressive'):
                 positions = sample.xt.cpu()[1:len(symbols)+1, :]
                 assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
             else:
@@ -175,7 +185,7 @@ def sampling(**opts):
                     print(f'x_length: {x_length}, y_length: {y_length}')
                     print(sample.xt.cpu())
 
-            if opts.interpolant == 'multimodal':
+            if opts.interpolant in ('multimodal', 'autoregressive'):
                 assert len(symbols) == len(positions), 'Symbols and positions have different lengths'
             if euclidean_dim == 1:
                 numbers = positions.squeeze(-1).tolist()
@@ -188,7 +198,7 @@ def sampling(**opts):
             }, separators=(',', ':'), cls=CustomJSONEncoder))
             f.write('\n')
             if opts.enable_plotting and rank == 0:
-                if opts.interpolant == 'multimodal':
+                if opts.interpolant in ('multimodal', 'autoregressive'):
                     plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)
                 elif opts.interpolant == 'multimodal_both':
                     plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(opts.dir, f'sample_{i}.png'), character_tokenizer)

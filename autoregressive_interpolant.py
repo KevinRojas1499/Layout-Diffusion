@@ -30,31 +30,15 @@ class SamplingResult:
     mask_t: Tensor # Shape [Batch, Length]
     trajectory: List[SamplingTrajectoryResult]
 
-    def __getitem__(self, index: int) -> SamplingResult:
-        trajectory_slice = []
-        for step in self.trajectory:
-             trajectory_slice.append(SamplingTrajectoryResult(
-                xt=step.xt[index],
-                yt=step.yt[index],
-                mask_t=step.mask_t[index],
-                t=step.t[index]
-             ))
-
-        return SamplingResult(
+    def __getitem__(self, index: int) -> SamplingTrajectoryResult:
+        # Return final state for batch index; t from last trajectory step or 1.0 if empty
+        t_final = self.trajectory[-1].t[index] if self.trajectory else torch.tensor(1.0, device=self.xt.device)
+        return SamplingTrajectoryResult(
             xt=self.xt[index],
             yt=self.yt[index],
             mask_t=self.mask_t[index],
-            trajectory=trajectory_slice
+            t=t_final,
         )
-
-    def __len__(self) -> int:
-        return self.xt.shape[0]
-    
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
-
-
 
 @dataclass
 class JointMultimodalInterpolantResult:
@@ -104,9 +88,8 @@ class MultimodalInterpolant():
         return t
     
     def get_len_time_t(self, length_1, t):
-        rate = -torch.log(1 - t)
-        length = torch.poisson(rate)
-        return torch.min(length, length_1)
+        length = torch.distributions.binomial.Binomial(length_1, t).sample()
+        return length
     
     def get_masking_time_t(self,t):
         return torch.rand_like(t)
@@ -134,10 +117,7 @@ class MultimodalInterpolant():
         full_xt[:,0] = 0.  # Don't corrupt beginning of the sequence
 
         # Masking data
-        # Deletion and masking times are independent for every position, thats why we pass y1
-        len_1 = torch.sum(y1 != self.pad_token, dim=-1)
-        len_t = self.get_len_time_t(len_1, t)
-        masking_time = self.get_masking_time_t(t)
+        masking_time = self.get_masking_time_t(t_shaped_disc)
 
         # Discrete data
         mask_positions = (t_shaped_disc <= masking_time) & attn_mask
@@ -147,8 +127,12 @@ class MultimodalInterpolant():
         # Euclidean data
         full_xt = torch.where(mask_positions.unsqueeze(-1), 0., full_xt) # Change to mask id
 
-        # Set up attention mask of deleted data
-        deleted_positions = (torch.arange(y1.shape[1], device=y1.device) >= len_t)
+        # Delete data 
+        # We subtract 1 because we don't want to delete the BOS token
+        len_1 = torch.sum(y1 != self.pad_token, dim=-1, keepdim=True) - 1 
+        len_t = self.get_len_time_t(len_1, t_shaped_disc) + 1
+
+        deleted_positions = (torch.arange(y1.shape[1], device=y1.device).unsqueeze(0) >= len_t)
         new_mask = attn_mask & ~deleted_positions
         new_mask[:,0] = True # Don't delete the start of the sequence
         yt = torch.where(new_mask, yt, self.pad_token)
@@ -203,7 +187,7 @@ class MultimodalInterpolant():
         insertion_rate = prediction.insertion_rate
         gaps = interpolant_sample.y1_length - interpolant_sample.yt_length
         insertion_loss = self.jump_kernel_elbo(gaps.unsqueeze(-1).clamp(min=1e-6), insertion_rate)
-        insertion_loss = insertion_loss.sum() / (y1.shape[0] * y1.shape[1]) # This is not the best scaling factor
+        insertion_loss = insertion_loss.sum() / y1.shape[0] 
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
@@ -211,13 +195,14 @@ class MultimodalInterpolant():
         targets_flat = interpolant_sample.y1[masked_positions]
         tokens_loss = F.cross_entropy(logits_flat, targets_flat, reduction="none").mean()
 
-        # Predicted euclidean loss
+        # Predicted euclidean loss (only at masked positions that are in the valid sequence)
         # Gather along V dimension: clean_data_unmasking is [B, L, V, D], y1 is [B, L] with vocab indices
         y1_indices = interpolant_sample.y1.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, x1.shape[-1])  # [B, L] -> [B, L, 1, D]
         predicted_cond_y1 = prediction.clean_data_unmasking.gather(dim=2, index=y1_indices).squeeze(2)  # [B, L, 1, D] -> [B, L, D]
         euclidean_loss = (predicted_cond_y1 - interpolant_sample.x1)**2
-        euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
-        euclidean_loss = euclidean_loss.mean() / x1.shape[-1]
+        valid_masked = masked_positions & interpolant_sample.mask_t
+        euclidean_loss = euclidean_loss.sum(dim=-1)[valid_masked]
+        euclidean_loss = euclidean_loss.mean() / x1.shape[-1] if valid_masked.any() else torch.tensor(0.0, device=x1.device)
 
 
         return {
@@ -319,12 +304,12 @@ class MultimodalInterpolant():
                     break
                 new_xt_j.append(xt[j, k:k+1, :].clone())
                 new_yt_j.append(yt[j, k].item())
-                if ext[j, k] > 0:
-                    n_insert = int(ext[j, k].item())
-                    for _ in range(n_insert):
-                        new_sample = torch.zeros_like(xt[j, :1, :], device=device)
-                        new_xt_j.append(new_sample)
-                        new_yt_j.append(self.mask_token)
+            if ext[j].item() > 0:
+                n_insert = int(ext[j].item())
+                for _ in range(n_insert):
+                    new_sample = torch.zeros_like(xt[j, :1, :], device=device)
+                    new_xt_j.append(new_sample)
+                    new_yt_j.append(self.mask_token)
 
             # Ensure we don't exceed the tensor size
             new_len = min(len(new_xt_j), max_length)
@@ -550,9 +535,3 @@ class MultimodalInterpolant():
         return SamplingResult(
             xt=xt, yt=yt, mask_t=mask_t, trajectory=trajectory
         )
-def sample_categorical(categorical_probs, method="hard"):
-    if method == "hard":
-        gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()
-        return (categorical_probs / gumbel_norm).argmax(dim=-1)
-    else:
-        raise ValueError(f"Method {method} for sampling categorical variables is not valid.")

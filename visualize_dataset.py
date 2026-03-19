@@ -83,16 +83,19 @@ def plot_sample(data, yt, mask, out_file_name, character_tokenizer : VocabTokeni
     if yt_viz.ndim == 1:
         yt_mask_viz = yt_mask_viz[:, None]
     
-    # For string annotations, we need to create a numeric array for coloring and annotate with strings
-    # Create a mapping from unique atoms to numeric codes for coloring
-    unique_atoms = np.unique(yt_detokenized[mask_np])  # Only consider valid (non-padded) atoms
-    atom_to_code = {atom: idx for idx, atom in enumerate(unique_atoms)}
-    yt_codes = np.array([atom_to_code.get(atom, -1) for atom in yt_detokenized])
+    # Use token IDs for consistent coloring across samples (same symbol = same color)
+    yt_codes = np.array(yt_np, dtype=float)
+    yt_codes[~mask_np] = np.nan  # Exclude from color scale
     yt_codes_viz = yt_codes[:, None] if yt_codes.ndim == 1 else yt_codes
     
-    # Use the numeric codes for coloring, but annotate with the actual atom names
-    sns.heatmap(yt_codes_viz, cmap='Set3', cbar=True, annot=yt_viz, fmt='', 
-                mask=yt_mask_viz, cbar_kws={'label': 'Atom Type'})
+    # Fixed color scale from tokenizer for consistency across all samples
+    token_ids = list(character_tokenizer.idx_to_atom.keys())
+    vmin, vmax = min(token_ids), max(token_ids)
+    n_colors = len(token_ids)
+    cmap = plt.colormaps['tab20'].resampled(n_colors)
+    
+    sns.heatmap(yt_codes_viz, cmap=cmap, cbar=True, annot=yt_viz, fmt='',
+                mask=yt_mask_viz, vmin=vmin, vmax=vmax, cbar_kws={'label': 'Atom Type'})
     plt.title('Categorical Values (yt) - Atom Names')
     plt.xlabel('Feature Dimension (1)')
     plt.ylabel('Sequence Length')
@@ -166,19 +169,26 @@ def plot_sample_2(data, yt, x_mask, y_mask, out_file_name, character_tokenizer :
     if yt_viz.ndim == 1:
         yt_mask_viz = yt_mask_viz[:, None]
 
-    valid_atoms = yt_detokenized[y_mask_np]
-    unique_atoms = np.unique(valid_atoms) if len(valid_atoms) > 0 else np.array(['<pad>'], dtype=object)
-    atom_to_code = {atom: idx for idx, atom in enumerate(unique_atoms)}
-    yt_codes = np.array([atom_to_code.get(atom, -1) for atom in yt_detokenized])
+    # Use token IDs for consistent coloring across samples (same symbol = same color)
+    yt_codes = np.array(yt_np, dtype=float)
+    yt_codes[~y_mask_np] = np.nan  # Exclude from color scale
     yt_codes_viz = yt_codes[:, None] if yt_codes.ndim == 1 else yt_codes
+
+    # Fixed color scale from tokenizer for consistency across all samples
+    token_ids = list(character_tokenizer.idx_to_atom.keys())
+    vmin, vmax = min(token_ids), max(token_ids)
+    n_colors = len(token_ids)
+    cmap = plt.colormaps['tab20'].resampled(n_colors)
 
     sns.heatmap(
         yt_codes_viz,
-        cmap='Set3',
+        cmap=cmap,
         cbar=True,
         annot=yt_viz,
         fmt='',
         mask=yt_mask_viz,
+        vmin=vmin,
+        vmax=vmax,
         cbar_kws={'label': 'Token Type'},
     )
     plt.title(f'Categorical Values (Valid Length: {valid_len_y})')

@@ -199,7 +199,7 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 class MMDiTQM9(nn.Module):
-    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, branching_flows: bool = False, improved=True, **kwargs):
+    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, branching_flows: bool = False, autoregressive: bool = False, **kwargs):
         super().__init__()
         self.euclidean_dim = euclidean_dim
         self.vocab_size = vocab_size
@@ -208,6 +208,7 @@ class MMDiTQM9(nn.Module):
         self.dim_symbols = self.dim_modalities[0]
         self.dim_positions = self.dim_modalities[1]
         self.branching_flows = branching_flows
+        self.autoregressive = autoregressive
         # Extract attention parameters for rotary embeddings
         self.dim_head = kwargs.get('dim_head', 64)
         self.heads = kwargs.get('heads', 8)
@@ -459,10 +460,14 @@ class MMDiTQM9(nn.Module):
         if not self.branching_flows:
             clean_data_unmasking= self.positions_unmask_pred(euclidean_representation, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
         # Insertion rate prediction
-        # TODO : Maybe the insertion rate could use both cat tokens and euclidean ones
-        insertion_rate = self.insertion_rate(insert_representation, pos_time).squeeze(-1)  # [B, L]
+        if self.autoregressive:
+            # Single sequence-level output: pool over valid positions, then predict once
+            insert_pooled = (insert_representation * pos_mask.unsqueeze(-1)).sum(dim=1) / pos_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            insertion_rate = self.insertion_rate(insert_pooled.unsqueeze(1), pos_time).squeeze(-1)  # [B, 1]
+        else:
+            insertion_rate = self.insertion_rate(insert_representation, pos_time).squeeze(-1)  # [B, L]
+            insertion_rate = insertion_rate * pos_mask
         insertion_rate = F.softplus(insertion_rate)
-        insertion_rate = insertion_rate * pos_mask
 
         if self.branching_flows:
             return BranchingFlowsPrediction(
@@ -542,6 +547,43 @@ class MMDiTBothVar(nn.Module):
         self.disc_insertion_rate = FinalLayer(self.dim_symbols, 1)
         self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
         self.positions_pred_layer = FinalLayer(self.dim_positions, euclidean_dim)
+
+    def _split_params_by_size(self, params):
+        muon_params = []
+        adam_params = []
+        for p in params:
+            if p.ndim == 2:
+                muon_params.append(p)
+            else:
+                adam_params.append(p)
+        return muon_params, adam_params
+
+    def get_muon_adam_params(self):
+        adam_params = []
+        adam_params.extend(list(self.symbols_time_encoder.mlp.parameters()))
+        adam_params.extend(list(self.positions_time_encoder.mlp.parameters()))
+        adam_params.extend(list(self.symbols_embedder.parameters()))
+        adam_params.extend(list(self.gaussian_fourier_projs.parameters()))
+        adam_params.extend(list(self.euclidean_proj.parameters()))
+        adam_params.extend(list(self.euc_insertion_rate.parameters()))
+        adam_params.extend(list(self.disc_insertion_rate.parameters()))
+        adam_params.extend(list(self.symbols_pred_layer.parameters()))
+        adam_params.extend(list(self.positions_pred_layer.parameters()))
+
+        muon_params = []
+        muon_params_, adam_params_ = self._split_params_by_size(self.joint_embedding.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        muon_params_, adam_params_ = self._split_params_by_size(self.symbols_dit.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        muon_params_, adam_params_ = self._split_params_by_size(self.positions_dit.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        muon_params_, adam_params_ = self._split_params_by_size(self.spatial_bias.parameters())
+        muon_params.extend(muon_params_)
+        adam_params.extend(adam_params_)
+        return {"muon_params": muon_params, "adam_params": adam_params}
 
     def freeze_last_block(self, idx):
         last_block = self.joint_embedding.blocks[-1]

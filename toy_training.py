@@ -7,6 +7,7 @@ from copy import deepcopy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from multimodal_interpolant import MultimodalInterpolant
+from autoregressive_interpolant import MultimodalInterpolant as AutoregressiveInterpolant
 from branching_flows_interpolant import BranchingFlowsInterpolant
 from custom_datasets.multimodal_math import EquationsDataset
 from custom_datasets.multimodal_math import ParenthesizedEquationsDataset
@@ -45,7 +46,7 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.option('--model',type=click.Choice(['radd', 'DiT', 'MMDiTBothVar']), default='DiT')
 @click.option('--dataset',type=click.Choice(['qm9', 'equations', 'parenthesis']), default='equations')
 @click.option('--data_path',type=str, default=None)
-@click.option('--interpolant',type=click.Choice(['multimodal', 'branching', 'multimodal_both']), default='multimodal')
+@click.option('--interpolant',type=click.Choice(['multimodal', 'autoregressive', 'branching', 'multimodal_both']), default='multimodal')
 @click.option('--optimizer',type=click.Choice(['adam','adamw']), default='adam')
 @click.option('--ema_beta',type=float, default=.9999)
 @click.option('--lr', type=float, default=1e-4)
@@ -110,6 +111,7 @@ def training(**opts):
     elif opts.model == 'DiT':
         model = MMDiTQM9(
             branching_flows=opts.interpolant == 'branching',
+            autoregressive=opts.interpolant == 'autoregressive',
             euclidean_dim=euclidean_dim,
             vocab_size=character_tokenizer.vocab_size,
             symbols_depth=4,
@@ -137,6 +139,15 @@ def training(**opts):
         bos_token=character_tokenizer.bos_token_id,
         euclidean_dim=euclidean_dim,
     )
+    elif opts.interpolant == 'autoregressive':
+        interpolant = AutoregressiveInterpolant(
+            max_length=dataset.max_length,
+            vocab_size=character_tokenizer.vocab_size,
+            mask_token=character_tokenizer.mask_token_id,
+            pad_token=character_tokenizer.pad_token_id,
+            bos_token=character_tokenizer.bos_token_id,
+            euclidean_dim=euclidean_dim,
+        )
     elif opts.interpolant == 'multimodal_both':
         interpolant = MultimodalInterpolantBoth(
             max_length=dataset.max_length,
@@ -176,7 +187,7 @@ def training(**opts):
             opt.zero_grad()
             
             losses = interpolant.compute_loss(model, data_)
-            if opts.interpolant == 'multimodal':
+            if opts.interpolant in ('multimodal', 'autoregressive'):
                 loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["euclidean_unmasking_loss"] + losses["insertion_loss"]
             elif opts.interpolant == 'multimodal_both':
                 loss = losses["dsm_loss"] + losses["discrete_unmasking_loss"] + losses["euc_insertion_loss"] + losses["disc_insertion_loss"]
@@ -203,18 +214,19 @@ def training(**opts):
             loss = loss.detach().item()
             
             
-            if opts.interpolant == 'multimodal':
+            if opts.interpolant in ('multimodal', 'autoregressive'):
                 pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Unmasking Loss: {losses["euclidean_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
             elif opts.interpolant == 'multimodal_both':
                 pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Euclidean Insertion Loss: {losses["euc_insertion_loss"] :6.4f}, Discrete Insertion Loss: {losses["disc_insertion_loss"] :6.4f}')
             elif opts.interpolant == 'branching':
                 pbar.set_description(f'Iter {training_iter} --- DSM Loss: {losses["dsm_loss"] :6.4f}, Discrete Unmasking Loss: {losses["discrete_unmasking_loss"] :6.4f}, Insertion Loss: {losses["insertion_loss"] :6.4f}')
             if wandb_enabled:
-                if opts.interpolant == 'multimodal':
+                if opts.interpolant in ('multimodal', 'autoregressive'):
                     wandb.log({
                         'loss': loss,
                         'dsm_loss': losses["dsm_loss"],
                         'discrete_unmasking_loss': losses["discrete_unmasking_loss"],
+                        'euclidean_unmasking_loss': losses["euclidean_unmasking_loss"],
                         'insertion_loss': losses["insertion_loss"],
                         'step': training_iter
                     })
@@ -243,17 +255,21 @@ def training(**opts):
                 model.eval()
 
                 samples = interpolant.sampling(model, 50, 20, dataset.max_length+1, device, return_trace=True)
-                for i, sample in enumerate(samples):
-                    if opts.interpolant == 'multimodal':
-                        plot_sample(sample.xt.cpu(), sample.yt.cpu(), sample.mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                batch_size = samples.xt.shape[0]
+                for i in range(batch_size):
+                    if opts.interpolant in ('multimodal', 'autoregressive'):
+                        plot_sample(samples.xt[i].cpu(), samples.yt[i].cpu(), samples.mask_t[i].cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
                     elif opts.interpolant == 'multimodal_both':
-                        plot_sample_2(sample.xt.cpu(), sample.yt.cpu(), sample.x_mask_t.cpu(), sample.y_mask_t.cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
+                        plot_sample_2(samples.xt[i].cpu(), samples.yt[i].cpu(), samples.x_mask_t[i].cpu(), samples.y_mask_t[i].cpu(), os.path.join(path, f'sample_{i}.png'), character_tokenizer)
 
-                    # os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
-                    # pbar = tqdm(enumerate(sample.trajectory), leave=False)
-                    # for j, trajectory in pbar:
-                    #     plot_sample(trajectory.xt.cpu(), trajectory.yt.cpu(), trajectory.mask_t.cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
-                    #     pbar.set_description(f'Saving trajectory {i} step {j}')
+                    if opts.interpolant in ('multimodal', 'autoregressive') and hasattr(samples, 'trajectory'):
+                        if i > 1:
+                            continue
+                        os.makedirs(os.path.join(path, f'trajectory_{i}'), exist_ok=True)
+                        pbar = tqdm(enumerate(samples.trajectory), leave=False)
+                        for j, step in pbar:
+                            plot_sample(step.xt[i].cpu(), step.yt[i].cpu(), step.mask_t[i].cpu(), os.path.join(path, f'trajectory_{i}', f'step_{j}.png'), character_tokenizer)
+                            pbar.set_description(f'Saving trajectory {i} step {j}')
                 model.train()
 
     save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))

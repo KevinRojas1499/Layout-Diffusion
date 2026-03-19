@@ -53,6 +53,8 @@ class OptimizerSchema:
     name: str = "adamw"
     lr: float = 1e-4
     weight_decay: float = 0.0
+    muon_lr: float = 5e-4
+    muon_weight_decay: float = 0.01
 
 
 @dataclass

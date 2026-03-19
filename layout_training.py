@@ -16,7 +16,7 @@ from branching_flows_interpolant import BranchingFlowsInterpolant
 from custom_datasets.multimodal_math import EquationsDataset, ParenthesizedEquationsDataset
 from custom_datasets.publaynet import PublayNetDataset, PUBLAYNET_VOCAB
 from utils.tokenizer import VocabTokenizer
-from utils.optimizers import WarmUpScheduler
+from utils.optimizers import WarmUpScheduler, CombinedOptimizer
 from models.mmdit_qm9 import MMDiTQM9, MMDiTBothVar
 from visualize_dataset import plot_sample, plot_sample_2, plot_layout_sample
 from multimodal_interpolant_both_var import MultimodalInterpolantBoth
@@ -136,6 +136,17 @@ def _get_optimizer(cfg: LayoutConfigSchema, model: torch.nn.Module) -> torch.opt
             lr=opt_cfg.lr,
             weight_decay=opt_cfg.weight_decay,
         )
+    elif opt_cfg.name == "muon":
+        param_groups = model.get_muon_adam_params()
+        muon_params = param_groups["muon_params"]
+        adam_params = param_groups["adam_params"]
+        muon_lr = getattr(opt_cfg, "muon_lr", 5e-4)
+        muon_weight_decay = getattr(opt_cfg, "muon_weight_decay", 0.01)
+        muon_opt = torch.optim.Muon(
+            muon_params, lr=muon_lr, weight_decay=muon_weight_decay, adjust_lr_fn="match_rms_adamw"
+        )
+        adam_opt = torch.optim.AdamW(adam_params, lr=opt_cfg.lr, weight_decay=opt_cfg.weight_decay)
+        return CombinedOptimizer(muon_opt, adam_opt)
     raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
 
