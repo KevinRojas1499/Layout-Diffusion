@@ -63,6 +63,7 @@ def _get_dataset_and_dims(cfg: LayoutConfigSchema):
             max_length=max_length,
             split=ds_cfg.split,
             max_samples=ds_cfg.max_samples,
+            annotations_dir=ds_cfg.data_path,
         )
         euclidean_dim = 4  # bbox: x_center, y_center, w, h
         hidden_dim = cfg.model.hidden_dim

@@ -11,24 +11,38 @@ Usage:
 
     tokenizer = VocabTokenizer(vocab=PUBLAYNET_VOCAB)
     dataset = PublayNetDataset(tokenizer, max_length=64, split="train")
+
+Annotations-only mode (avoids ~130GB image download):
+    Download labels.tar.gz (~314MB) from IBM DAX:
+    https://dax-cdn.cdn.appdomain.cloud/dax-publaynet/1.0.0/labels.tar.gz
+    Extract to e.g. data/publaynet_labels/ and pass annotations_dir="data/publaynet_labels"
 """
 
-import torch
-import datasets
+import json
+from pathlib import Path
+
 import numpy as np
+import torch
 from torch.utils.data import Dataset
+
+import datasets
 from utils.tokenizer import VocabTokenizer
 
 # PubLayNet category_id -> token string (for VocabTokenizer with <token> format)
 CATEGORY_NAMES = {0: "text", 1: "title", 2: "list", 3: "table", 4: "figure"}
 PUBLAYNET_VOCAB = {"<text>", "<title>", "<list>", "<table>", "<figure>"}
 
+# COCO split -> filename in labels.tar.gz
+SPLIT_FILENAMES = {"train": "train.json", "validation": "val.json", "val": "val.json", "test": "test.json"}
+
 
 class PublayNetDataset(Dataset):
     """PubLayNet document layout dataset.
 
-    Loads from HuggingFace (jordanparker6/publaynet). Each sample has variable-length
-    annotations (bbox + category). Bboxes are normalized to [0, 1] by image dimensions.
+    Supports two loading modes:
+    1. annotations_dir: Load from COCO JSON only (~314MB, no images). Use this to avoid
+       the ~130GB HuggingFace download. Download labels.tar.gz from IBM DAX and extract.
+    2. HuggingFace: Full dataset with images (default, requires ~130GB).
     """
 
     def __init__(
@@ -37,18 +51,64 @@ class PublayNetDataset(Dataset):
         max_length: int = 64,
         split: str = "train",
         max_samples: int | None = None,
+        annotations_dir: str | None = None,
     ):
         self.max_length = max_length
         self.tokenizer = tokenizer
+        self._annotations_only = annotations_dir is not None
 
-        self.hf_dataset = datasets.load_dataset(
-            "jordanparker6/publaynet",
-            split=split,
-        )
+        if annotations_dir is not None:
+            self._load_from_coco_json(annotations_dir, split, max_samples)
+        else:
+            self.hf_dataset = datasets.load_dataset(
+                "jordanparker6/publaynet",
+                split=split,
+            )
+            if max_samples is not None:
+                self.hf_dataset = self.hf_dataset.select(
+                    range(min(max_samples, len(self.hf_dataset)))
+                )
+
+    def _load_from_coco_json(self, annotations_dir: str, split: str, max_samples: int | None):
+        """Load from COCO JSON annotations only (no images). Width/height come from metadata."""
+        path = Path(annotations_dir)
+        filename = SPLIT_FILENAMES.get(split, f"{split}.json")
+        json_path = path / filename
+        if not json_path.exists():
+            raise FileNotFoundError(
+                f"Annotations file not found: {json_path}. "
+                f"Download labels.tar.gz from https://dax-cdn.cdn.appdomain.cloud/dax-publaynet/1.0.0/labels.tar.gz "
+                f"and extract to {annotations_dir}"
+            )
+        with open(json_path) as f:
+            coco = json.load(f)
+
+        # Build image_id -> {width, height, annotations}
+        images_by_id = {img["id"]: {"width": img["width"], "height": img["height"]} for img in coco["images"]}
+        anns_by_image: dict[int, list] = {}
+        for ann in coco["annotations"]:
+            img_id = ann["image_id"]
+            if img_id not in anns_by_image:
+                anns_by_image[img_id] = []
+            anns_by_image[img_id].append(ann)
+
+        # Build list of (width, height, annotations) for each image that has annotations
+        self._samples = []
+        for img in coco["images"]:
+            img_id = img["id"]
+            if img_id not in anns_by_image:
+                continue
+            w, h = img["width"], img["height"]
+            if w <= 0 or h <= 0:
+                w, h = 1.0, 1.0
+            self._samples.append((w, h, anns_by_image[img_id]))
+
         if max_samples is not None:
-            self.hf_dataset = self.hf_dataset.select(range(min(max_samples, len(self.hf_dataset))))
+            self._samples = self._samples[: max_samples]
 
     def __len__(self) -> int:
+        if self._annotations_only:
+            return len(self._samples)
         return len(self.hf_dataset)
 
     def _get_category_token(self, ann: dict) -> str:
@@ -64,13 +124,15 @@ class PublayNetDataset(Dataset):
         return f"<{name}>"
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        sample = self.hf_dataset[index]
-        img = sample["image"]
-        annotations = sample["annotations"]
-
-        w, h = img.size
-        if w <= 0 or h <= 0:
-            w, h = 1.0, 1.0
+        if self._annotations_only:
+            w, h, annotations = self._samples[index]
+        else:
+            sample = self.hf_dataset[index]
+            img = sample["image"]
+            annotations = sample["annotations"]
+            w, h = img.size
+            if w <= 0 or h <= 0:
+                w, h = 1.0, 1.0
 
         bboxes = []
         categories = []

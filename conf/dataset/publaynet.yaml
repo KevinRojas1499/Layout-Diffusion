@@ -5,4 +5,6 @@ name: publaynet
 max_length: 25
 split: train
 max_samples: null
-data_path: null
+# data_path: path to annotations-only dir (train.json, val.json) to avoid ~130GB image download.
+# Download labels.tar.gz from https://dax-cdn.cdn.appdomain.cloud/dax-publaynet/1.0.0/labels.tar.gz
+data_path: null  # e.g. "data/publaynet_labels" for annotations-only (~314MB)
