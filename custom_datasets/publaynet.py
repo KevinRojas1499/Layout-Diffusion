@@ -1,7 +1,7 @@
 """Dataset for PubLayNet document layout analysis.
 
 Each sample returns:
-    - x: normalized bounding boxes [max_length, 4] (x_center, y_center, w, h) in [0, 1]
+    - x: normalized bounding boxes [max_length, 4] (x_center, y_center, w, h) in [-1, 1]
     - y: tokenized category labels [max_length]
     - mask: valid positions [max_length]
 
@@ -13,9 +13,11 @@ Usage:
     dataset = PublayNetDataset(tokenizer, max_length=64, split="train")
 
 Annotations-only mode (avoids ~130GB image download):
-    Download labels.tar.gz (~314MB) from IBM DAX:
-    https://dax-cdn.cdn.appdomain.cloud/dax-publaynet/1.0.0/labels.tar.gz
-    Extract to e.g. data/publaynet_labels/ and pass annotations_dir="data/publaynet_labels"
+    Pass annotations_dir pointing to a directory with train.json, val.json (COCO format).
+    Sources for annotations (IBM DAX has been unreliable; try alternatives):
+    - Kaggle: https://www.kaggle.com/datasets/captaintushar/publaynet-dataset
+    - IBM DAX (if available): https://developer.ibm.com/exchanges/data/all/publaynet/
+    - Or run extract_annotations_to_json() once to save from HuggingFace.
 """
 
 import json
@@ -36,12 +38,76 @@ PUBLAYNET_VOCAB = {"<text>", "<title>", "<list>", "<table>", "<figure>"}
 SPLIT_FILENAMES = {"train": "train.json", "validation": "val.json", "val": "val.json", "test": "test.json"}
 
 
+def extract_annotations_to_json(
+    output_dir: str,
+    splits: tuple[str, ...] = ("train", "validation"),
+    max_samples_per_split: int | None = None,
+) -> None:
+    """Extract annotations + image dimensions from HuggingFace to local COCO JSON.
+
+    Run once on a machine with enough space (~130GB) to download the full dataset.
+    Produces train.json, val.json etc. (~few hundred MB). Upload that directory
+    to your cluster and use dataset.data_path=output_dir to train without images.
+
+    Example:
+        python -c "
+        from custom_datasets.publaynet import extract_annotations_to_json
+        extract_annotations_to_json('data/publaynet_labels', splits=('train', 'validation'))
+        "
+    """
+    from tqdm import tqdm
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    for split in splits:
+        hf_split = "validation" if split == "val" else split
+        ds = datasets.load_dataset("jordanparker6/publaynet", split=hf_split)
+        if max_samples_per_split is not None:
+            ds = ds.select(range(min(max_samples_per_split, len(ds))))
+
+        images = []
+        annotations = []
+        ann_id = 0
+
+        for idx in tqdm(range(len(ds)), desc=f"Extracting {split}"):
+            row = ds[idx]
+            img = row["image"]
+            w, h = img.size
+            if w <= 0 or h <= 0:
+                w, h = 1.0, 1.0
+
+            images.append({"id": idx, "width": w, "height": h, "file_name": f"{idx}.png"})
+            for ann in row["annotations"]:
+                ann_copy = dict(ann)
+                ann_copy["id"] = ann_id
+                ann_copy["image_id"] = idx
+                ann_id += 1
+                annotations.append(ann_copy)
+
+        coco = {"images": images, "annotations": annotations, "categories": []}
+        out_file = output_path / SPLIT_FILENAMES.get(split, f"{split}.json")
+        with open(out_file, "w") as f:
+            json.dump(coco, f)
+        print(f"Wrote {out_file} ({len(images)} images, {len(annotations)} annotations)")
+
+
+def _main():
+    """CLI for extract_annotations_to_json. Run: python -m custom_datasets.publaynet [output_dir]"""
+    import sys
+
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "data/publaynet_labels"
+    print(f"Extracting to {output_dir} (requires ~130GB for HuggingFace download)")
+    extract_annotations_to_json(output_dir, splits=("train", "validation"))
+    print(f"Done. Copy {output_dir}/ to your cluster and set dataset.data_path={output_dir}")
+
+
 class PublayNetDataset(Dataset):
     """PubLayNet document layout dataset.
 
     Supports two loading modes:
-    1. annotations_dir: Load from COCO JSON only (~314MB, no images). Use this to avoid
-       the ~130GB HuggingFace download. Download labels.tar.gz from IBM DAX and extract.
+    1. annotations_dir: Load from COCO JSON only (no images). Use extract_annotations_to_json()
+       on a machine with space, then upload the output dir to your cluster.
     2. HuggingFace: Full dataset with images (default, requires ~130GB).
     """
 
@@ -77,8 +143,8 @@ class PublayNetDataset(Dataset):
         if not json_path.exists():
             raise FileNotFoundError(
                 f"Annotations file not found: {json_path}. "
-                f"Download labels.tar.gz from https://dax-cdn.cdn.appdomain.cloud/dax-publaynet/1.0.0/labels.tar.gz "
-                f"and extract to {annotations_dir}"
+                f"Run extract_annotations_to_json() on a machine with HuggingFace access, "
+                f"then copy the output directory to this machine."
             )
         with open(json_path) as f:
             coco = json.load(f)
@@ -140,11 +206,11 @@ class PublayNetDataset(Dataset):
         for ann in annotations:
             bbox = ann["bbox"]  # [x_min, y_min, width, height]
             x_min, y_min, bw, bh = bbox
-            # Normalize to [0, 1]
-            x_center = (x_min + bw / 2) / w
-            y_center = (y_min + bh / 2) / h
-            nw = bw / w
-            nh = bh / h
+            # Normalize to [-1, 1]
+            x_center = 2 * (x_min + bw / 2) / w - 1
+            y_center = 2 * (y_min + bh / 2) / h - 1
+            nw = 2 * bw / w - 1
+            nh = 2 * bh / h - 1
             bboxes.append([x_center, y_center, nw, nh])
             categories.append(self._get_category_token(ann))
 
@@ -180,3 +246,7 @@ class PublayNetDataset(Dataset):
         mask[:original_length] = True
 
         return {"x": x, "y": y, "mask": mask}
+
+
+if __name__ == "__main__":
+    _main()

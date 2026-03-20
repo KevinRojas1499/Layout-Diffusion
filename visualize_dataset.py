@@ -230,7 +230,7 @@ def plot_layout_sample(
     Visualize a generated layout sample (bounding boxes with category labels).
 
     Args:
-        xt: Bbox coordinates [L, 4] - (x_center, y_center, w, h) normalized in [0, 1]
+        xt: Bbox coordinates [L, 4] - (x_center, y_center, w, h) normalized in [-1, 1]
         yt: Token IDs [L] for category labels
         mask: Valid positions [L] (True = valid bbox)
         tokenizer: VocabTokenizer for decoding labels (e.g. PUBLAYNET_VOCAB)
@@ -239,6 +239,8 @@ def plot_layout_sample(
         title: Optional custom title
     """
     xt_np = xt.detach().cpu().numpy() if isinstance(xt, torch.Tensor) else np.array(xt)
+    # Convert [-1, 1] to [0, 1] for display
+    xt_np = (xt_np + 1) / 2
     yt_np = yt.detach().cpu().numpy() if isinstance(yt, torch.Tensor) else np.array(yt)
     mask_np = mask.detach().cpu().numpy() if isinstance(mask, torch.Tensor) else np.array(mask, dtype=bool)
 
