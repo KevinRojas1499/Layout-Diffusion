@@ -721,7 +721,9 @@ def evaluate_molecule_distributions(
     generated_smiles: Optional[List[str]] = None,
     fingerprint_type: str = 'rdkit',
     random_seed: Optional[int] = None,
-    filter_invalid: bool = True
+    filter_invalid: bool = True,
+    ks_only: bool = False,
+    precomputed_real: Optional[dict] = None,
 ):
     """
     Main evaluation function: Compare real vs generated molecule distributions.
@@ -743,6 +745,9 @@ def evaluate_molecule_distributions(
         fingerprint_type: Type of fingerprint ('morgan' or 'rdkit')
         random_seed: Random seed for reproducible sampling and UMAP (default 42)
         filter_invalid: If True, filter out invalid and not-fully-connected molecules (default True)
+        ks_only: If True, skip UMAP and plots; only compute and save KS statistics (faster)
+        precomputed_real: Optional dict with 'properties', 'fps', 'valid', 'atom_counts' to skip
+            real-side computation (for batch evaluation)
     
     Returns:
         Dictionary containing evaluation results including fingerprints, embeddings, KS statistics
@@ -777,30 +782,38 @@ def evaluate_molecule_distributions(
         if generated_smiles:
             generated_smiles = [generated_smiles[i] for i in indices]
     
-    # 1. Compute molecular properties (this also filters if filter_invalid=True)
-    print("\n" + "="*50)
-    print("1. Computing molecular properties...")
-    print("="*50)
-    print("Computing properties for real molecules...")
-    real_properties = compute_molecular_properties(real_symbols, real_positions, filter_invalid=filter_invalid)
+    # 1. Compute molecular properties (skip if precomputed)
+    if precomputed_real is not None:
+        real_properties = precomputed_real['properties']
+        real_fps = precomputed_real['fps']
+        real_valid = precomputed_real['valid']
+        real_fp_stats = precomputed_real.get('fp_stats', {})
+        print("Using precomputed real molecules data")
+    else:
+        print("\n" + "="*50)
+        print("1. Computing molecular properties...")
+        print("="*50)
+        print("Computing properties for real molecules...")
+        real_properties = compute_molecular_properties(real_symbols, real_positions, filter_invalid=filter_invalid)
+    
+    # 2. Compute fingerprints (skip real if precomputed)
+    if precomputed_real is None:
+        print("\n" + "="*50)
+        print("2. Computing molecular fingerprints...")
+        print("="*50)
+        print(f"Using {fingerprint_type} fingerprints...")
+        print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
+        real_fps, real_valid, real_fp_stats = compute_molecular_fingerprints(
+            real_symbols, real_positions,
+            radius=fingerprint_radius, n_bits=fingerprint_bits,
+            fingerprint_type=fingerprint_type,
+            filter_invalid=filter_invalid,
+            return_stats=True
+        )
+        print(f"Valid real molecules: {len(real_fps)}")
+    
     print("Computing properties for generated molecules...")
     gen_properties = compute_molecular_properties(generated_symbols, generated_positions, filter_invalid=filter_invalid)
-    
-    # 2. Compute fingerprints (this also filters and returns valid indices)
-    print("\n" + "="*50)
-    print("2. Computing molecular fingerprints...")
-    print("="*50)
-    print(f"Using {fingerprint_type} fingerprints...")
-    print(f"Computing fingerprints for {len(real_symbols)} real molecules...")
-    real_fps, real_valid, real_fp_stats = compute_molecular_fingerprints(
-        real_symbols, real_positions,
-        radius=fingerprint_radius, n_bits=fingerprint_bits,
-        fingerprint_type=fingerprint_type,
-        filter_invalid=filter_invalid,
-        return_stats=True
-    )
-    print(f"Valid real molecules: {len(real_fps)}")
-    
     print(f"Computing fingerprints for {len(generated_symbols)} generated molecules...")
     generated_fps, gen_valid, gen_fp_stats = compute_molecular_fingerprints(
         generated_symbols, generated_positions,
@@ -810,12 +823,13 @@ def evaluate_molecule_distributions(
         return_stats=True
     )
     print("\nPre-filter stats (all samples):")
-    print(f"  QM9 total: {real_fp_stats['total']} (failed={real_fp_stats['failed']})")
+    if real_fp_stats:
+        print(f"  QM9 total: {real_fp_stats.get('total', '?')} (failed={real_fp_stats.get('failed', 0)})")
     print(f"  Generated total: {gen_fp_stats['total']} (failed={gen_fp_stats['failed']})")
-    if filter_invalid:
+    if filter_invalid and real_fp_stats:
         print("\nFiltering summary (after xyz→sdf→RDKit):")
-        print(f"  QM9 valid: {real_fp_stats['valid']} / {real_fp_stats['total']} "
-              f"(invalid={real_fp_stats['invalid']}, not_connected={real_fp_stats['not_connected']})")
+        print(f"  QM9 valid: {real_fp_stats.get('valid', '?')} / {real_fp_stats.get('total', '?')} "
+              f"(invalid={real_fp_stats.get('invalid', 0)}, not_connected={real_fp_stats.get('not_connected', 0)})")
         print(f"  Generated valid: {gen_fp_stats['valid']} / {gen_fp_stats['total']} "
               f"(invalid={gen_fp_stats['invalid']}, not_connected={gen_fp_stats['not_connected']})")
     print(f"Valid generated molecules: {len(generated_fps)}")
@@ -865,43 +879,49 @@ def evaluate_molecule_distributions(
         else:
             print(f"  {prop_type:>5}: 1-KSD = NaN (insufficient valid data)")
     
-    # Plot distributions
-    print("\nPlotting atom count marginal distributions...")
-    plot_atom_count_distributions(real_atom_counts, gen_atom_counts, output_dir, ks_stats)
+    # Plot distributions (skipped if ks_only)
+    if not ks_only:
+        print("\nPlotting atom count marginal distributions...")
+        plot_atom_count_distributions(real_atom_counts, gen_atom_counts, output_dir, ks_stats)
+        
+        print("\nPlotting molecular property distributions...")
+        plot_distribution_cdfs(real_properties, gen_properties, output_dir, ks_stats, plot_type='properties')
     
-    print("\nPlotting molecular property distributions...")
-    plot_distribution_cdfs(real_properties, gen_properties, output_dir, ks_stats, plot_type='properties')
+    # 5. Compute UMAP embedding (skipped if ks_only)
+    if ks_only:
+        real_embedding = np.zeros((len(real_fps), 2))  # Dummy for return dict
+        generated_embedding = np.zeros((len(generated_fps), 2))
+    else:
+        print("\n" + "="*50)
+        print("5. Computing UMAP embedding...")
+        print("="*50)
+        
+        # Combine for joint UMAP fitting (better comparison)
+        all_fps = np.vstack([real_fps, generated_fps])
+        all_embedding = compute_umap_embedding(all_fps, random_state=random_seed)
+        
+        # Split back
+        real_embedding = all_embedding[:len(real_fps)]
+        generated_embedding = all_embedding[len(real_fps):]
+        
+        # Plot UMAP comparison
+        output_file = os.path.join(output_dir, 'distribution_comparison_umap.png')
+        real_num_atoms = [len(s) for s in real_symbols]
+        gen_num_atoms = [len(s) for s in generated_symbols]
+        plot_distribution_comparison(real_embedding, generated_embedding, output_file,
+                                    real_num_atoms=real_num_atoms, gen_num_atoms=gen_num_atoms)
     
-    # 5. Compute UMAP embedding
-    print("\n" + "="*50)
-    print("5. Computing UMAP embedding...")
-    print("="*50)
-    
-    # Combine for joint UMAP fitting (better comparison)
-    all_fps = np.vstack([real_fps, generated_fps])
-    all_embedding = compute_umap_embedding(all_fps, random_state=random_seed)
-    
-    # Split back
-    real_embedding = all_embedding[:len(real_fps)]
-    generated_embedding = all_embedding[len(real_fps):]
-    
-    # Plot UMAP comparison
-    output_file = os.path.join(output_dir, 'distribution_comparison_umap.png')
-    real_num_atoms = [len(s) for s in real_symbols]
-    gen_num_atoms = [len(s) for s in generated_symbols]
-    plot_distribution_comparison(real_embedding, generated_embedding, output_file,
-                                real_num_atoms=real_num_atoms, gen_num_atoms=gen_num_atoms)
-    
-    # Print summary statistics
+    # Print summary statistics (skip embedding details if ks_only)
     print("\n" + "="*50)
     print("Summary Statistics:")
     print("="*50)
     print(f"Real molecules: {len(real_fps)} valid out of {len(real_symbols)}")
     print(f"Generated molecules: {len(generated_fps)} valid out of {len(generated_symbols)}")
-    print(f"\nReal embedding range: X=[{real_embedding[:, 0].min():.2f}, {real_embedding[:, 0].max():.2f}], "
-          f"Y=[{real_embedding[:, 1].min():.2f}, {real_embedding[:, 1].max():.2f}]")
-    print(f"Generated embedding range: X=[{generated_embedding[:, 0].min():.2f}, {generated_embedding[:, 0].max():.2f}], "
-          f"Y=[{generated_embedding[:, 1].min():.2f}, {generated_embedding[:, 1].max():.2f}]")
+    if not ks_only:
+        print(f"\nReal embedding range: X=[{real_embedding[:, 0].min():.2f}, {real_embedding[:, 0].max():.2f}], "
+              f"Y=[{real_embedding[:, 1].min():.2f}, {real_embedding[:, 1].max():.2f}]")
+        print(f"Generated embedding range: X=[{generated_embedding[:, 0].min():.2f}, {generated_embedding[:, 0].max():.2f}], "
+              f"Y=[{generated_embedding[:, 1].min():.2f}, {generated_embedding[:, 1].max():.2f}]")
     
     # Print summary table (matching paper format)
     print("\n" + "="*70)

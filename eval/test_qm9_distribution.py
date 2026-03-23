@@ -25,7 +25,7 @@ from utils.tokenizer import VocabTokenizer
 def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distribution_test.png',
                           generated_file: str = None, comparison_output: str = None,
                           n_real_samples: Optional[int] = None, n_gen_samples: Optional[int] = None,
-                          use_all_samples: bool = False):
+                          use_all_samples: bool = False, ks_only: bool = False):
     """
     Plot QM9 dataset distribution using UMAP.
     
@@ -126,11 +126,13 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
                 real_smiles=real_smiles,
                 fingerprint_type='rdkit',
                 random_seed=42,
-                filter_invalid=False
+                filter_invalid=False,
+                ks_only=ks_only,
             )
-            print(f"   All-samples plots saved to:")
-            print(f"     - {output_dir_all}/distribution_comparison_umap.png")
-            print(f"     - {output_dir_all}/atom_count_distributions.png")
+            if not ks_only:
+                print(f"   All-samples plots saved to:")
+                print(f"     - {output_dir_all}/distribution_comparison_umap.png")
+                print(f"     - {output_dir_all}/atom_count_distributions.png")
 
             print(f"\n   [Valid only] Running report with filtering...")
             results_valid = evaluate_molecule_distributions(
@@ -142,11 +144,13 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
                 real_smiles=real_smiles,
                 fingerprint_type='rdkit',
                 random_seed=42,
-                filter_invalid=True
+                filter_invalid=True,
+                ks_only=ks_only,
             )
-            print(f"   Valid-only plots saved to:")
-            print(f"     - {output_dir_valid}/distribution_comparison_umap.png")
-            print(f"     - {output_dir_valid}/atom_count_distributions.png")
+            if not ks_only:
+                print(f"   Valid-only plots saved to:")
+                print(f"     - {output_dir_valid}/distribution_comparison_umap.png")
+                print(f"     - {output_dir_valid}/atom_count_distributions.png")
 
             results = results_valid
         except Exception as e:
@@ -155,7 +159,12 @@ def plot_qm9_distribution(n_samples: int = 10000, output_file: str = 'qm9_distri
             traceback.print_exc()
             return
     
-    # Reuse results from evaluate_molecule_distributions if available, otherwise compute separately
+    # Reuse results from evaluate_molecule_distributions if available (skip final plot if ks_only)
+    if results is not None and ks_only:
+        print("\n" + "="*60)
+        print("SUCCESS: KS statistics saved (--ks_only: skipped UMAP and plots)")
+        print("="*60)
+        return
     if results is not None:
         # Reuse fingerprints and embeddings from evaluation results
         print(f"\n6. Reusing fingerprints and embeddings from evaluation results...")
@@ -374,6 +383,8 @@ Example usage:
                        help='Path to JSON file with generated molecules (optional, enables comparison mode)')
     parser.add_argument('--comparison_output', type=str, default=None,
                        help='Directory to save full comparison results (optional, only used with --generated)')
+    parser.add_argument('--ks_only', action='store_true',
+                       help='Skip UMAP and plots; only compute and save KS statistics (much faster)')
     
     args = parser.parse_args()
     
@@ -384,5 +395,6 @@ Example usage:
         comparison_output=args.comparison_output,
         n_real_samples=args.n_real_samples,
         n_gen_samples=args.n_gen_samples,
-        use_all_samples=args.use_all_samples
+        use_all_samples=args.use_all_samples,
+        ks_only=args.ks_only,
     )

@@ -59,3 +59,33 @@ uv run torchrun sampling_toy.py --num_samples 10000 --dataset parenthesis --data
 
 ### Samplers Grid Search Figure 3
 uv run python run_equations_grid_search.py --steps-min 50 --steps-max 500 --steps-num 5 --nfe-min 50 --nfe-max 1500 --nfe-num 5 --num-samples 10000 --seed 1 --seed 2 --seed 3
+
+
+## QM9 Distribution Evaluation
+
+Evaluate generated molecules at different sample sizes (1k, 2.5k, 5k, 10k, etc.) to see how KS statistics change:
+
+```bash
+uv run python grid_search.py eval-sample-sizes --generated samples/muon-fused-residual-80k/samples.json
+```
+
+### Changing the output folder
+
+Use `--comparison-output-template` to control where results are written. Use `{n_gen}` for the sample size:
+
+```bash
+uv run python grid_search.py eval-sample-sizes \
+  --generated samples/muon-fused-residual-80k/samples.json \
+  --comparison-output-template "results-diff-samples/muon-fused-80k-eval-{n_gen}"
+```
+
+This writes to `results-diff-samples/muon-fused-80k-eval-1000/`, `results-diff-samples/muon-fused-80k-eval-2500/`, etc. Default is `results/eval-n-gen-{n_gen}`.
+
+### Direct batch script
+
+```bash
+uv run python eval/eval_ks_batch.py \
+  --generated samples/muon-fused-residual-80k/samples.json \
+  --n-gen-samples 1000 2500 5000 10000 20000 \
+  --comparison-output-template "my_results/eval-{n_gen}"
+```

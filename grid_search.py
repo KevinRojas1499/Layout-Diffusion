@@ -87,7 +87,7 @@ def grid_search_equations():
 )
 @click.option("--num-samples", type=int, default=10000, show_default=True)
 @click.option("--n-real-samples", type=int, default=10000, show_default=True)
-@click.option("--master-port", type=int, default=29502, show_default=True)
+@click.option("--master-port", type=int, default=29501, show_default=True)
 @click.option(
     "--sample-dir-template",
     type=str,
@@ -330,6 +330,124 @@ def grid_search_equations_samplers(
                 _run(sampling_cmd, dry_run)
                 _run(eval_cmd, dry_run)
 
+
+@grid_search_equations.command()
+@click.option(
+    "--generated",
+    type=click.Path(path_type=Path, exists=True, file_okay=True, dir_okay=False),
+    required=True,
+    help="Path to samples.json with generated molecules (e.g. from 80K run).",
+)
+@click.option(
+    "--n-gen-samples",
+    "n_gen_sample_sizes",
+    type=int,
+    multiple=True,
+    default=(1000, 2500, 5000, 10000, 20000, 40000, 80000),
+    show_default=True,
+    help="Generated sample sizes to evaluate. Pass multiple times to override default.",
+)
+@click.option(
+    "--use-all-real-samples/--no-use-all-real-samples",
+    default=True,
+    show_default=True,
+    help="Use all QM9 samples for the real distribution (default). Disable to use --n-real-samples.",
+)
+@click.option("--n-real-samples", type=int, default=10000, show_default=True)
+@click.option(
+    "--comparison-output-template",
+    type=str,
+    default="results/eval-n-gen-{n_gen}",
+    show_default=True,
+    help="Output dir template. Use {n_gen} for sample size (e.g. 10000).",
+)
+@click.option("--dry-run", is_flag=True, default=False, show_default=True)
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=True,
+    show_default=True,
+    help="Skip sizes where comparison output already exists.",
+)
+@click.option(
+    "--batch/--no-batch",
+    default=True,
+    show_default=True,
+    help="Use batch mode: load data once, evaluate all sizes in one process (faster). Disable to run test_qm9_distribution.py separately per size.",
+)
+@click.option(
+    "--ks-only/--no-ks-only",
+    default=True,
+    show_default=True,
+    help="Skip UMAP and plots; only KS statistics (faster). With --no-batch, passes --ks_only to test script.",
+)
+def eval_sample_sizes(
+    generated: Path,
+    n_gen_sample_sizes: tuple[int, ...],
+    use_all_real_samples: bool,
+    n_real_samples: int,
+    comparison_output_template: str,
+    dry_run: bool,
+    skip_existing: bool,
+    batch: bool,
+    ks_only: bool,
+) -> None:
+    """Evaluate the same generated samples at different subsample sizes.
+
+    Use when you have many samples (e.g. 80K) and want to see how KS statistics
+    change with 1k, 2.5k, 5k, 10k, 20k, etc. No re-sampling needed.
+    """
+    if batch:
+        # Single process: load once, evaluate all sizes (much faster)
+        n_real = 132008 if use_all_real_samples else n_real_samples
+        batch_cmd = [
+            "uv",
+            "run",
+            "python",
+            "eval/eval_ks_batch.py",
+            "--generated",
+            str(generated),
+            "--n-gen-samples",
+            *[str(s) for s in n_gen_sample_sizes],
+            "--n-real-samples",
+            str(n_real),
+            "--comparison-output-template",
+            str(comparison_output_template),
+        ]
+        if skip_existing:
+            batch_cmd.append("--skip-existing")
+        else:
+            batch_cmd.append("--no-skip-existing")
+        click.echo(f"\n=== Batch evaluation (all sizes in one run) ===")
+        _run(batch_cmd, dry_run)
+        return
+
+    # Per-size subprocess calls
+    for n_gen in n_gen_sample_sizes:
+        comparison_output = Path(comparison_output_template.format(n_gen=n_gen))
+        if skip_existing and comparison_output.exists():
+            click.echo(f"Skipping n_gen={n_gen}: {comparison_output} exists.")
+            continue
+
+        n_real = 132008 if use_all_real_samples else n_real_samples  # QM9 dataset size
+        eval_cmd = [
+            "uv",
+            "run",
+            "python",
+            "eval/test_qm9_distribution.py",
+            "--n_real_samples",
+            str(n_real),
+            "--n_gen_samples",
+            str(n_gen),
+            "--generated",
+            str(generated),
+            "--comparison_output",
+            str(comparison_output),
+        ]
+        if ks_only:
+            eval_cmd.append("--ks_only")
+
+        click.echo(f"\n=== Evaluating with n_gen_samples={n_gen}, n_real={n_real} ===")
+        _run(eval_cmd, dry_run)
 
 
 if __name__ == "__main__":

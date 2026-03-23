@@ -163,11 +163,13 @@ def sampling(**opts):
                         pbar.set_description(f'Saving trajectory {i} step {j}')
                 except Exception as e:
                     print(f'Error plotting sample {i}')
-            
-    b = json.dumps(output_samples, indent=2, separators=(',', ':'), cls=CustomJSONEncoder)
-    b = b.replace('"##<', "").replace('>##"', "")
-    with open(os.path.join(opts.dir, 'samples.json'), 'w') as f:
-        f.write(b)
+
+        # Save incrementally after each batch (rank 0 only)
+        if rank == 0:
+            b = json.dumps(output_samples, indent=2, separators=(',', ':'), cls=CustomJSONEncoder)
+            b = b.replace('"##<', "").replace('>##"', "")
+            with open(os.path.join(opts.dir, 'samples.json'), 'w') as f:
+                f.write(b)
 
     dist.barrier(device_ids=[device])
     dist.destroy_process_group()
