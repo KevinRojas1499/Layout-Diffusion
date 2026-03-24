@@ -307,6 +307,7 @@ class MultimodalInterpolant():
         t: Tensor,
         dt: float,
         is_last_step: bool,
+        unmasking_mode: str = 'confidence',
     ) -> tuple[Tensor, Tensor]:
         # Denoise
         masked_positions = (yt == self.mask_token)
@@ -326,7 +327,9 @@ class MultimodalInterpolant():
             new_sample = unmasking_nums.argmax(dim=-1)
         else:
             change_pos = masked_positions
-            new_sample = unmasking_rate.argmax(dim=-1)
+            # new_sample = unmasking_nums.argmax(dim=-1)
+            probs = unmasking_rate.softmax(dim=-1) 
+            new_sample = torch.distributions.Categorical(probs=probs).sample()
 
         indices = new_sample.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, xt.shape[-1])  # [B, L] -> [B, L, 1, D]
         mean_cond_y1 = prediction.clean_data_unmasking.gather(dim=2, index=indices).squeeze(2)
