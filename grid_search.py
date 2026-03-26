@@ -117,6 +117,12 @@ def grid_search_equations():
     show_default=True,
     help="Only run evaluation; skip sampling (use when samples already exist).",
 )
+@click.option(
+    "--ks-only/--no-ks-only",
+    default=True,
+    show_default=True,
+    help="Skip UMAP and distribution plots; only KS statistics (faster).",
+)
 def main(
     exp_dir: Path,
     start_itr: Optional[int],
@@ -133,6 +139,7 @@ def main(
     dry_run: bool,
     skip_existing: bool,
     eval_only: bool,
+    ks_only: bool,
 ) -> None:
     itrs = _build_itr_list(exp_dir, start_itr, end_itr, step, use_all_folders)
     if not itrs:
@@ -191,6 +198,8 @@ def main(
             "--comparison_output",
             str(comparison_output),
         ]
+        if ks_only:
+            eval_cmd.append("--ks_only")
 
         click.echo(f"\n=== Iteration {itr} ===")
         if not eval_only:
@@ -255,6 +264,12 @@ def main(
     show_default=True,
     help="Skip iterations where evaluation output already exists.",
 )
+@click.option(
+    "--ks-only/--no-ks-only",
+    default=True,
+    show_default=True,
+    help="Skip UMAP and distribution plots; only KS statistics (faster).",
+)
 def grid_search_equations_samplers(
     exp_dir: Path,
     start_itr: Optional[int],
@@ -271,6 +286,7 @@ def grid_search_equations_samplers(
     use_ema: bool,
     dry_run: bool,
     skip_existing: bool,
+    ks_only: bool,
 ) -> None:
     itrs = _build_itr_list(exp_dir, start_itr, end_itr, step, use_all_folders)
     if not itrs:
@@ -325,6 +341,8 @@ def grid_search_equations_samplers(
                     "--comparison_output",
                     str(comparison_output),
                 ]
+                if ks_only:
+                    eval_cmd.append("--ks_only")
 
                 click.echo(f"\n=== Iteration {itr} with sampler {sampler} ===")
                 _run(sampling_cmd, dry_run)
@@ -380,6 +398,13 @@ def grid_search_equations_samplers(
     show_default=True,
     help="Skip UMAP and plots; only KS statistics (faster). With --no-batch, passes --ks_only to test script.",
 )
+@click.option(
+    "--n-repeats",
+    type=int,
+    default=1,
+    show_default=True,
+    help="For stability analysis: number of independent subsamples per size. Each repeat uses a different random 2500 (or n_gen) subset.",
+)
 def eval_sample_sizes(
     generated: Path,
     n_gen_sample_sizes: tuple[int, ...],
@@ -390,6 +415,7 @@ def eval_sample_sizes(
     skip_existing: bool,
     batch: bool,
     ks_only: bool,
+    n_repeats: int,
 ) -> None:
     """Evaluate the same generated samples at different subsample sizes.
 
@@ -412,6 +438,8 @@ def eval_sample_sizes(
             str(n_real),
             "--comparison-output-template",
             str(comparison_output_template),
+            "--n-repeats",
+            str(n_repeats),
         ]
         if skip_existing:
             batch_cmd.append("--skip-existing")

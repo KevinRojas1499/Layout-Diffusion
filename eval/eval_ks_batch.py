@@ -4,6 +4,11 @@ Batch evaluation of KS statistics at multiple generated sample sizes.
 Loads QM9 and generated molecules once, then evaluates each n_gen size.
 Skips UMAP and plots. Much faster than running test_qm9_distribution.py
 multiple times.
+
+Stability mode (--n-repeats): Subsample multiple independent groups of the same
+size to assess metric variance. E.g. with 80K samples and --n-gen-samples 2500
+--n-repeats 10, evaluates 10 different random 2500-subsets and saves each to
+repeat-0/, repeat-1/, ... to study statistical stability.
 """
 
 import argparse
@@ -34,7 +39,10 @@ def main():
     parser.add_argument('--n-real-samples', type=int, default=132008,
                         help='QM9 samples (default: 132008 = all)')
     parser.add_argument('--comparison-output-template', type=str, default='results/eval-n-gen-{n_gen}',
-                        help='Output dir template, use {n_gen} for size')
+                        help='Output dir template. Use {n_gen} for size. With --n-repeats>1, /repeat-{i} is appended.')
+    parser.add_argument('--n-repeats', type=int, default=1,
+                        help='Number of independent subsamples per size (for stability analysis). '
+                             'Each repeat uses a different random subsample. Default 1.')
     parser.add_argument('--skip-existing', action='store_true', default=True,
                         help='Skip sizes where output exists')
     parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing',
@@ -94,48 +102,62 @@ def main():
     }
     print("   Done. Real data will be reused for all n_gen sizes.")
 
+    n_repeats = max(1, args.n_repeats)
+
     for n_gen in args.n_gen_samples:
-        output_dir = args.comparison_output_template.format(n_gen=n_gen)
-        valid_dir = os.path.join(output_dir, 'valid_only')
-        all_dir = os.path.join(output_dir, 'all_samples')
-        summary_path = os.path.join(valid_dir, 'ks_statistics_summary.txt')
+        for repeat in range(n_repeats):
+            base_dir = args.comparison_output_template.format(n_gen=n_gen)
+            output_dir = os.path.join(base_dir, f'repeat-{repeat}') if n_repeats > 1 else base_dir
 
-        if args.skip_existing and os.path.exists(summary_path):
-            print(f"\nSkipping n_gen={n_gen} (exists)")
-            continue
+            valid_dir = os.path.join(output_dir, 'valid_only')
+            all_dir = os.path.join(output_dir, 'all_samples')
+            summary_path = os.path.join(valid_dir, 'ks_statistics_summary.txt')
 
-        print(f"\n{'='*50}")
-        print(f"Evaluating n_gen_samples={n_gen}")
-        print(f"{'='*50}")
+            if args.skip_existing and os.path.exists(summary_path):
+                if n_repeats > 1:
+                    print(f"\nSkipping n_gen={n_gen} repeat={repeat} (exists)")
+                else:
+                    print(f"\nSkipping n_gen={n_gen} (exists)")
+                continue
 
-        evaluate_molecule_distributions(
-            real_symbols, real_positions,
-            gen_symbols, gen_positions,
-            output_dir=all_dir,
-            n_real_samples=None,
-            n_gen_samples=n_gen,
-            real_smiles=real_smiles,
-            fingerprint_type='rdkit',
-            random_seed=42,
-            filter_invalid=False,
-            ks_only=True,
-            precomputed_real=precomputed_real_all,
-        )
+            seed = 42 + repeat
+            if n_repeats > 1:
+                print(f"\n{'='*50}")
+                print(f"Evaluating n_gen_samples={n_gen} repeat={repeat}/{n_repeats} (seed={seed})")
+                print(f"{'='*50}")
+            else:
+                print(f"\n{'='*50}")
+                print(f"Evaluating n_gen_samples={n_gen}")
+                print(f"{'='*50}")
 
-        evaluate_molecule_distributions(
-            real_symbols, real_positions,
-            gen_symbols, gen_positions,
-            output_dir=valid_dir,
-            n_real_samples=None,
-            n_gen_samples=n_gen,
-            real_smiles=real_smiles,
-            fingerprint_type='rdkit',
-            random_seed=42,
-            filter_invalid=True,
-            ks_only=True,
-            precomputed_real=precomputed_real_valid,
-        )
-        print(f"   Saved to {output_dir}/")
+            evaluate_molecule_distributions(
+                real_symbols, real_positions,
+                gen_symbols, gen_positions,
+                output_dir=all_dir,
+                n_real_samples=None,
+                n_gen_samples=n_gen,
+                real_smiles=real_smiles,
+                fingerprint_type='rdkit',
+                random_seed=seed,
+                filter_invalid=False,
+                ks_only=True,
+                precomputed_real=precomputed_real_all,
+            )
+
+            evaluate_molecule_distributions(
+                real_symbols, real_positions,
+                gen_symbols, gen_positions,
+                output_dir=valid_dir,
+                n_real_samples=None,
+                n_gen_samples=n_gen,
+                real_smiles=real_smiles,
+                fingerprint_type='rdkit',
+                random_seed=seed,
+                filter_invalid=True,
+                ks_only=True,
+                precomputed_real=precomputed_real_valid,
+            )
+            print(f"   Saved to {output_dir}/")
 
     print("\n" + "="*60)
     print("Done")
