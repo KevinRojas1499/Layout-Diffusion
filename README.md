@@ -81,6 +81,20 @@ uv run python grid_search.py eval-sample-sizes \
 
 This writes to `results-diff-samples/muon-fused-80k-eval-1000/`, `results-diff-samples/muon-fused-80k-eval-2500/`, etc. Default is `results/eval-n-gen-{n_gen}`.
 
+### Stability analysis (multiple subsamples per size)
+
+To assess metric variance, run multiple independent subsamples of the same size. Each repeat uses a different random subset:
+
+```bash
+uv run python eval/eval_ks_batch.py \
+  --generated samples/muon-fused-residual-80k/samples.json \
+  --n-gen-samples 2500 \
+  --n-repeats 10 \
+  --comparison-output-template "results/stability-2500"
+```
+
+This creates `results/stability-2500/repeat-0/`, `repeat-1/`, ... `repeat-9/`, each with KS stats from a different random 2500-sample subset. Compare the metrics across repeats to study statistical stability.
+
 ### Direct batch script
 
 ```bash
@@ -89,3 +103,7 @@ uv run python eval/eval_ks_batch.py \
   --n-gen-samples 1000 2500 5000 10000 20000 \
   --comparison-output-template "my_results/eval-{n_gen}"
 ```
+
+### Evaluate a folder
+
+uv run eval/eval_ks_batch.py --folder qm9_sampling_grid/ 

@@ -377,7 +377,8 @@ def grid_search_equations_samplers(
     type=str,
     default="results/eval-n-gen-{n_gen}",
     show_default=True,
-    help="Output dir template. Use {n_gen} for sample size (e.g. 10000).",
+    help="Non-batch only: output dir template for test_qm9_distribution.py. "
+         "Batch mode writes under <generated-dir>/<stem>/n_gen_<n>/ (stem = JSON basename).",
 )
 @click.option("--dry-run", is_flag=True, default=False, show_default=True)
 @click.option(
@@ -436,8 +437,6 @@ def eval_sample_sizes(
             *[str(s) for s in n_gen_sample_sizes],
             "--n-real-samples",
             str(n_real),
-            "--comparison-output-template",
-            str(comparison_output_template),
             "--n-repeats",
             str(n_repeats),
         ]

@@ -1198,7 +1198,7 @@ def load_molecules_from_json(json_file: str):
             print(f"Warning: Skipping molecule {i} - symbols length ({len(symbols)}) != positions length ({len(positions)})")
             continue
         
-        if positions.shape[1] != 3:
+        if positions.ndim < 2 or positions.shape[1] != 3:
             print(f"Warning: Skipping molecule {i} - positions must be (N, 3), got {positions.shape}")
             continue
         

@@ -9,10 +9,12 @@ from tqdm import tqdm
 import argparse
 from pathlib import Path
 from eval.evaluate_distribution import _positions_to_molecule_via_openbabel
+from custom_datasets.qm9_hydrogen_order import reorder_hydrogens_nearest_heavy
 
 
 def preprocess_qm9_dataset(
     output_dir: str,
+    reorder_hydrogens: bool = True,
 ):
     """
     Preprocess QM9 dataset by filtering to molecules that pass the same
@@ -21,6 +23,8 @@ def preprocess_qm9_dataset(
     
     Args:
         output_dir: Directory to save the preprocessed dataset
+        reorder_hydrogens: If True, place each H before its nearest heavy atom
+            (heavy order unchanged); original order is kept in original_* keys.
     """
     print("Loading QM9 dataset...")
     qm9_dataset = datasets.load_dataset('yairschiff/qm9', split='train')
@@ -39,14 +43,25 @@ def preprocess_qm9_dataset(
             )
             if not is_valid or not is_fully_connected:
                 return None
-            
+
+            orig_symbols = list(atomic_symbols)
+            orig_pos = np.asarray(pos, dtype=np.float64)
+            if reorder_hydrogens:
+                new_symbols, new_pos = reorder_hydrogens_nearest_heavy(
+                    orig_symbols, orig_pos
+                )
+                out_symbols = new_symbols
+                out_pos = new_pos.tolist()
+            else:
+                out_symbols = orig_symbols
+                out_pos = pos if isinstance(pos, list) else orig_pos.tolist()
+
             result = {
-                'atomic_symbols': atomic_symbols,
-                'pos': pos,
+                'atomic_symbols': out_symbols,
+                'pos': out_pos,
                 'canonical_smiles': smiles,
-                # Keep compatibility with previous training codepaths.
-                'original_atomic_symbols': atomic_symbols,
-                'original_pos': pos,
+                'original_atomic_symbols': orig_symbols,
+                'original_pos': orig_pos.tolist(),
             }
             
             for key in example.keys():
@@ -91,8 +106,14 @@ def preprocess_qm9_dataset(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess and filter QM9 dataset")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the preprocessed dataset")
+    parser.add_argument(
+        "--no_hydrogen_reorder",
+        action="store_true",
+        help="Keep raw dataset atom order (heavy/H as in QM9 files).",
+    )
     args = parser.parse_args()
-    
+
     preprocess_qm9_dataset(
         output_dir=args.output_dir,
+        reorder_hydrogens=not args.no_hydrogen_reorder,
     )

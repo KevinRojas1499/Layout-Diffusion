@@ -1,19 +1,23 @@
 """
 Batch evaluation of KS statistics at multiple generated sample sizes.
 
-Loads QM9 and generated molecules once, then evaluates each n_gen size.
+Loads QM9 once. With --generated, loads one JSON and evaluates each n_gen size.
+With --folder, walks for .json files and evaluates each valid file (invalid files skipped).
 Skips UMAP and plots. Much faster than running test_qm9_distribution.py
 multiple times.
 
 Stability mode (--n-repeats): Subsample multiple independent groups of the same
-size to assess metric variance. E.g. with 80K samples and --n-gen-samples 2500
---n-repeats 10, evaluates 10 different random 2500-subsets and saves each to
-repeat-0/, repeat-1/, ... to study statistical stability.
+size. Outputs go under <json_stem>/n_gen_<n>/repeat-<i>/ next to each JSON file
+(json_stem = filename without .json) so multiple JSONs in one folder do not clash.
 """
 
 import argparse
+import io
+import json
 import os
 import sys
+from contextlib import redirect_stdout
+from typing import Callable, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,18 +32,120 @@ from eval.evaluate_distribution import (
 )
 
 
+def iter_json_files(root: str):
+    root = os.path.abspath(root)
+    for dirpath, _, filenames in os.walk(root):
+        for name in sorted(filenames):
+            if name.lower().endswith('.json'):
+                yield os.path.join(dirpath, name)
+
+
+def eval_output_dir_next_to_json(
+    source_dir: str, json_stem: str, n_gen: int, repeat: int, n_repeats: int
+) -> str:
+    """Directory for one KS run: <source_dir>/<stem>/n_gen_<n>/[repeat-<r>/]."""
+    stem = json_stem or 'samples'
+    base = os.path.join(source_dir, stem, f'n_gen_{n_gen}')
+    if n_repeats > 1:
+        return os.path.join(base, f'repeat-{repeat}')
+    return base
+
+
+def try_load_valid_molecules_json(path: str) -> Optional[Tuple[list, list]]:
+    """Load molecules if the file is valid QM9-style JSON; otherwise return None."""
+    try:
+        with redirect_stdout(io.StringIO()):
+            symbols, positions = load_molecules_from_json(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, KeyError):
+        return None
+    if not symbols:
+        return None
+    return symbols, positions
+
+
+def run_eval_loop(
+    args,
+    real_symbols,
+    real_positions,
+    real_smiles,
+    precomputed_real_all,
+    precomputed_real_valid,
+    gen_symbols,
+    gen_positions,
+    get_eval_output_dir: Callable[[int, int], str],
+    label: str = '',
+):
+    n_repeats = max(1, args.n_repeats)
+    for n_gen in args.n_gen_samples:
+        for repeat in range(n_repeats):
+            output_dir = get_eval_output_dir(n_gen, repeat)
+
+            valid_dir = os.path.join(output_dir, 'valid_only')
+            all_dir = os.path.join(output_dir, 'all_samples')
+            summary_path = os.path.join(valid_dir, 'ks_statistics_summary.txt')
+
+            if args.skip_existing and os.path.exists(summary_path):
+                if n_repeats > 1:
+                    print(f"\nSkipping {label}n_gen={n_gen} repeat={repeat} (exists)")
+                else:
+                    print(f"\nSkipping {label}n_gen={n_gen} (exists)")
+                continue
+
+            seed = 42 + repeat
+            if n_repeats > 1:
+                print(f"\n{'='*50}")
+                print(f"{label}Evaluating n_gen_samples={n_gen} repeat={repeat}/{n_repeats} (seed={seed})")
+                print(f"{'='*50}")
+            else:
+                print(f"\n{'='*50}")
+                print(f"{label}Evaluating n_gen_samples={n_gen}")
+                print(f"{'='*50}")
+
+            evaluate_molecule_distributions(
+                real_symbols, real_positions,
+                gen_symbols, gen_positions,
+                output_dir=all_dir,
+                n_real_samples=None,
+                n_gen_samples=n_gen,
+                real_smiles=real_smiles,
+                fingerprint_type='rdkit',
+                random_seed=seed,
+                filter_invalid=False,
+                ks_only=True,
+                precomputed_real=precomputed_real_all,
+            )
+
+            evaluate_molecule_distributions(
+                real_symbols, real_positions,
+                gen_symbols, gen_positions,
+                output_dir=valid_dir,
+                n_real_samples=None,
+                n_gen_samples=n_gen,
+                real_smiles=real_smiles,
+                fingerprint_type='rdkit',
+                random_seed=seed,
+                filter_invalid=True,
+                ks_only=True,
+                precomputed_real=precomputed_real_valid,
+            )
+            print(f"   Saved to {output_dir}/")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Batch KS evaluation at multiple generated sample sizes (loads data once)',
     )
-    parser.add_argument('--generated', type=str, required=True,
-                        help='Path to samples.json')
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument('--generated', type=str,
+                     help='Path to samples.json')
+    src.add_argument('--folder', type=str,
+                     help='Root directory: recursively find .json files; each valid file is evaluated '
+                          'and results go under <same-dir>/<stem>/n_gen_<n>/valid_only|all_samples '
+                          '(stem = filename without .json). Invalid JSON files are skipped silently.')
     parser.add_argument('--n-gen-samples', type=int, nargs='+', required=True,
                         help='Generated sample sizes to evaluate (e.g. 1000 2500 5000 10000)')
     parser.add_argument('--n-real-samples', type=int, default=132008,
                         help='QM9 samples (default: 132008 = all)')
-    parser.add_argument('--comparison-output-template', type=str, default='results/eval-n-gen-{n_gen}',
-                        help='Output dir template. Use {n_gen} for size. With --n-repeats>1, /repeat-{i} is appended.')
     parser.add_argument('--n-repeats', type=int, default=1,
                         help='Number of independent subsamples per size (for stability analysis). '
                              'Each repeat uses a different random subsample. Default 1.')
@@ -63,13 +169,8 @@ def main():
     )
     print(f"   Loaded {len(real_symbols)} real molecules")
 
-    # 2. Load generated once
-    print("\n2. Loading generated molecules...")
-    gen_symbols, gen_positions = load_molecules_from_json(args.generated)
-    print(f"   Loaded {len(gen_symbols)} generated molecules")
-
-    # 3. Precompute real molecules data once (reused for all n_gen sizes)
-    print("\n3. Precomputing real molecules (fingerprints + properties)...")
+    # 2. Precompute real molecules data once (reused for all n_gen sizes)
+    print("\n2. Precomputing real molecules (fingerprints + properties)...")
     print("   [all_samples mode - no filtering]")
     real_props_all = compute_molecular_properties(real_symbols, real_positions, filter_invalid=False)
     real_fps_all, real_valid_all, real_stats_all = compute_molecular_fingerprints(
@@ -104,60 +205,49 @@ def main():
 
     n_repeats = max(1, args.n_repeats)
 
-    for n_gen in args.n_gen_samples:
-        for repeat in range(n_repeats):
-            base_dir = args.comparison_output_template.format(n_gen=n_gen)
-            output_dir = os.path.join(base_dir, f'repeat-{repeat}') if n_repeats > 1 else base_dir
-
-            valid_dir = os.path.join(output_dir, 'valid_only')
-            all_dir = os.path.join(output_dir, 'all_samples')
-            summary_path = os.path.join(valid_dir, 'ks_statistics_summary.txt')
-
-            if args.skip_existing and os.path.exists(summary_path):
-                if n_repeats > 1:
-                    print(f"\nSkipping n_gen={n_gen} repeat={repeat} (exists)")
-                else:
-                    print(f"\nSkipping n_gen={n_gen} (exists)")
+    if args.folder:
+        json_paths = list(iter_json_files(args.folder))
+        print(f"\n3. Folder mode: found {len(json_paths)} JSON file(s) under {args.folder!r}")
+        for json_path in json_paths:
+            loaded = try_load_valid_molecules_json(json_path)
+            if loaded is None:
                 continue
+            gen_symbols, gen_positions = loaded
+            json_dir = os.path.dirname(os.path.abspath(json_path))
+            json_stem = os.path.splitext(os.path.basename(json_path))[0]
+            rel = os.path.relpath(json_path, start=os.path.abspath(args.folder))
 
-            seed = 42 + repeat
-            if n_repeats > 1:
-                print(f"\n{'='*50}")
-                print(f"Evaluating n_gen_samples={n_gen} repeat={repeat}/{n_repeats} (seed={seed})")
-                print(f"{'='*50}")
-            else:
-                print(f"\n{'='*50}")
-                print(f"Evaluating n_gen_samples={n_gen}")
-                print(f"{'='*50}")
+            def get_eval_output_dir(n_gen: int, repeat: int, _jd=json_dir, _stem=json_stem) -> str:
+                return eval_output_dir_next_to_json(_jd, _stem, n_gen, repeat, n_repeats)
 
-            evaluate_molecule_distributions(
-                real_symbols, real_positions,
+            print(f"\n--- Valid: {rel} ({len(gen_symbols)} molecules) ---")
+            run_eval_loop(
+                args,
+                real_symbols, real_positions, real_smiles,
+                precomputed_real_all, precomputed_real_valid,
                 gen_symbols, gen_positions,
-                output_dir=all_dir,
-                n_real_samples=None,
-                n_gen_samples=n_gen,
-                real_smiles=real_smiles,
-                fingerprint_type='rdkit',
-                random_seed=seed,
-                filter_invalid=False,
-                ks_only=True,
-                precomputed_real=precomputed_real_all,
+                get_eval_output_dir,
+                label=f'[{rel}] ',
             )
+    else:
+        gen_stem = os.path.splitext(os.path.basename(args.generated))[0]
 
-            evaluate_molecule_distributions(
-                real_symbols, real_positions,
-                gen_symbols, gen_positions,
-                output_dir=valid_dir,
-                n_real_samples=None,
-                n_gen_samples=n_gen,
-                real_smiles=real_smiles,
-                fingerprint_type='rdkit',
-                random_seed=seed,
-                filter_invalid=True,
-                ks_only=True,
-                precomputed_real=precomputed_real_valid,
-            )
-            print(f"   Saved to {output_dir}/")
+        def get_eval_output_dir_single(n_gen: int, repeat: int) -> str:
+            source_dir = os.path.dirname(os.path.abspath(args.generated))
+            return eval_output_dir_next_to_json(source_dir, gen_stem, n_gen, repeat, n_repeats)
+
+        print("\n3. Loading generated molecules...")
+        gen_symbols, gen_positions = load_molecules_from_json(args.generated)
+        print(f"   Loaded {len(gen_symbols)} generated molecules")
+
+        run_eval_loop(
+            args,
+            real_symbols, real_positions, real_smiles,
+            precomputed_real_all, precomputed_real_valid,
+            gen_symbols, gen_positions,
+            get_eval_output_dir_single,
+            label='',
+        )
 
     print("\n" + "="*60)
     print("Done")
