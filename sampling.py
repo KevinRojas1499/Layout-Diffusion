@@ -66,9 +66,9 @@ def sampling(**opts):
     model = MMDiTQM9(
         euclidean_dim=3,
         vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=6,
-        positions_depth=6,
-        depth=6,
+        symbols_depth=8,
+        positions_depth=8,
+        depth=4,
         dim_modalities=[384, 384],
         dim_joint_attn=384,
         dim_conds=[384, 384]

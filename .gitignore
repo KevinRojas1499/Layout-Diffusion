@@ -13,3 +13,6 @@ results-grid-search/
 *.pdf
 ablation_qm9/
 outputs/
+qm9_sampling_grid*
+num_steps_ablation/
+runs/

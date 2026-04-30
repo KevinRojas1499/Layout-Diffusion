@@ -14,6 +14,7 @@ from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler, CombinedOptimizer
 from models.mmdit_qm9 import MMDiTQM9
+from models.transformer import Transformer
 from visualize_dataset import plot_sample, plot_molecule, plot_molecule_with_mask
 
 # This makes training on A100s faster
@@ -43,7 +44,7 @@ def update_ema(ema_model, model, decay=0.9999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 @click.command()
-@click.option('--model',type=click.Choice(['radd', 'DiT']), default='DiT')
+@click.option('--model',type=click.Choice(['radd', 'DiT', 'Transformer']), default='DiT')
 @click.option('--optimizer',type=click.Choice(['adam','adamw','muon']), default='adam')
 @click.option('--ema_beta',type=float, default=.9999)
 @click.option('--lr', type=float, default=1e-4)
@@ -93,16 +94,26 @@ def training(**opts):
     if wandb_enabled:
         init_wandb(opts)
     
-    model = MMDiTQM9(
-        euclidean_dim=3,
-        vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=6,
-        positions_depth=6,
-        depth=6,
-        dim_modalities=[384, 384],
-        dim_joint_attn=384,
-        dim_conds=[384, 384]
-    ).to(device)
+    if opts.model == 'Transformer':
+        model = Transformer(
+            euclidean_dim=3,
+            vocab_size=character_tokenizer.vocab_size,
+            dim=384,
+            depth=12,
+            num_heads=12,
+            head_dim=64,
+        ).to(device)
+    else:
+        model = MMDiTQM9(
+            euclidean_dim=3,
+            vocab_size=character_tokenizer.vocab_size,
+            symbols_depth=6,
+            positions_depth=6,
+            depth=6,
+            dim_modalities=[384, 384],
+            dim_joint_attn=384,
+            dim_conds=[384, 384]
+        ).to(device)
     ema = deepcopy(model)
     
     # TODO: Implement Muon optimizer
