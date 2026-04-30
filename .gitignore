@@ -16,3 +16,5 @@ outputs/
 qm9_sampling_grid*
 num_steps_ablation/
 runs/
+eval/cache/
+.claude/
