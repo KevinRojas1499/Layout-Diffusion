@@ -1,7 +1,8 @@
 """
 Batch evaluation of KS statistics at multiple generated sample sizes.
 
-Loads QM9 once. With --generated, loads one JSON and evaluates each n_gen size.
+Loads QM9 once unless a matching real-side cache exists (default path under eval/cache/;
+use --no-real-cache to always load QM9). With --generated, loads one JSON and evaluates each n_gen size.
 With --folder, walks for .json files and evaluates each valid file (invalid files skipped).
 Skips UMAP and plots. Much faster than running test_qm9_distribution.py
 multiple times.
@@ -12,12 +13,76 @@ size. Outputs go under <json_stem>/n_gen_<n>/repeat-<i>/ next to each JSON file
 """
 
 import argparse
+import gzip
 import io
 import json
 import os
+import pickle
 import sys
 from contextlib import redirect_stdout
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
+
+REAL_CACHE_VERSION = 1
+QM9_EXTRACT_SEED = 42
+QM9_MAX_LENGTH = 30
+FP_RADIUS = 2
+FP_BITS = 2048
+FP_TYPE = 'rdkit'
+
+DEFAULT_REAL_CACHE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'cache',
+    'qm9_real_ks_bundle.pkl.gz',
+)
+
+
+def _real_cache_meta(args) -> Dict[str, Any]:
+    return {
+        'version': REAL_CACHE_VERSION,
+        'n_real_samples_requested': int(args.n_real_samples),
+        'extract_seed': QM9_EXTRACT_SEED,
+        'qm9_max_length': QM9_MAX_LENGTH,
+        'fp_radius': FP_RADIUS,
+        'fp_bits': FP_BITS,
+        'fp_type': FP_TYPE,
+    }
+
+
+def _meta_matches(stored: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    for k, v in expected.items():
+        if stored.get(k) != v:
+            return False
+    return True
+
+
+def load_real_side_cache(path: str, meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        with gzip.open(path, 'rb') as f:
+            payload = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError, gzip.BadGzipFile):
+        return None
+    if not isinstance(payload, dict) or 'meta' not in payload or 'bundle' not in payload:
+        return None
+    if not _meta_matches(payload['meta'], meta):
+        return None
+    bundle = payload['bundle']
+    need = ('real_symbols', 'real_positions', 'real_smiles', 'precomputed_real_all', 'precomputed_real_valid')
+    if any(k not in bundle for k in need):
+        return None
+    if payload['meta'].get('n_molecules') != len(bundle['real_symbols']):
+        return None
+    return bundle
+
+
+def save_real_side_cache(path: str, meta: Dict[str, Any], bundle: Dict[str, Any]) -> None:
+    meta = {**meta, 'n_molecules': len(bundle['real_symbols'])}
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + '.tmp'
+    with gzip.open(tmp, 'wb', compresslevel=3) as f:
+        pickle.dump({'meta': meta, 'bundle': bundle}, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -153,55 +218,90 @@ def main():
                         help='Skip sizes where output exists')
     parser.add_argument('--no-skip-existing', action='store_false', dest='skip_existing',
                         help='Do not skip existing')
+    parser.add_argument('--real-cache', type=str, default=DEFAULT_REAL_CACHE, metavar='PATH',
+                        help='Path to a .pkl.gz: load QM9 real extract + precomputed fingerprints/properties '
+                             'if metadata matches; otherwise compute and save. Default: %(default)s')
+    parser.add_argument('--no-real-cache', action='store_true',
+                        help='Disable real-side cache (always load QM9 and precompute; do not read or write cache)')
     args = parser.parse_args()
+    if args.no_real_cache:
+        args.real_cache = None
 
     print("="*60)
     print("Batch KS evaluation (load once, evaluate multiple sizes)")
     print("="*60)
 
-    # 1. Load QM9 once
-    print("\n1. Loading QM9...")
-    tokenizer = VocabTokenizer(vocab={'H', 'C', 'N', 'O', 'F'})
-    dataset = QM9Dataset(tokenizer, max_length=30)
-    n_real = min(args.n_real_samples, len(dataset))
-    real_symbols, real_positions, real_smiles = extract_molecules_from_qm9_dataset(
-        dataset, n_samples=n_real, random_seed=42
-    )
-    print(f"   Loaded {len(real_symbols)} real molecules")
+    cache_meta = _real_cache_meta(args)
+    bundle_from_cache = None
+    if args.real_cache:
+        print(f"\n0. Real-side cache: {args.real_cache!r}")
+        bundle_from_cache = load_real_side_cache(args.real_cache, cache_meta)
+        if bundle_from_cache is not None:
+            print("   Loaded valid cache; skipping QM9 load and real precompute.")
+        else:
+            print("   No valid cache (missing or stale); will compute and write.")
 
-    # 2. Precompute real molecules data once (reused for all n_gen sizes)
-    print("\n2. Precomputing real molecules (fingerprints + properties)...")
-    print("   [all_samples mode - no filtering]")
-    real_props_all = compute_molecular_properties(real_symbols, real_positions, filter_invalid=False)
-    real_fps_all, real_valid_all, real_stats_all = compute_molecular_fingerprints(
-        real_symbols, real_positions,
-        radius=2, n_bits=2048,
-        fingerprint_type='rdkit',
-        filter_invalid=False,
-        return_stats=True
-    )
-    precomputed_real_all = {
-        'properties': real_props_all,
-        'fps': real_fps_all,
-        'valid': real_valid_all,
-        'fp_stats': real_stats_all,
-    }
-    print("   [valid_only mode - filter invalid]")
-    real_props_valid = compute_molecular_properties(real_symbols, real_positions, filter_invalid=True)
-    real_fps_valid, real_valid_valid, real_stats_valid = compute_molecular_fingerprints(
-        real_symbols, real_positions,
-        radius=2, n_bits=2048,
-        fingerprint_type='rdkit',
-        filter_invalid=True,
-        return_stats=True
-    )
-    precomputed_real_valid = {
-        'properties': real_props_valid,
-        'fps': real_fps_valid,
-        'valid': real_valid_valid,
-        'fp_stats': real_stats_valid,
-    }
-    print("   Done. Real data will be reused for all n_gen sizes.")
+    if bundle_from_cache is not None:
+        real_symbols = bundle_from_cache['real_symbols']
+        real_positions = bundle_from_cache['real_positions']
+        real_smiles = bundle_from_cache['real_smiles']
+        precomputed_real_all = bundle_from_cache['precomputed_real_all']
+        precomputed_real_valid = bundle_from_cache['precomputed_real_valid']
+    else:
+        # 1. Load QM9 once
+        print("\n1. Loading QM9...")
+        tokenizer = VocabTokenizer(vocab={'H', 'C', 'N', 'O', 'F'})
+        dataset = QM9Dataset(tokenizer, max_length=QM9_MAX_LENGTH)
+        n_real = min(args.n_real_samples, len(dataset))
+        real_symbols, real_positions, real_smiles = extract_molecules_from_qm9_dataset(
+            dataset, n_samples=n_real, random_seed=QM9_EXTRACT_SEED
+        )
+        print(f"   Loaded {len(real_symbols)} real molecules")
+
+        # 2. Precompute real molecules data once (reused for all n_gen sizes)
+        print("\n2. Precomputing real molecules (fingerprints + properties)...")
+        print("   [all_samples mode - no filtering]")
+        real_props_all = compute_molecular_properties(real_symbols, real_positions, filter_invalid=False)
+        real_fps_all, real_valid_all, real_stats_all = compute_molecular_fingerprints(
+            real_symbols, real_positions,
+            radius=FP_RADIUS, n_bits=FP_BITS,
+            fingerprint_type=FP_TYPE,
+            filter_invalid=False,
+            return_stats=True
+        )
+        precomputed_real_all = {
+            'properties': real_props_all,
+            'fps': real_fps_all,
+            'valid': real_valid_all,
+            'fp_stats': real_stats_all,
+        }
+        print("   [valid_only mode - filter invalid]")
+        real_props_valid = compute_molecular_properties(real_symbols, real_positions, filter_invalid=True)
+        real_fps_valid, real_valid_valid, real_stats_valid = compute_molecular_fingerprints(
+            real_symbols, real_positions,
+            radius=FP_RADIUS, n_bits=FP_BITS,
+            fingerprint_type=FP_TYPE,
+            filter_invalid=True,
+            return_stats=True
+        )
+        precomputed_real_valid = {
+            'properties': real_props_valid,
+            'fps': real_fps_valid,
+            'valid': real_valid_valid,
+            'fp_stats': real_stats_valid,
+        }
+        print("   Done. Real data will be reused for all n_gen sizes.")
+
+        if args.real_cache:
+            save_bundle = {
+                'real_symbols': real_symbols,
+                'real_positions': real_positions,
+                'real_smiles': real_smiles,
+                'precomputed_real_all': precomputed_real_all,
+                'precomputed_real_valid': precomputed_real_valid,
+            }
+            save_real_side_cache(args.real_cache, cache_meta, save_bundle)
+            print(f"   Saved real-side cache to {args.real_cache}")
 
     n_repeats = max(1, args.n_repeats)
 

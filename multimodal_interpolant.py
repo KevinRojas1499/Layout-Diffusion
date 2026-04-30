@@ -219,7 +219,7 @@ class MultimodalInterpolant():
             st_expanded = st.view(*index_shape).expand_as(xt)
             return torch.gather(xt, 1, st_expanded)
 
-    def compute_loss(self, model, batch):
+    def compute_loss(self, model, batch, extra_loss_fn=None):
         _x1 = batch["x"]
         _y1 = batch["y"]
         _mask_1 = batch["mask"]
@@ -238,7 +238,7 @@ class MultimodalInterpolant():
         mask_t_shaped = interpolant_sample.mask_t.unsqueeze(-1)
 
         masked_positions = (interpolant_sample.yt == self.mask_token)
-        
+
         # Euclidean loss
         # We must only compute the loss for positions that are:
         # not deleted: mask_t_shaped
@@ -267,13 +267,18 @@ class MultimodalInterpolant():
         euclidean_loss = euclidean_loss.sum(dim=-1)[masked_positions]
         euclidean_loss = euclidean_loss.mean() / x1.shape[-1]
 
-
-        return {
+        losses = {
             "dsm_loss": dsm_loss,
             "discrete_unmasking_loss": tokens_loss,
             "euclidean_unmasking_loss": euclidean_loss,
             "insertion_loss": insertion_loss,
         }
+
+        if extra_loss_fn is not None:
+            extra = extra_loss_fn(prediction, interpolant_sample, x1, y1)
+            losses.update(extra)
+
+        return losses
     
     def get_drift(self, prediction: MultimodalModelPrediction, xt: Tensor, t: Tensor) -> Tensor:
         clean_data = prediction.clean_data 

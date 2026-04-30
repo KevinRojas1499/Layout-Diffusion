@@ -55,11 +55,9 @@ def _eval_implicit_numbers_expr(
                 raise ValueError("Unmatched '('.")
             i += 1
             return value
-        if i < len(symbols) and symbols[i] in {"+", "-"}:
-            op = symbols[i]
-            i += 1
-            val = parse_factor()
-            return val if op == "+" else -val
+        # The data format embeds the first term's sign in the number value.
+        # Binary +/- between terms are consumed by parse_expr's while loop.
+        # Never treat +/- as unary here.
         return next_number()
 
     def parse_term() -> float:

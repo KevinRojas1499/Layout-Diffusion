@@ -21,6 +21,85 @@ from evaluate_equations_parenthesis import parse_equation
 from multimodal_interpolant_both_var import MultimodalInterpolantBoth
 
 
+def _fill_equation_coefficients(sym_ids, coeffs_row, idx_to_atom, pad_id, bos_id):
+    """Fill per-number-slot coefficients for the L-R=0 constraint (in-place).
+
+    The data format: first term's sign is embedded in the number value; subsequent
+    terms' signs come from the binary +/- operators in the symbol sequence (parens
+    are structural only and do not affect sign assignment).
+    """
+    syms = []
+    for tid in sym_ids:
+        tid = int(tid)
+        if tid in (pad_id, bos_id):
+            continue
+        tok = idx_to_atom.get(tid)
+        if tok is None:
+            continue
+        syms.append(tok)
+
+    eq_idx = None
+    dot_idx = None
+    for i, tok in enumerate(syms):
+        if tok == '=' and eq_idx is None:
+            eq_idx = i
+        if tok == '.':
+            dot_idx = i
+            break
+
+    if eq_idx is None:
+        return
+
+    end_idx = dot_idx if dot_idx is not None else len(syms)
+    left_ops = [t for t in syms[:eq_idx] if t in ('+', '-')]
+    right_ops = [t for t in syms[eq_idx + 1:end_idx] if t in ('+', '-')]
+
+    L = len(coeffs_row)
+    # Left side: position 1 = first number (sign embedded → coeff +1),
+    #            positions 2..n_left = subsequent numbers (coeff from operator)
+    if 1 < L:
+        coeffs_row[1] = 1.0
+    for i, op in enumerate(left_ops):
+        pos = 2 + i
+        if pos < L:
+            coeffs_row[pos] = 1.0 if op == '+' else -1.0
+
+    # Right side: negated for L - R = 0
+    n_left = 1 + len(left_ops)
+    rs = 1 + n_left  # right-side start position
+    if rs < L:
+        coeffs_row[rs] = -1.0
+    for i, op in enumerate(right_ops):
+        pos = rs + 1 + i
+        if pos < L:
+            coeffs_row[pos] = -1.0 if op == '+' else 1.0
+
+
+def compute_constraint_coefficients_batch(y1, idx_to_atom, pad_id, bos_id):
+    """Return [batch, seq_len] float tensor of per-number-slot coefficients."""
+    B, L = y1.shape
+    coeffs = torch.zeros(B, L, dtype=torch.float32, device=y1.device)
+    y1_cpu = y1.cpu().tolist()
+    for b in range(B):
+        _fill_equation_coefficients(y1_cpu[b], coeffs[b], idx_to_atom, pad_id, bos_id)
+    return coeffs
+
+
+def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id):
+    """Return a callback suitable for MultimodalInterpolant.compute_loss(extra_loss_fn=...)."""
+    def constraint_fn(prediction, interpolant_sample, x1, y1):
+        coeffs = compute_constraint_coefficients_batch(y1, idx_to_atom, pad_id, bos_id)
+        # Un-reorder model's x0 prediction back to original token order
+        inv_st = interpolant_sample.st.argsort(dim=1)
+        x0_orig = prediction.clean_data.gather(
+            1, inv_st.unsqueeze(-1).expand_as(prediction.clean_data)
+        )  # [B, L, D]
+        # constraint: sum_j(coeff_j * x0_pred_j) == 0  →  minimise squared residual
+        residual = (coeffs * x0_orig.squeeze(-1)).sum(dim=1)  # [B]
+        return {"constraint_loss": residual.pow(2).mean()}
+    return constraint_fn
+
+
 def init_wandb(opts):
     wandb.init(
         project='MMDiT-Toy',
@@ -37,8 +116,11 @@ def update_ema(ema_model, model, decay=0.9999):
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
-def evaluate_samples(samples, character_tokenizer, euclidean_dim=1, delta=1.0):
-    """Compute accuracy metrics on a SamplingResult batch."""
+def evaluate_samples(samples, character_tokenizer, euclidean_dim=1, delta=0.5, num_scale=1.0):
+    """Compute accuracy metrics on a SamplingResult batch.
+
+    num_scale: multiply generated positions by this before evaluating (reverses training normalization).
+    """
     n = samples.xt.shape[0]
     valid = 0
     correct = 0
@@ -48,7 +130,7 @@ def evaluate_samples(samples, character_tokenizer, euclidean_dim=1, delta=1.0):
     for i in range(n):
         symbols_str = character_tokenizer.decode(samples.yt[i].cpu())
         symbols = list(symbols_str)
-        positions = samples.xt[i].cpu()[1:len(symbols) + 1, :]
+        positions = samples.xt[i].cpu()[1:len(symbols) + 1, :] * num_scale
         numbers = positions.squeeze(-1).tolist() if euclidean_dim == 1 else positions.tolist()
 
         try:
@@ -74,13 +156,13 @@ def evaluate_samples(samples, character_tokenizer, euclidean_dim=1, delta=1.0):
     }
 
 
-def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1):
+def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1, num_scale=1.0):
     """Write generated samples to a JSONL file compatible with evaluate_equations_parenthesis.py."""
     with open(path, 'w') as f:
         for i in range(samples.xt.shape[0]):
             symbols_str = character_tokenizer.decode(samples.yt[i].cpu())
             symbols = list(symbols_str)
-            positions = samples.xt[i].cpu()[1:len(symbols) + 1, :]
+            positions = samples.xt[i].cpu()[1:len(symbols) + 1, :] * num_scale
             numbers = positions.squeeze(-1).tolist() if euclidean_dim == 1 else positions.tolist()
             f.write(json.dumps({'symbols': symbols, 'numbers': numbers, 'length': len(symbols)}) + '\n')
 
@@ -98,12 +180,21 @@ def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1):
 @click.option('--num_workers', type=int, default=2)
 @click.option('--seed', type=int, default=42)
 @click.option('--dir', type=str)
-@click.option('--load_checkpoint', type=str, help='Path to a snapshot.pt to resume from')
+@click.option('--load_checkpoint', type=str, help='Path to a snapshot.pt to resume from (restores model+optimizer+scheduler)')
+@click.option('--finetune_checkpoint', type=str, default=None,
+              help='Load model weights only from this snapshot (fresh optimizer/scheduler — for curriculum learning)')
 @click.option('--enable_wandb', is_flag=True, default=False)
 @click.option('--run_name', type=str, default='')
 @click.option('--eval_samples', type=int, default=200, help='Number of samples to generate for evaluation')
 @click.option('--eval_steps', type=int, default=20, help='Number of diffusion steps for evaluation sampling')
 @click.option('--eval_delta', type=float, default=0.5, help='Absolute-error tolerance for counting a sample correct')
+@click.option('--lr_schedule', type=click.Choice(['warmup_only', 'cosine']), default='warmup_only',
+              help='LR schedule: warmup_only keeps LR constant after warmup; cosine decays to lr_min after warmup')
+@click.option('--lr_min', type=float, default=1e-6, help='Minimum LR for cosine schedule')
+@click.option('--num_scale', type=float, default=1.0,
+              help='Divide training numbers by this factor (e.g. 5.0 for l5 data) and multiply back at eval')
+@click.option('--constraint_weight', type=float, default=0.0,
+              help='Weight for differentiable equation-balance constraint loss (L-R)^2. 0 disables it.')
 def training(**opts):
     opts = dotdict(opts)
     torch.manual_seed(opts.seed)
@@ -146,7 +237,18 @@ def training(**opts):
     ema = deepcopy(model)
 
     opt = torch.optim.AdamW(model.parameters(), lr=opts.lr)
-    scheduler = WarmUpScheduler(opt, opts.warmup_iters)
+    if opts.lr_schedule == 'cosine':
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1e-8, end_factor=1.0, total_iters=opts.warmup_iters
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=opts.num_iters - opts.warmup_iters, eta_min=opts.lr_min
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            opt, schedulers=[warmup, cosine], milestones=[opts.warmup_iters]
+        )
+    else:
+        scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler()
 
     if opts.interpolant == 'multimodal':
@@ -187,6 +289,20 @@ def training(**opts):
     start_iter = 0
     if opts.load_checkpoint is not None:
         start_iter = load_checkpoint(opts, device, model, ema, opt, scheduler)
+    elif opts.finetune_checkpoint is not None:
+        snap = torch.load(opts.finetune_checkpoint, weights_only=True, map_location=device)
+        model.load_state_dict(snap['model'], strict=False)
+        ema.load_state_dict(snap['ema'], strict=False)
+        print(f'Loaded weights from {opts.finetune_checkpoint} (fresh optimizer)')
+
+    constraint_fn = None
+    if opts.constraint_weight > 0 and opts.interpolant in ('multimodal', 'autoregressive'):
+        constraint_fn = make_constraint_loss_fn(
+            character_tokenizer.idx_to_atom,
+            character_tokenizer.pad_token_id,
+            character_tokenizer.bos_token_id,
+        )
+        print(f'Constraint loss enabled with weight={opts.constraint_weight}')
 
     model.train()
     os.makedirs(opts.dir, exist_ok=True)
@@ -201,13 +317,17 @@ def training(**opts):
 
             for key, value in data_.items():
                 data_[key] = value.to(device=device)
+            if opts.num_scale != 1.0:
+                data_['x'] = data_['x'] / opts.num_scale
 
             opt.zero_grad()
-            losses = interpolant.compute_loss(model, data_)
+            losses = interpolant.compute_loss(model, data_, extra_loss_fn=constraint_fn)
 
             if opts.interpolant in ('multimodal', 'autoregressive'):
                 loss = (losses["dsm_loss"] + losses["discrete_unmasking_loss"]
                         + losses["euclidean_unmasking_loss"] + losses["insertion_loss"])
+                if constraint_fn is not None:
+                    loss = loss + opts.constraint_weight * losses["constraint_loss"]
             elif opts.interpolant == 'multimodal_both':
                 loss = (losses["dsm_loss"] + losses["discrete_unmasking_loss"]
                         + losses["euc_insertion_loss"] + losses["disc_insertion_loss"])
@@ -230,13 +350,16 @@ def training(**opts):
             loss_val = loss.detach().item()
 
             if opts.interpolant in ('multimodal', 'autoregressive'):
-                pbar.set_description(
+                desc = (
                     f'Iter {training_iter} --- '
                     f'DSM: {losses["dsm_loss"]:.4f}  '
                     f'Disc: {losses["discrete_unmasking_loss"]:.4f}  '
                     f'EucUnmask: {losses["euclidean_unmasking_loss"]:.4f}  '
                     f'Ins: {losses["insertion_loss"]:.4f}'
                 )
+                if constraint_fn is not None:
+                    desc += f'  Cstr: {losses["constraint_loss"]:.4f}'
+                pbar.set_description(desc)
             elif opts.interpolant == 'multimodal_both':
                 pbar.set_description(
                     f'Iter {training_iter} --- '
@@ -263,10 +386,12 @@ def training(**opts):
                 os.makedirs(ckpt_path, exist_ok=True)
                 save_ckpt(model, ema, opt, scheduler, os.path.join(ckpt_path, 'snapshot.pt'))
 
-                model.eval()
+                # Use EMA for evaluation — EMA tracks the smoothed model and gives
+                # better sample quality, but only once ema_beta^n_iters ≈ 0.
+                ema.eval()
                 with torch.no_grad():
                     samples = interpolant.sampling(
-                        model, opts.eval_steps, opts.eval_samples,
+                        ema, opts.eval_steps, opts.eval_samples,
                         dataset.max_length, device, return_trace=False,
                     )
 
@@ -275,6 +400,7 @@ def training(**opts):
                     samples, character_tokenizer,
                     os.path.join(ckpt_path, 'samples.jsonl'),
                     euclidean_dim=euclidean_dim,
+                    num_scale=opts.num_scale,
                 )
 
                 # Evaluate accuracy
@@ -282,6 +408,7 @@ def training(**opts):
                     samples, character_tokenizer,
                     euclidean_dim=euclidean_dim,
                     delta=opts.eval_delta,
+                    num_scale=opts.num_scale,
                 )
                 metrics['iteration'] = training_iter
 
@@ -307,6 +434,7 @@ def training(**opts):
                     })
 
                 model.train()
+                ema.train()
 
     save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
 
@@ -320,7 +448,9 @@ def load_checkpoint(opts, device, model, ema, opt, scheduler):
     ema.load_state_dict(snapshot['ema'], strict=False)
     opt.load_state_dict(snapshot['optimizer'])
     scheduler.load_state_dict(snapshot['scheduler'])
-    return scheduler.last_epoch
+    # SequentialLR stores last_epoch on each sub-scheduler; WarmUpScheduler stores it directly.
+    last = snapshot['scheduler'].get('last_epoch', None)
+    return last if last is not None else scheduler.last_epoch
 
 
 def save_ckpt(model, ema, opt, scheduler, path):
