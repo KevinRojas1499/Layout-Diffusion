@@ -11,6 +11,7 @@ from custom_datasets.qm9 import QM9Dataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from models.mmdit_qm9 import MMDiTQM9
+from models.transformer import Transformer
 from visualize_dataset import plot_sample, plot_molecule, plot_molecule_with_mask, compute_axis_limits
 
 import json
@@ -39,6 +40,7 @@ class CustomJSONEncoder(JSONEncoder):
 @click.option('--load_checkpoint',type=str, help='Directory where we can find the desired checkpoints')
 @click.option('--enable_plotting', is_flag=True, default=False)
 @click.option('--use_ema', is_flag=True, default=False)
+@click.option('--model', type=click.Choice(['radd', 'DiT', 'Transformer']), default='DiT')
 def sampling(**opts):
     opts = dotdict(opts)
     batch_size = opts.batch_size
@@ -63,16 +65,26 @@ def sampling(**opts):
     print('--------------------------------')
     dataset = QM9Dataset(character_tokenizer)
     
-    model = MMDiTQM9(
-        euclidean_dim=3,
-        vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=8,
-        positions_depth=8,
-        depth=4,
-        dim_modalities=[384, 384],
-        dim_joint_attn=384,
-        dim_conds=[384, 384]
-    ).to(device)
+    if opts.model == 'Transformer':
+        model = Transformer(
+            euclidean_dim=3,
+            vocab_size=character_tokenizer.vocab_size,
+            dim=384,
+            depth=12,
+            num_heads=12,
+            head_dim=64,
+        ).to(device)
+    else:
+        model = MMDiTQM9(
+            euclidean_dim=3,
+            vocab_size=character_tokenizer.vocab_size,
+            symbols_depth=6,
+            positions_depth=6,
+            depth=6,
+            dim_modalities=[384, 384],
+            dim_joint_attn=384,
+            dim_conds=[384, 384]
+        ).to(device)
     model = load_checkpoint(opts, rank, device, model, opts.use_ema)
     
     interpolant = MultimodalInterpolant(
