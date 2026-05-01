@@ -85,8 +85,24 @@ def compute_constraint_coefficients_batch(y1, idx_to_atom, pad_id, bos_id):
     return coeffs
 
 
-def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id):
-    """Return a callback suitable for MultimodalInterpolant.compute_loss(extra_loss_fn=...)."""
+def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_hinge=False,
+                            use_normalized=False, threshold_getter=None, normalized_scale_target=1.0,
+                            use_proxy=False, scale_hinge_target=0.0):
+    """Return a callback suitable for MultimodalInterpolant.compute_loss(extra_loss_fn=...).
+
+    use_hinge: replace squared residual with max(0, |L-R|-threshold)^2. threshold is fixed at 0.5
+        unless threshold_getter is provided (see below).
+    threshold_getter: callable () -> float that returns the current hinge threshold. Used for
+        curriculum training: start with a loose threshold (e.g. 2.0) and tighten to 0.5 over time.
+        Implies use_hinge=True.
+    normalized_scale_target: minimum value for the active_scale clamp in use_normalized mode.
+    scale_weight: weight for scale_hinge_loss when scale_hinge_target > 0.
+    scale_hinge_target: if > 0, add scale_weight * max(0, S - mean|x_active|)^2 to oppose scale
+        shrinkage. Unlike the old reward (-mean|x|), the hinge is bounded: gradient is zero when
+        mean|x_active| >= S, preventing runaway. Equilibrium is at mean|x_active| = S.
+    use_normalized: divide residual by sum of |x| at active (non-pad) positions — makes loss
+        scale-invariant so the trivial x=0 solution has no gradient advantage.
+    """
     def constraint_fn(prediction, interpolant_sample, x1, y1):
         coeffs = compute_constraint_coefficients_batch(y1, idx_to_atom, pad_id, bos_id)
         # Un-reorder model's x0 prediction back to original token order
@@ -94,9 +110,32 @@ def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id):
         x0_orig = prediction.clean_data.gather(
             1, inv_st.unsqueeze(-1).expand_as(prediction.clean_data)
         )  # [B, L, D]
-        # constraint: sum_j(coeff_j * x0_pred_j) == 0  →  minimise squared residual
         residual = (coeffs * x0_orig.squeeze(-1)).sum(dim=1)  # [B]
-        return {"constraint_loss": residual.pow(2).mean()}
+        active_mask = (coeffs.abs() > 0.5).float()  # [B, L] — number positions only
+        if use_normalized:
+            active_scale = (x0_orig.squeeze(-1).abs() * active_mask).sum(dim=1)  # [B]
+            scale = active_scale.clamp(min=normalized_scale_target)
+            balance_loss = (residual / scale).pow(2).mean()
+        elif use_proxy:
+            # Proxy constraint: detach residual to remove x_i self-coupling.
+            # gradient = residual_detached * coeff_i (no x_i² term → no pull toward zero).
+            balance_loss = (residual.detach() * residual).mean()
+        elif threshold_getter is not None or use_hinge:
+            threshold = threshold_getter() if threshold_getter is not None else 0.5
+            balance_loss = torch.clamp(residual.abs() - threshold, min=0.0).pow(2).mean()
+        else:
+            balance_loss = residual.pow(2).mean()
+        if scale_hinge_target > 0.0 and scale_weight > 0.0:
+            # Scale hinge: penalize mean|x_active| below target. Zero gradient above target → no runaway.
+            # Equilibrium: constraint balances equations while scale hinge keeps magnitudes near target.
+            num_active = active_mask.sum(dim=1).clamp(min=1.0)  # [B]
+            active_mean_abs = (x0_orig.squeeze(-1).abs() * active_mask).sum(dim=1) / num_active  # [B]
+            scale_hinge = torch.clamp(scale_hinge_target - active_mean_abs, min=0.0).pow(2).mean()
+            balance_loss = balance_loss + scale_weight * scale_hinge
+        elif scale_weight > 0.0 and not use_normalized:
+            # Legacy: direct reward (unbounded — prefer scale_hinge_target instead)
+            balance_loss = balance_loss - scale_weight * x0_orig.squeeze(-1).abs().mean()
+        return {"constraint_loss": balance_loss}
     return constraint_fn
 
 
@@ -195,6 +234,24 @@ def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1, num_
               help='Divide training numbers by this factor (e.g. 5.0 for l5 data) and multiply back at eval')
 @click.option('--constraint_weight', type=float, default=0.0,
               help='Weight for differentiable equation-balance constraint loss (L-R)^2. 0 disables it.')
+@click.option('--scale_weight', type=float, default=0.0,
+              help='Weight for scale-reward term: subtracts scale_weight * mean(|x_i|) from constraint loss to oppose scale shrinkage.')
+@click.option('--use_hinge', is_flag=True, default=False,
+              help='Use hinge constraint max(0,|L-R|-0.5)^2 instead of squared residual.')
+@click.option('--use_normalized', is_flag=True, default=False,
+              help='Divide residual by sum(|x| at active positions) — scale-invariant constraint that avoids x=0 bias.')
+@click.option('--normalized_scale_target', type=float, default=1.0,
+              help='Soft-cap floor for the active_scale denominator in --use_normalized mode. Set to ~15 for l5 anchoring. Use constraint_weight = base_w * target^2 (e.g. target=15 -> weight=450 for base 2.0).')
+@click.option('--use_proxy', is_flag=True, default=False,
+              help='Proxy constraint: detach residual in one factor to remove x_i self-coupling (scale shrinkage). Gradient = residual_sg*coeff_i instead of 2*residual*coeff_i. Use constraint_weight*=2 to compensate for halved gradient.')
+@click.option('--scale_hinge_target', type=float, default=0.0,
+              help='Scale hinge target S: adds scale_weight * max(0, S - mean|x_active|)^2 to constraint loss. Zero gradient above S prevents runaway. Use scale_weight to control the hinge strength.')
+@click.option('--hinge_threshold_start', type=float, default=0.5,
+              help='Starting hinge threshold for curriculum training (e.g. 2.0). Decays linearly to 0.5 over hinge_curriculum_iters.')
+@click.option('--hinge_curriculum_iters', type=int, default=0,
+              help='Iters over which hinge threshold decays from hinge_threshold_start to 0.5. 0 = no curriculum (fixed threshold).')
+@click.option('--depth', type=int, default=4, help='Number of joint attention blocks in MMDiTQM9')
+@click.option('--hidden_dim', type=int, default=256, help='Embedding dim for symbols and positions')
 def training(**opts):
     opts = dotdict(opts)
     torch.manual_seed(opts.seed)
@@ -204,7 +261,7 @@ def training(**opts):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     euclidean_dim = 1
-    hidden_dim = 256
+    hidden_dim = opts.hidden_dim
     character_tokenizer = VocabTokenizer(vocab={'+', '-', '*', '=', '.', '(', ')'})
     dataset = ParenthesizedEquationsDataset(character_tokenizer, data_path=opts.data_path)
 
@@ -227,9 +284,9 @@ def training(**opts):
         autoregressive=opts.interpolant == 'autoregressive',
         euclidean_dim=euclidean_dim,
         vocab_size=character_tokenizer.vocab_size,
-        symbols_depth=4,
-        positions_depth=4,
-        depth=4,
+        symbols_depth=opts.depth,
+        positions_depth=opts.depth,
+        depth=opts.depth,
         dim_modalities=[hidden_dim, hidden_dim],
         dim_joint_attn=hidden_dim,
         dim_conds=[hidden_dim, hidden_dim],
@@ -297,12 +354,25 @@ def training(**opts):
 
     constraint_fn = None
     if opts.constraint_weight > 0 and opts.interpolant in ('multimodal', 'autoregressive'):
+        threshold_getter = None
+        if opts.hinge_threshold_start > 0.5 and opts.hinge_curriculum_iters > 0:
+            # Mutable state for curriculum threshold; updated in the training loop below
+            _threshold = [float(opts.hinge_threshold_start)]
+            threshold_getter = lambda: _threshold[0]
+            print(f'Hinge curriculum: threshold {opts.hinge_threshold_start} → 0.5 over {opts.hinge_curriculum_iters} iters')
         constraint_fn = make_constraint_loss_fn(
             character_tokenizer.idx_to_atom,
             character_tokenizer.pad_token_id,
             character_tokenizer.bos_token_id,
+            scale_weight=opts.scale_weight,
+            use_hinge=opts.use_hinge,
+            use_normalized=opts.use_normalized,
+            threshold_getter=threshold_getter,
+            normalized_scale_target=opts.normalized_scale_target,
+            use_proxy=opts.use_proxy,
+            scale_hinge_target=opts.scale_hinge_target,
         )
-        print(f'Constraint loss enabled with weight={opts.constraint_weight}')
+        print(f'Constraint loss enabled: weight={opts.constraint_weight}, use_hinge={opts.use_hinge}, use_normalized={opts.use_normalized}, use_proxy={opts.use_proxy}, scale_hinge_target={opts.scale_hinge_target}')
 
     model.train()
     os.makedirs(opts.dir, exist_ok=True)
@@ -319,6 +389,11 @@ def training(**opts):
                 data_[key] = value.to(device=device)
             if opts.num_scale != 1.0:
                 data_['x'] = data_['x'] / opts.num_scale
+
+            # Update curriculum hinge threshold if applicable
+            if threshold_getter is not None:
+                progress = min(1.0, training_iter / opts.hinge_curriculum_iters)
+                _threshold[0] = opts.hinge_threshold_start - progress * (opts.hinge_threshold_start - 0.5)
 
             opt.zero_grad()
             losses = interpolant.compute_loss(model, data_, extra_loss_fn=constraint_fn)
