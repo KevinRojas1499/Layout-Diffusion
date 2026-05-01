@@ -228,9 +228,20 @@ Start with threshold = 2.0 (loose: `max(0, |L-R| - 2.0)²`) and tighten it gradu
 
 **Schedule:** threshold = max(0.5, 2.0 - 1.5 * iter/5000). Implement via `threshold_getter` callable in `make_constraint_loss_fn` (already supported in the code).
 
-### 4. Separate numeric prediction head
+### 4. Separate numeric prediction head — TRIED AND FAILED (2026-05)
 
-Add a small 2-layer MLP "constraint head" that takes final per-position embeddings and predicts constraint-adjusted numbers. The constraint loss trains only this head; the backbone is trained only by DSM. This separates the competing objectives architecturally, reducing DSM-constraint oscillation.
+Implemented as `ConstraintHead` (3→64→64→1 MLP) + `HeadWrappedModel` (applies head correction at each denoising step). Backbone trains only on DSM (x0_orig detached before head); head trains only on constraint loss (`(sum coeff_i*(x_i+delta_i))²`).
+
+**Results (depth8-constraint-head, 5k iters from depth8-baseline):**
+
+| Checkpoint | Mode | Steps | Accuracy | MAE | Scale avg_max |
+|---|---|---|---|---|---|
+| itr_4500 | Backbone only | 400 | 18.1% | 2.187 | **2.902** |
+| itr_4500 | Per-step head | 400 | 44.7% | 0.829 | 1.127 |
+| itr_5000 | Backbone only | 400 | 15.6% | 2.180 | **2.890** |
+| itr_5000 | Per-step head | 400 | **50.3%** | 0.768 | 1.032 |
+
+**Why it failed:** The head is trained to minimize `(sum coeff_i*(x_i+delta_i))²`, which has the same global minimum at x=0 as the main constraint. Backbone scale IS preserved (~2.90) but the head, applied 400× during inference, collapses scale from 2.9 → 1.03 — worse than standard w=2.0 (~1.3). Best accuracy 50.3%, 30pp below the 80.5% baseline. The head learns to satisfy the constraint by reducing magnitudes, compounding across 400 correction steps.
 
 ### 5. Two-optimizer setup
 
@@ -267,5 +278,6 @@ Check avg_max_abs in generated samples every 1000 iters. If scale stays below 1.
 | depth8-scale-hinge-sw005/itr_500 | 52.5% | 70.4% | — | 0.563 | 1.895 | sw=0.05: -10.1pp accuracy for +0.6 scale; better Pareto than hinge |
 | depth8-balance-hinge/itr_2500 | 43.8% | 63.8% | 89.4% | 0.586 | 1.757 | Dominated by sw=0.05 |
 | depth8-l1l5-w2-phase2/itr_1000 | 57.0% | 85.6% | 88.6% | 0.295 | ~0.44 | Inflated (l1 scale artifact) |
+| depth8-constraint-head/itr_5000 | 23.1% (head) | 50.3% (head) | 91.0% | 0.768 | **2.89** backbone / 1.03 head-corrected | FAILED: backbone scale excellent but head collapses it; 30pp below baseline |
 
 All checkpoints are under `runs/parenthesis/`.

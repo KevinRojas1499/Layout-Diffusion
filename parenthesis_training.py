@@ -1,5 +1,6 @@
 import json
 import os
+import types
 import click
 import numpy as np
 import torch
@@ -85,9 +86,59 @@ def compute_constraint_coefficients_batch(y1, idx_to_atom, pad_id, bos_id):
     return coeffs
 
 
+class ConstraintHead(torch.nn.Module):
+    """Per-position balance-correction MLP.
+
+    Takes (x_i, coeff_i, global_residual) per position and predicts delta_i.
+    Trained by the constraint loss on (x_backbone.detach() + delta), so it
+    learns to distribute the residual without affecting backbone scale.
+    At inference: corrected_x = backbone_x + head(backbone_x, coeffs).
+    """
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(3, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x0, coeffs):
+        """x0: [B, L, 1], coeffs: [B, L] → delta: [B, L, 1]"""
+        residual = (coeffs * x0.squeeze(-1)).sum(dim=1, keepdim=True)  # [B, 1]
+        res_bc = residual.unsqueeze(1).expand(-1, x0.size(1), 1)       # [B, L, 1]
+        inp = torch.cat([x0, coeffs.unsqueeze(-1), res_bc], dim=-1)    # [B, L, 3]
+        return self.net(inp)                                             # [B, L, 1]
+
+
+class HeadWrappedModel(torch.nn.Module):
+    """Wraps backbone + ConstraintHead for per-step inference correction.
+
+    At each denoising step, the backbone's x0 prediction is corrected by the head
+    before being used to compute xt-1. This matches the training distribution (where
+    the head corrects x0_pred at each training timestep) to the inference distribution.
+    """
+    def __init__(self, backbone, head, idx_to_atom, pad_id, bos_id):
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+        self.idx_to_atom = idx_to_atom
+        self.pad_id = pad_id
+        self.bos_id = bos_id
+
+    def forward(self, **kwargs):
+        prediction = self.backbone(**kwargs)
+        yt = kwargs['cat_tokens']  # [B, L] — current discrete token state
+        coeffs = compute_constraint_coefficients_batch(yt, self.idx_to_atom, self.pad_id, self.bos_id)
+        delta = self.head(prediction.clean_data, coeffs)
+        prediction.clean_data = prediction.clean_data + delta
+        return prediction
+
+
 def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_hinge=False,
                             use_normalized=False, threshold_getter=None, normalized_scale_target=1.0,
-                            use_proxy=False, scale_hinge_target=0.0):
+                            use_proxy=False, scale_hinge_target=0.0, constraint_head=None):
     """Return a callback suitable for MultimodalInterpolant.compute_loss(extra_loss_fn=...).
 
     use_hinge: replace squared residual with max(0, |L-R|-threshold)^2. threshold is fixed at 0.5
@@ -110,6 +161,14 @@ def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_h
         x0_orig = prediction.clean_data.gather(
             1, inv_st.unsqueeze(-1).expand_as(prediction.clean_data)
         )  # [B, L, D]
+        if constraint_head is not None:
+            # Head mode: backbone is detached — only the head receives constraint gradient.
+            # The head learns to redistribute residual without affecting backbone scale.
+            x0_detached = x0_orig.detach()
+            delta = constraint_head(x0_detached, coeffs)
+            x0_corrected = x0_detached + delta
+            residual_head = (coeffs * x0_corrected.squeeze(-1)).sum(dim=1)
+            return {"constraint_loss": residual_head.pow(2).mean()}
         residual = (coeffs * x0_orig.squeeze(-1)).sum(dim=1)  # [B]
         active_mask = (coeffs.abs() > 0.5).float()  # [B, L] — number positions only
         if use_normalized:
@@ -252,6 +311,8 @@ def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1, num_
               help='Iters over which hinge threshold decays from hinge_threshold_start to 0.5. 0 = no curriculum (fixed threshold).')
 @click.option('--depth', type=int, default=4, help='Number of joint attention blocks in MMDiTQM9')
 @click.option('--hidden_dim', type=int, default=256, help='Embedding dim for symbols and positions')
+@click.option('--use_constraint_head', is_flag=True, default=False,
+              help='Use separate ConstraintHead MLP trained only by constraint loss; backbone trains on DSM only, preventing scale shrinkage.')
 def training(**opts):
     opts = dotdict(opts)
     torch.manual_seed(opts.seed)
@@ -293,7 +354,20 @@ def training(**opts):
     ).to(device)
     ema = deepcopy(model)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=opts.lr)
+    constraint_head = None
+    ema_head = None
+    if opts.constraint_weight > 0 and opts.use_constraint_head:
+        constraint_head = ConstraintHead(hidden=64).to(device)
+        ema_head = deepcopy(constraint_head)
+        print('ConstraintHead enabled: backbone trains on DSM only; head trains on constraint only.')
+
+    if constraint_head is not None:
+        opt = torch.optim.AdamW([
+            {'params': model.parameters(), 'lr': opts.lr},
+            {'params': constraint_head.parameters(), 'lr': 1e-3},
+        ])
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=opts.lr)
     if opts.lr_schedule == 'cosine':
         warmup = torch.optim.lr_scheduler.LinearLR(
             opt, start_factor=1e-8, end_factor=1.0, total_iters=opts.warmup_iters
@@ -345,7 +419,8 @@ def training(**opts):
 
     start_iter = 0
     if opts.load_checkpoint is not None:
-        start_iter = load_checkpoint(opts, device, model, ema, opt, scheduler)
+        start_iter = load_checkpoint(opts, device, model, ema, opt, scheduler,
+                                     constraint_head=constraint_head, ema_head=ema_head)
     elif opts.finetune_checkpoint is not None:
         snap = torch.load(opts.finetune_checkpoint, weights_only=True, map_location=device)
         model.load_state_dict(snap['model'], strict=False)
@@ -371,8 +446,9 @@ def training(**opts):
             normalized_scale_target=opts.normalized_scale_target,
             use_proxy=opts.use_proxy,
             scale_hinge_target=opts.scale_hinge_target,
+            constraint_head=constraint_head,
         )
-        print(f'Constraint loss enabled: weight={opts.constraint_weight}, use_hinge={opts.use_hinge}, use_normalized={opts.use_normalized}, use_proxy={opts.use_proxy}, scale_hinge_target={opts.scale_hinge_target}')
+        print(f'Constraint loss enabled: weight={opts.constraint_weight}, use_hinge={opts.use_hinge}, use_normalized={opts.use_normalized}, use_proxy={opts.use_proxy}, scale_hinge_target={opts.scale_hinge_target}, use_constraint_head={opts.use_constraint_head}')
 
     model.train()
     os.makedirs(opts.dir, exist_ok=True)
@@ -413,6 +489,8 @@ def training(**opts):
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             update_ema(ema, model, decay=opts.ema_beta)
+            if ema_head is not None:
+                update_ema(ema_head, constraint_head, decay=opts.ema_beta)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
             for param in model.parameters():
                 if param.grad is not None:
@@ -459,20 +537,34 @@ def training(**opts):
             if training_iter % opts.log_rate == 0 or training_iter == opts.num_iters:
                 ckpt_path = os.path.join(opts.dir, f'itr_{training_iter}')
                 os.makedirs(ckpt_path, exist_ok=True)
-                save_ckpt(model, ema, opt, scheduler, os.path.join(ckpt_path, 'snapshot.pt'))
+                save_ckpt(model, ema, opt, scheduler, os.path.join(ckpt_path, 'snapshot.pt'),
+                          constraint_head=constraint_head, ema_head=ema_head)
 
                 # Use EMA for evaluation — EMA tracks the smoothed model and gives
                 # better sample quality, but only once ema_beta^n_iters ≈ 0.
                 ema.eval()
+                if ema_head is not None:
+                    ema_head.eval()
+                    # Per-step head correction: apply head at each denoising step.
+                    # This matches the training distribution (head sees x0_pred at each timestep).
+                    eval_model = HeadWrappedModel(
+                        ema, ema_head,
+                        character_tokenizer.idx_to_atom,
+                        character_tokenizer.pad_token_id,
+                        character_tokenizer.bos_token_id,
+                    )
+                else:
+                    eval_model = ema
                 with torch.no_grad():
                     samples = interpolant.sampling(
-                        ema, opts.eval_steps, opts.eval_samples,
+                        eval_model, opts.eval_steps, opts.eval_samples,
                         dataset.max_length, device, return_trace=False,
                     )
+                eval_samples = samples
 
                 # Save raw samples for offline analysis
                 save_samples_jsonl(
-                    samples, character_tokenizer,
+                    eval_samples, character_tokenizer,
                     os.path.join(ckpt_path, 'samples.jsonl'),
                     euclidean_dim=euclidean_dim,
                     num_scale=opts.num_scale,
@@ -480,7 +572,7 @@ def training(**opts):
 
                 # Evaluate accuracy
                 metrics = evaluate_samples(
-                    samples, character_tokenizer,
+                    eval_samples, character_tokenizer,
                     euclidean_dim=euclidean_dim,
                     delta=opts.eval_delta,
                     num_scale=opts.num_scale,
@@ -510,31 +602,45 @@ def training(**opts):
 
                 model.train()
                 ema.train()
+                if ema_head is not None:
+                    constraint_head.train()
+                    ema_head.train()
+                    # eval_model was a HeadWrappedModel wrapper (not a persistent module) — no cleanup needed
 
-    save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
+    save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'),
+              constraint_head=constraint_head, ema_head=ema_head)
 
     if opts.enable_wandb:
         wandb.finish()
 
 
-def load_checkpoint(opts, device, model, ema, opt, scheduler):
+def load_checkpoint(opts, device, model, ema, opt, scheduler, constraint_head=None, ema_head=None):
     snapshot = torch.load(opts.load_checkpoint, weights_only=True, map_location=device)
     model.load_state_dict(snapshot['model'], strict=False)
     ema.load_state_dict(snapshot['ema'], strict=False)
     opt.load_state_dict(snapshot['optimizer'])
     scheduler.load_state_dict(snapshot['scheduler'])
+    if constraint_head is not None and 'constraint_head' in snapshot:
+        constraint_head.load_state_dict(snapshot['constraint_head'])
+    if ema_head is not None and 'ema_head' in snapshot:
+        ema_head.load_state_dict(snapshot['ema_head'])
     # SequentialLR stores last_epoch on each sub-scheduler; WarmUpScheduler stores it directly.
     last = snapshot['scheduler'].get('last_epoch', None)
     return last if last is not None else scheduler.last_epoch
 
 
-def save_ckpt(model, ema, opt, scheduler, path):
-    torch.save({
+def save_ckpt(model, ema, opt, scheduler, path, constraint_head=None, ema_head=None):
+    d = {
         'model': model.state_dict(),
         'ema': ema.state_dict(),
         'optimizer': opt.state_dict(),
         'scheduler': scheduler.state_dict(),
-    }, path)
+    }
+    if constraint_head is not None:
+        d['constraint_head'] = constraint_head.state_dict()
+    if ema_head is not None:
+        d['ema_head'] = ema_head.state_dict()
+    torch.save(d, path)
 
 
 if __name__ == '__main__':

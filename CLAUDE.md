@@ -182,6 +182,7 @@ depth8-constraint-w2 (done): finetune depth8-stabilize2/itr_2000, constraint_wei
 | depth8-scale-hinge-sw1 | finetune depth8-constraint-w2/itr_3000, scale_hinge_target=2.5, scale_weight=1.0, w=2.0, lr=1e-5 | ~34% | — | ~72% | Scale jumped 1.575→2.9 but accuracy collapsed 55.6%→33.9% in 1k iters; sw=1.0 was ~10× too strong; killed |
 | depth8-balance-hinge | finetune depth8-constraint-w2/itr_3000, use_hinge=True (max(0,\|L-R\|-0.5)²), w=2.0, lr=1e-5, 3k iters | 50.3% (iter 500) | ~44% | 73–80% | Scale grew slowly: 1.575→1.826 in 2500 iters; 50-step acc: 50.3%→42.6%→44.4%→44.5%→43.8%→38.5%; 400-step/itr_2500: **63.8%**/89.4%/MAE 0.586/scale 1.757 — **16.7pp below baseline** |
 | depth8-scale-hinge-sw005 | finetune depth8-constraint-w2/itr_3000, scale_hinge_target=2.5, scale_weight=0.05, w=2.0, lr=1e-5, 5k iters | 52.5% (iter 500) | ~47.4% | 69–79% | Scale jumped to 2.056 at itr_500 and STABILIZED there (all 10 checkpoints identical!); new equilibrium; 50-step traj: 52.5%→44.4%→46.7%→46.7%→46.6%→43.7%→46.1%→49.0%→50.1%→48.2%; 400-step/itr_500: **70.4%**/MAE 0.563/scale 1.895 — -10.1pp vs baseline for +0.3 scale |
+| depth8-constraint-head | finetune depth8-baseline/itr_10000, use_constraint_head=True (backbone DSM-only, head constraint-only), w=2.0, head lr=1e-3, const lr=1e-5, 5k iters | 24.3% (iter 4500) | ~21% | 72–79% | Backbone-only scale: **2.89** (2.2× better than standard); per-step head 400-step: acc=50.3%/scale=1.03 (itr_5000) — head COLLAPSES scale worse than standard; 30pp below 80.5% baseline; FAILED — see diagnosis |
 
 ### Diagnosis log
 
@@ -342,10 +343,19 @@ The (L-R)² constraint has a global minimum at x=0 (all L=R=0 trivially). The di
 **Scale-normalized constraint (active terms only, done, FAILED):** Added `detach()` to active_scale computation (was missing — gradient flowed through normalization). Used `--use_normalized --normalized_scale_target 5.0 --constraint_weight 200` starting from depth8-baseline/itr_10000. Scale collapsed to 1.260 in the first 500 iters and FROZE there for all 10 checkpoints. 50-step accuracy: 31.1%→53.4%→57.1%→50.3%→52.6%→50.4%→55.8%→50.3%→53.3%→50.0% (avg 50.4%, same as standard w=1.0).
 CONCLUSION: Scale shrinkage is NOT caused by the gradient direction. It is a consequence of the optimization landscape: small-magnitude balanced equations are a local optimum easier to find than large-magnitude balanced ones. Regardless of whether the constraint gradient points toward x=0 or not, the model converges to small scale because small numbers make |L-R|<0.5 trivially satisfiable. No loss function formulation within the single-optimizer framework can fix this.
 
-**Future work directions (loss-function approaches exhausted — architectural change required):**
-1. **Separate numeric head**: add a 2-layer MLP constraint head trained only by the balance loss; backbone trained only by DSM. Constraint can no longer affect the backbone's scale. At inference, use backbone outputs (l5 scale) with head-corrected balance.
+**Separate numeric head (done, FAILED — depth8-constraint-head):** Trained a 3→64→64→1 MLP constraint head alongside the backbone. Backbone receives only DSM gradients (x0_orig detached before head); head receives only constraint gradients. At inference, HeadWrappedModel applies head correction at every denoising step.
+Results:
+- Backbone-only scale: avg_max_abs **2.89** at 400 steps (2.2× better than standard w=2.0's ~1.3) — objective separation works for backbone
+- Per-step head correction (400 steps): itr_4500: acc=**44.7%**/MAE=0.829/scale=**1.127**; itr_5000: acc=**50.3%**/MAE=0.768/scale=**1.032**
+- Head-corrected scale (1.03) is WORSE than standard w=2.0 (1.3-1.6), and accuracy is 30pp below baseline (80.5%)
+Root cause: The head is a tiny MLP trained to minimize `(sum coeff_i*(x_i+delta_i))²` which has the same global minimum at x=0 as the main constraint. Applied 400 times at inference, the head pushes numbers from backbone scale 2.89 → 1.03 (collapsing 3× over 400 corrections). Training/inference mismatch: at training time, backbone x0_pred residuals are moderate (backbone learns DSM), but the head is applied 400× at inference compounding small corrections into large scale collapse.
+CONCLUSION: Architectural separation of objectives preserves backbone scale but the head reintroduces the scale-shrinkage problem. Any loss that minimizes |L-R| has a global minimum at x=0.
+
+**Future work directions (all loss-function and architectural approaches tried — fundamental bottleneck confirmed):**
+1. **Separate numeric head** ← TRIED AND FAILED (see above)
 2. **Relative evaluation criterion**: change |L-R|<0.5 threshold to |L-R|/max(|L|,|R|)<0.1 in both loss and eval. Small-scale equations can no longer trivially satisfy the criterion.
 3. **Wasserstein/MMD on numeric marginals**: add a distribution-matching loss forcing generated numbers to match training data scale distribution directly.
+4. **Threshold curriculum**: hinge threshold decaying 2.0→0.5 over 5k iters (already implemented; `--hinge_threshold_start 2.0 --hinge_curriculum_iters 5000`). During the loose phase the constraint gives zero gradient → DSM pulls scale toward l5. Then tightening forces balance at higher scale.
 
 ---
 
