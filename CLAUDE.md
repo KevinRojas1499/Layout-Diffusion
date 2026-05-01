@@ -339,11 +339,13 @@ ROOT CAUSE: the constraint loss (L-R)² pulls numeric predictions toward 0 (all 
 - Scale hinge sw=1.0 → scale 2.9, accuracy 33.9% (catastrophic)
 The (L-R)² constraint has a global minimum at x=0 (all L=R=0 trivially). The diffusion model finds this equilibrium by generating small-magnitude numbers where |L-R|<0.5 is easy to satisfy. Any loss that rewards accuracy without penalizing small numbers converges to this equilibrium. A fundamentally different constraint formulation is needed to escape it.
 
-**Future work directions:**
-1. **Scale-normalized constraint (active terms only)**: `(residual / active_scale)²` where active_scale = sum(|x_active|).detach().clamp(min=1). Removes the pull toward 0 by making gradient scale-invariant. Requires constraint_weight ≈ 50–100 to compensate for smaller loss magnitude. Previously failed version used ALL positions (including padding) which diluted by ~25×; correct version uses only (coeffs.abs()>0.5) positions.
-2. **Relative constraint**: `((L-R) / sigma_batch)²` where sigma_batch = running std of L values in the batch. Scale-invariant gradient, no preference for small numbers. Requires careful implementation to avoid mode collapse.
-3. **Separate numeric heads**: give constraint its own smaller subnet that doesn't affect the denoising backbone, reducing DSM-Cstr competition.
-4. **Contrastive scale loss**: require generated numbers to match the scale distribution of training data (Wasserstein/MMD on marginals).
+**Scale-normalized constraint (active terms only, done, FAILED):** Added `detach()` to active_scale computation (was missing — gradient flowed through normalization). Used `--use_normalized --normalized_scale_target 5.0 --constraint_weight 200` starting from depth8-baseline/itr_10000. Scale collapsed to 1.260 in the first 500 iters and FROZE there for all 10 checkpoints. 50-step accuracy: 31.1%→53.4%→57.1%→50.3%→52.6%→50.4%→55.8%→50.3%→53.3%→50.0% (avg 50.4%, same as standard w=1.0).
+CONCLUSION: Scale shrinkage is NOT caused by the gradient direction. It is a consequence of the optimization landscape: small-magnitude balanced equations are a local optimum easier to find than large-magnitude balanced ones. Regardless of whether the constraint gradient points toward x=0 or not, the model converges to small scale because small numbers make |L-R|<0.5 trivially satisfiable. No loss function formulation within the single-optimizer framework can fix this.
+
+**Future work directions (loss-function approaches exhausted — architectural change required):**
+1. **Separate numeric head**: add a 2-layer MLP constraint head trained only by the balance loss; backbone trained only by DSM. Constraint can no longer affect the backbone's scale. At inference, use backbone outputs (l5 scale) with head-corrected balance.
+2. **Relative evaluation criterion**: change |L-R|<0.5 threshold to |L-R|/max(|L|,|R|)<0.1 in both loss and eval. Small-scale equations can no longer trivially satisfy the criterion.
+3. **Wasserstein/MMD on numeric marginals**: add a distribution-matching loss forcing generated numbers to match training data scale distribution directly.
 
 ---
 

@@ -113,7 +113,7 @@ def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_h
         residual = (coeffs * x0_orig.squeeze(-1)).sum(dim=1)  # [B]
         active_mask = (coeffs.abs() > 0.5).float()  # [B, L] — number positions only
         if use_normalized:
-            active_scale = (x0_orig.squeeze(-1).abs() * active_mask).sum(dim=1)  # [B]
+            active_scale = (x0_orig.squeeze(-1).abs() * active_mask).sum(dim=1).detach()  # [B]
             scale = active_scale.clamp(min=normalized_scale_target)
             balance_loss = (residual / scale).pow(2).mean()
         elif use_proxy:
