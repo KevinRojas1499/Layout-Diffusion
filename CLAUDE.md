@@ -181,6 +181,7 @@ depth8-constraint-w2 (done): finetune depth8-stabilize2/itr_2000, constraint_wei
 | depth8-proxy-constraint | finetune depth8-constraint-w2/itr_3000, proxy constraint (residual.detach() * residual), w=2.0, lr=1e-5 | ~47% | — | ~73% | Proxy = standard for Adam (identical first-order gradients); acc declining: 47.3%→47.4%→45.9%; killed after 3 declines |
 | depth8-scale-hinge-sw1 | finetune depth8-constraint-w2/itr_3000, scale_hinge_target=2.5, scale_weight=1.0, w=2.0, lr=1e-5 | ~34% | — | ~72% | Scale jumped 1.575→2.9 but accuracy collapsed 55.6%→33.9% in 1k iters; sw=1.0 was ~10× too strong; killed |
 | depth8-balance-hinge | finetune depth8-constraint-w2/itr_3000, use_hinge=True (max(0,\|L-R\|-0.5)²), w=2.0, lr=1e-5, 3k iters | 50.3% (iter 500) | ~44% | 73–80% | Scale grew slowly: 1.575→1.826 in 2500 iters; 50-step acc: 50.3%→42.6%→44.4%→44.5%→43.8%→38.5%; 400-step/itr_2500: **63.8%**/89.4%/MAE 0.586/scale 1.757 — **16.7pp below baseline** |
+| depth8-scale-hinge-sw005 | finetune depth8-constraint-w2/itr_3000, scale_hinge_target=2.5, scale_weight=0.05, w=2.0, lr=1e-5, 5k iters | 52.5% (iter 500) | ~47.4% | 69–79% | Scale jumped to 2.056 at itr_500 and STABILIZED there (all 10 checkpoints identical!); new equilibrium; 50-step traj: 52.5%→44.4%→46.7%→46.7%→46.6%→43.7%→46.1%→49.0%→50.1%→48.2%; 400-step/itr_500: **70.4%**/MAE 0.563/scale 1.895 — -10.1pp vs baseline for +0.3 scale |
 
 ### Diagnosis log
 
@@ -332,13 +333,14 @@ ROOT CAUSE: the constraint loss (L-R)² pulls numeric predictions toward 0 (all 
 - Verdict: scale grew by only 0.18 units while accuracy dropped 16.7pp at 400 steps vs baseline (80.5%). Hinge removes gradient for already-balanced samples, weakening the constraint and allowing L-R precision to erode. Not a viable approach.
 
 **Scale-accuracy tradeoff — FUNDAMENTAL CONCLUSION (as of 2026-05-01):** Every attempt to grow scale has traded accuracy:
-- Standard (L-R)² constraint → scale ~1.2-1.6, accuracy 80.5% ← best Pareto point
-- Balance hinge → scale 1.76, accuracy 63.8% (-16.7pp for +0.18 scale)
+- Standard (L-R)² constraint → scale ~1.2-1.6, accuracy 80.5% ← best Pareto point for accuracy
+- Scale hinge sw=0.05 → scale 1.895, accuracy 70.4% (-10.1pp for +0.3 scale); scale stabilized at 2.056 (50-step) immediately and held; better Pareto than balance hinge
+- Balance hinge → scale 1.76, accuracy 63.8% (-16.7pp for +0.18 scale) ← dominated by sw=0.05
 - Scale hinge sw=1.0 → scale 2.9, accuracy 33.9% (catastrophic)
 The (L-R)² constraint has a global minimum at x=0 (all L=R=0 trivially). The diffusion model finds this equilibrium by generating small-magnitude numbers where |L-R|<0.5 is easy to satisfy. Any loss that rewards accuracy without penalizing small numbers converges to this equilibrium. A fundamentally different constraint formulation is needed to escape it.
 
-**Future work directions (untried):**
-1. **Scale-penalty term**: `+lambda * max(0, S - mean|x_active|)²` with sw=0.05–0.1; the balance gradient must dominate.
+**Future work directions:**
+1. **Scale-normalized constraint (active terms only)**: `(residual / active_scale)²` where active_scale = sum(|x_active|).detach().clamp(min=1). Removes the pull toward 0 by making gradient scale-invariant. Requires constraint_weight ≈ 50–100 to compensate for smaller loss magnitude. Previously failed version used ALL positions (including padding) which diluted by ~25×; correct version uses only (coeffs.abs()>0.5) positions.
 2. **Relative constraint**: `((L-R) / sigma_batch)²` where sigma_batch = running std of L values in the batch. Scale-invariant gradient, no preference for small numbers. Requires careful implementation to avoid mode collapse.
 3. **Separate numeric heads**: give constraint its own smaller subnet that doesn't affect the denoising backbone, reducing DSM-Cstr competition.
 4. **Contrastive scale loss**: require generated numbers to match the scale distribution of training data (Wasserstein/MMD on marginals).

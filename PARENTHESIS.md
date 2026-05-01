@@ -192,10 +192,11 @@ GPU OOM. The 7.6 GiB GPU is fully utilized at batch=128. Gradient accumulation (
 
 Every attempt to improve the generated number scale while maintaining ≥80% accuracy has failed. The table below summarizes the Pareto frontier as of 2026-05-01:
 
-| Approach | 400-step accuracy | avg_max_abs | Notes |
+| Approach | 400-step accuracy | avg_max_abs (400-step) | Notes |
 |---|---|---|---|
-| Standard (L-R)², w=2.0 | **80.5%** | 1.2–1.6 | Best accuracy; scale ≈ 1/3 of l5 data |
-| Balance hinge, w=2.0 | 63.8% | 1.76 | -16.7pp accuracy for +0.18 scale |
+| Standard (L-R)², w=2.0 | **80.5%** | ~1.3 | Best accuracy; scale ≈ 1/3 of l5 data |
+| Scale hinge sw=0.05 | 70.4% | 1.895 | -10.1pp accuracy for +0.6 scale; new equilibrium at 2.056 (50-step) |
+| Balance hinge, w=2.0 | 63.8% | 1.76 | Dominated by sw=0.05: less scale AND less accuracy |
 | Scale hinge sw=1.0 | ~34% | 2.9 | Catastrophic accuracy collapse |
 | l5 training data | — | **~4.3** | Target scale |
 
@@ -263,7 +264,8 @@ Check avg_max_abs in generated samples every 1000 iters. If scale stays below 1.
 |-----|-------------|--------------|---------|-----------|-------------|-------|
 | depth8-stabilize2/itr_2000 | 50.0% | ~74% | 75.6% | ~0.54 | ~1.0 | Best w=1.0 starting point |
 | **depth8-constraint-w2/itr_3000** | **55.6%** | **80.5%** | **91.2%** | **0.494** | **1.2–1.6** | **Honest best (l5 scale)** |
-| depth8-balance-hinge/itr_2500 | 43.8% | 63.8% | 89.4% | 0.586 | 1.757 | Hinge failed: -16.7pp for +0.18 scale |
+| depth8-scale-hinge-sw005/itr_500 | 52.5% | 70.4% | — | 0.563 | 1.895 | sw=0.05: -10.1pp accuracy for +0.6 scale; better Pareto than hinge |
+| depth8-balance-hinge/itr_2500 | 43.8% | 63.8% | 89.4% | 0.586 | 1.757 | Dominated by sw=0.05 |
 | depth8-l1l5-w2-phase2/itr_1000 | 57.0% | 85.6% | 88.6% | 0.295 | ~0.44 | Inflated (l1 scale artifact) |
 
 All checkpoints are under `runs/parenthesis/`.
