@@ -86,6 +86,30 @@ def compute_constraint_coefficients_batch(y1, idx_to_atom, pad_id, bos_id):
     return coeffs
 
 
+def gaussian_mmd(x, y, bandwidths=(0.5, 1.0, 2.0, 5.0)):
+    """Multi-scale unbiased MMD² with Gaussian kernels.
+
+    Compares marginal distributions of predicted vs training active numbers.
+    Penalizes scale shrinkage: training numbers have std~2.5 (l5), so predicting
+    near-zero numbers gives high MMD, pushing values toward training scale.
+    x, y: 1D float tensors of sampled values from pred and target distributions.
+    """
+    if x.numel() < 2 or y.numel() < 2:
+        return x.sum() * 0.0
+    mmd_total = x.new_zeros(1)
+    n, m = x.shape[0], y.shape[0]
+    for bw in bandwidths:
+        inv_bw2 = 1.0 / (2.0 * bw * bw)
+        kxx = torch.exp(-(x.unsqueeze(1) - x.unsqueeze(0)).pow(2) * inv_bw2)
+        kyy = torch.exp(-(y.unsqueeze(1) - y.unsqueeze(0)).pow(2) * inv_bw2)
+        kxy = torch.exp(-(x.unsqueeze(1) - y.unsqueeze(0)).pow(2) * inv_bw2)
+        mmd_bw = ((kxx.sum() - kxx.diag().sum()) / (n * (n - 1))
+                  + (kyy.sum() - kyy.diag().sum()) / (m * (m - 1))
+                  - 2.0 * kxy.mean())
+        mmd_total = mmd_total + mmd_bw
+    return (mmd_total / len(bandwidths)).squeeze()
+
+
 class ConstraintHead(torch.nn.Module):
     """Per-position balance-correction MLP.
 
@@ -138,7 +162,9 @@ class HeadWrappedModel(torch.nn.Module):
 
 def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_hinge=False,
                             use_normalized=False, threshold_getter=None, normalized_scale_target=1.0,
-                            use_proxy=False, scale_hinge_target=0.0, constraint_head=None):
+                            use_proxy=False, scale_hinge_target=0.0, constraint_head=None,
+                            nonzero_floor=0.0, nonzero_weight=0.0, use_relative=False, relative_floor=0.5,
+                            mmd_weight=0.0, mmd_bandwidths=(0.5, 1.0, 2.0, 5.0)):
     """Return a callback suitable for MultimodalInterpolant.compute_loss(extra_loss_fn=...).
 
     use_hinge: replace squared residual with max(0, |L-R|-threshold)^2. threshold is fixed at 0.5
@@ -153,6 +179,16 @@ def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_h
         mean|x_active| >= S, preventing runaway. Equilibrium is at mean|x_active| = S.
     use_normalized: divide residual by sum of |x| at active (non-pad) positions — makes loss
         scale-invariant so the trivial x=0 solution has no gradient advantage.
+    use_relative: divide residual by per-sample mean|x_active| (detached, floored at relative_floor).
+        Unlike use_normalized (which divides by sum over all positions), this uses mean over active
+        positions only. Key property: the gradient is WEAKER at large scale (sigma in denominator),
+        so the model can maintain l5-scale numbers with less constraint disruption. At small scale
+        (sigma → floor), the gradient is stronger than standard, opposing collapse to x=0.
+    relative_floor: minimum denominator for use_relative mode (default 0.5). Prevents division by
+        near-zero when scale collapses; makes gradient at x=0 equal to standard constraint * (1/floor)^2.
+    nonzero_floor: if > 0, add per-position hinge mean_active(max(0, floor - |x_i|)^2) to penalize
+        active positions with small magnitude. Directly blocks the "predict zeros" degenerate solution.
+    nonzero_weight: weight for the per-position nonzero hinge. Typical value: 0.5–2.0.
     """
     def constraint_fn(prediction, interpolant_sample, x1, y1):
         coeffs = compute_constraint_coefficients_batch(y1, idx_to_atom, pad_id, bos_id)
@@ -171,7 +207,15 @@ def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_h
             return {"constraint_loss": residual_head.pow(2).mean()}
         residual = (coeffs * x0_orig.squeeze(-1)).sum(dim=1)  # [B]
         active_mask = (coeffs.abs() > 0.5).float()  # [B, L] — number positions only
-        if use_normalized:
+        num_active = active_mask.sum(dim=1).clamp(min=1.0)  # [B]
+        if use_relative:
+            # Relative constraint: (L-R)^2 / sigma^2 where sigma = mean|x_active|, floored.
+            # Weaker gradient at large scale → DSM has more room to maintain l5-scale numbers.
+            # Stronger gradient at small scale (sigma=floor) → opposes collapse to x=0.
+            sigma = (x0_orig.squeeze(-1).abs() * active_mask).sum(dim=1) / num_active  # [B]
+            sigma = sigma.detach().clamp(min=relative_floor)
+            balance_loss = (residual / sigma).pow(2).mean()
+        elif use_normalized:
             active_scale = (x0_orig.squeeze(-1).abs() * active_mask).sum(dim=1).detach()  # [B]
             scale = active_scale.clamp(min=normalized_scale_target)
             balance_loss = (residual / scale).pow(2).mean()
@@ -187,13 +231,27 @@ def make_constraint_loss_fn(idx_to_atom, pad_id, bos_id, scale_weight=0.0, use_h
         if scale_hinge_target > 0.0 and scale_weight > 0.0:
             # Scale hinge: penalize mean|x_active| below target. Zero gradient above target → no runaway.
             # Equilibrium: constraint balances equations while scale hinge keeps magnitudes near target.
-            num_active = active_mask.sum(dim=1).clamp(min=1.0)  # [B]
             active_mean_abs = (x0_orig.squeeze(-1).abs() * active_mask).sum(dim=1) / num_active  # [B]
             scale_hinge = torch.clamp(scale_hinge_target - active_mean_abs, min=0.0).pow(2).mean()
             balance_loss = balance_loss + scale_weight * scale_hinge
         elif scale_weight > 0.0 and not use_normalized:
             # Legacy: direct reward (unbounded — prefer scale_hinge_target instead)
             balance_loss = balance_loss - scale_weight * x0_orig.squeeze(-1).abs().mean()
+        if nonzero_floor > 0.0 and nonzero_weight > 0.0:
+            # Per-position nonzero hinge: penalizes each active position with |x| < floor.
+            # Blocks "predict two matching anchors + zeros" degenerate solution.
+            per_pos_hinge = torch.clamp(nonzero_floor - x0_orig.squeeze(-1).abs(), min=0.0).pow(2)
+            nonzero_loss = (per_pos_hinge * active_mask).sum(dim=1) / num_active
+            balance_loss = balance_loss + nonzero_weight * nonzero_loss.mean()
+        if mmd_weight > 0.0:
+            # MMD on active number marginals: predicted vs training data values.
+            # Penalizes scale shrinkage — trivial x=0 solution has high MMD since
+            # training numbers have std~2.5, not 0. Forces predicted distribution
+            # toward training data scale without a trivial minimum at x=0.
+            x0_active = x0_orig.squeeze(-1)[active_mask.bool()]
+            x1_active = x1.squeeze(-1)[active_mask.bool()]
+            mmd = gaussian_mmd(x0_active, x1_active, bandwidths=mmd_bandwidths)
+            balance_loss = balance_loss + mmd_weight * mmd
         return {"constraint_loss": balance_loss}
     return constraint_fn
 
@@ -309,6 +367,18 @@ def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1, num_
               help='Starting hinge threshold for curriculum training (e.g. 2.0). Decays linearly to 0.5 over hinge_curriculum_iters.')
 @click.option('--hinge_curriculum_iters', type=int, default=0,
               help='Iters over which hinge threshold decays from hinge_threshold_start to 0.5. 0 = no curriculum (fixed threshold).')
+@click.option('--nonzero_floor', type=float, default=0.0,
+              help='Per-position nonzero hinge floor: penalize active positions with |x| < floor via mean_active(max(0,floor-|x|)^2). Blocks predict-zeros degenerate solution.')
+@click.option('--nonzero_weight', type=float, default=0.0,
+              help='Weight for the per-position nonzero hinge loss. Typical range: 0.5–2.0.')
+@click.option('--use_relative', is_flag=True, default=False,
+              help='Relative constraint: divide residual by per-sample mean|x_active| (floored at relative_floor). Weaker gradient at large scale; stronger at small scale. Distinct from --use_normalized (which divides by sum, not mean).')
+@click.option('--relative_floor', type=float, default=0.5,
+              help='Floor for mean|x_active| denominator in --use_relative mode. Prevents division by near-zero at small scale.')
+@click.option('--mmd_weight', type=float, default=0.0,
+              help='Weight for MMD loss on active number marginals (predicted vs training). Penalizes scale shrinkage.')
+@click.option('--mmd_bandwidths', type=str, default='0.5,1.0,2.0,5.0',
+              help='Comma-separated Gaussian kernel bandwidths for MMD loss.')
 @click.option('--depth', type=int, default=4, help='Number of joint attention blocks in MMDiTQM9')
 @click.option('--hidden_dim', type=int, default=256, help='Embedding dim for symbols and positions')
 @click.option('--use_constraint_head', is_flag=True, default=False,
@@ -428,6 +498,7 @@ def training(**opts):
         print(f'Loaded weights from {opts.finetune_checkpoint} (fresh optimizer)')
 
     constraint_fn = None
+    threshold_getter = None
     if opts.constraint_weight > 0 and opts.interpolant in ('multimodal', 'autoregressive'):
         threshold_getter = None
         if opts.hinge_threshold_start > 0.5 and opts.hinge_curriculum_iters > 0:
@@ -447,8 +518,14 @@ def training(**opts):
             use_proxy=opts.use_proxy,
             scale_hinge_target=opts.scale_hinge_target,
             constraint_head=constraint_head,
+            nonzero_floor=opts.nonzero_floor,
+            nonzero_weight=opts.nonzero_weight,
+            use_relative=opts.use_relative,
+            relative_floor=opts.relative_floor,
+            mmd_weight=opts.mmd_weight,
+            mmd_bandwidths=tuple(float(b) for b in opts.mmd_bandwidths.split(',')),
         )
-        print(f'Constraint loss enabled: weight={opts.constraint_weight}, use_hinge={opts.use_hinge}, use_normalized={opts.use_normalized}, use_proxy={opts.use_proxy}, scale_hinge_target={opts.scale_hinge_target}, use_constraint_head={opts.use_constraint_head}')
+        print(f'Constraint loss enabled: weight={opts.constraint_weight}, use_hinge={opts.use_hinge}, use_normalized={opts.use_normalized}, use_proxy={opts.use_proxy}, scale_hinge_target={opts.scale_hinge_target}, use_constraint_head={opts.use_constraint_head}, nonzero_floor={opts.nonzero_floor}, nonzero_weight={opts.nonzero_weight}, use_relative={opts.use_relative}, relative_floor={opts.relative_floor}, mmd_weight={opts.mmd_weight}, mmd_bandwidths={opts.mmd_bandwidths}')
 
     model.train()
     os.makedirs(opts.dir, exist_ok=True)

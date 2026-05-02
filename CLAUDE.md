@@ -105,8 +105,16 @@ Best accuracy: 61.8% (iter 3000), avg ~48%  ← l1 dataset (numbers in [-1,1])
 Mean abs error: 0.46 (best)
 Config: data=l1, lr=1e-4, batch_size=128, warmup=500, depth=4, dim=256, interpolant=multimodal
 
-l5 best (eval_steps=50): 55.6% (depth8-constraint-w2, iter 3000) — validity 73.0% ← HONEST BEST
-l5 best (eval_steps=400): 80.5% / 91.2% validity (depth8-constraint-w2/itr_3000) ← HONEST BEST (see scale caveat)
+l5 best (eval_steps=50): 59.8% (new-depth8-constraint-w2, itr_5000, nonzero hinge) ← NEW 50-STEP RECORD
+l5 best (eval_steps=400, accuracy+validity): 80.5% / 91.2% validity (depth8-constraint-w2/itr_3000) ← HONEST BEST
+l5 best (eval_steps=400, accuracy+scale): 78.1% / 87.8% validity / avg_max_abs 1.458 (new-depth8-constraint-w2/itr_5000, nonzero hinge) ← BEST PARETO (accuracy vs scale)
+l5 best (eval_steps=400, high scale): 71.0% / 86.8% / avg_max_abs 2.211 (new-depth8-mmd-w05/itr_1000, MMD weight=0.5) ← NEW PARETO at high scale (+0.316 over sw=0.05)
+  Full Pareto frontier (400-step, accuracy vs scale):
+    80.5% / 1.30 scale  — depth8-constraint-w2/itr_3000 (best accuracy)
+    78.1% / 1.458 scale — new-depth8-constraint-w2/itr_5000 (nonzero hinge)
+    74.6% / 1.553 scale — new-depth8-mmd-nommd/itr_2500 (MMD charge → drop)
+    71.3% / 1.834 scale — new-depth8-mmd-finetune-w01/itr_2500 (mmd=0.1, scale grows at inference)
+    71.0% / 2.211 scale — new-depth8-mmd-w05/itr_1000 (mmd=0.5, best scale Pareto)
   Inference scaling (depth8-stabilize2/itr_2000):
     steps  50: acc 50.0%, valid 75.6%, MAE 1.012
     steps 100: acc 57.6%, valid 83.4%, MAE 0.900 (+7.6pp)
@@ -116,6 +124,24 @@ l5 best (eval_steps=400): 80.5% / 91.2% validity (depth8-constraint-w2/itr_3000)
   Inference scaling (depth8-constraint-w2/itr_3000) ← HONEST BEST CHECKPOINT (l5-scale, avg_max_abs ~1.3):
     steps  50: acc 55.6%, valid 73.0%, MAE 0.955
     steps 400: acc 80.5%, valid 91.2%, MAE 0.494 (+24.9pp)
+  Inference scaling (new-depth8-constraint-w2/itr_5000) ← BEST SCALE PARETO (avg_max_abs 1.458 at 400-step):
+    steps  50: acc 59.8%, valid ~74%, MAE ~0.890
+    steps 400: acc 78.1%, valid 87.8%, MAE 0.472, avg_max_abs 1.458
+  Inference scaling (new-depth8-mmd-w05/itr_1000) ← MMD loss HIGH-SCALE PARETO (avg_max_abs 2.211 at 400-step):
+    steps  50: acc 50.4%, valid 73.4%, MAE 1.051, avg_max_abs 1.973
+    steps 400: acc 71.0%, valid 86.8%, MAE 0.574, avg_max_abs 2.211 (scale GROWS during inference!)
+    ← Beats sw=0.05 (70.4%, scale 1.895): +0.6pp accuracy, +0.316 scale at comparable accuracy level
+  Inference scaling (new-depth8-mmd-nommd/itr_2500) ← MMD-charge then drop; scale SHRINKS at inference:
+    steps  50: acc 54.6%, valid 74.0%, MAE 1.102, avg_max_abs 1.687
+    steps 400: acc 74.6%, valid 84.2%, avg_max_abs 1.553 (scale SHRINKS -8% — no MMD → trivial min reasserts)
+    ← New Pareto point: 74.6%/1.553 (between nonzero-hinge 78.1%/1.458 and mmd_w05 71.0%/2.211)
+  Inference scaling (new-depth8-mmd-finetune-w01/itr_2500) ← mmd=0.1 maintained; scale GROWS slightly at inference:
+    steps  50: acc 53.4%, valid 73.8%, MAE 1.098, avg_max_abs 1.788
+    steps 400: acc 71.3%, valid 85.0%, avg_max_abs 1.834 (scale GROWS +0.046 — MMD training retained at inference)
+    ← New Pareto point: 71.3%/1.834 (ties mmd_w05 in accuracy but lower scale; MMD-signal persists at inference)
+  Inference scaling (new-depth8-constraint-w2-nohinge/itr_5000) ← no-hinge 80.6% (validity caveat):
+    steps  50: acc 58.4%, valid ~73%, MAE 0.926
+    steps 400: acc 80.6%, valid 85.6%, MAE 0.476, avg_max_abs 1.153 (scale collapses vs 50-step 1.529)
   Inference scaling (depth8-l1l5-w2-phase2/itr_500) ← scale artifact (avg_max_abs 0.57; see caveat):
     steps  50: acc 62.8%, valid 79.6%, MAE 0.478
     steps 400: acc 84.7%, valid 90.4%, MAE 0.219 (+22.0pp — MAE 56% lower than w2 record!)
@@ -183,6 +209,18 @@ depth8-constraint-w2 (done): finetune depth8-stabilize2/itr_2000, constraint_wei
 | depth8-balance-hinge | finetune depth8-constraint-w2/itr_3000, use_hinge=True (max(0,\|L-R\|-0.5)²), w=2.0, lr=1e-5, 3k iters | 50.3% (iter 500) | ~44% | 73–80% | Scale grew slowly: 1.575→1.826 in 2500 iters; 50-step acc: 50.3%→42.6%→44.4%→44.5%→43.8%→38.5%; 400-step/itr_2500: **63.8%**/89.4%/MAE 0.586/scale 1.757 — **16.7pp below baseline** |
 | depth8-scale-hinge-sw005 | finetune depth8-constraint-w2/itr_3000, scale_hinge_target=2.5, scale_weight=0.05, w=2.0, lr=1e-5, 5k iters | 52.5% (iter 500) | ~47.4% | 69–79% | Scale jumped to 2.056 at itr_500 and STABILIZED there (all 10 checkpoints identical!); new equilibrium; 50-step traj: 52.5%→44.4%→46.7%→46.7%→46.6%→43.7%→46.1%→49.0%→50.1%→48.2%; 400-step/itr_500: **70.4%**/MAE 0.563/scale 1.895 — -10.1pp vs baseline for +0.3 scale |
 | depth8-constraint-head | finetune depth8-baseline/itr_10000, use_constraint_head=True (backbone DSM-only, head constraint-only), w=2.0, head lr=1e-3, const lr=1e-5, 5k iters | 24.3% (iter 4500) | ~21% | 72–79% | Backbone-only scale: **2.89** (2.2× better than standard); per-step head 400-step: acc=50.3%/scale=1.03 (itr_5000) — head COLLAPSES scale worse than standard; 30pp below 80.5% baseline; FAILED — see diagnosis |
+| depth8-threshold-curriculum | finetune depth8-constraint-w2/itr_3000, hinge_threshold_start=2.0, hinge_curriculum_iters=5000, w=2.0, const lr=1e-5 | 43.5% (iter 500) | ~35% | 73–80% | Scale grew 1.575→2.029 (peak iter 2000) then declined to 1.854 (iter 5000) as threshold tightened; 400-step: 50.3%→51.6%→54.9%→**61.1%** (itr_5000); scale hinge sw=0.05 gives 70.4% at same scale (1.895) → curriculum DOMINATED by sw=0.05; FAILED |
+| depth8-w2-long-s2 | H1-corrected: finetune depth8-stabilize2/itr_2000, w=2.0, const lr=1e-5, 50k iters | **57.4%** (itr_16000) | ~53% | 72–76% | H1 answered ✓ — 57.4% exceeds 55.6% ceiling; rising oscillation envelope confirmed (1st peak 54.6%, 2nd 57.4%); killed at itr_22000 after success criterion met |
+| new-depth8-baseline | 160k dataset (train_l5.jsonl), depth=8, lr=1e-4 cosine→1e-6, warmup=500, 10k iters | 16.3% (itr_10000) | ~13% | ~75% | Stage 1 of new pipeline on 160k dataset |
+| new-depth8-constraint | finetune new-depth8-baseline/itr_10000, w=1.0, lr=3e-5 cosine→1e-5, nonzero_floor=0.5, nonzero_weight=1.0, 10k iters | **53.3%** (itr_8000) | ~48% | 72–77% | Nonzero hinge +3.6pp over old Stage 2 ceiling (49.7%); blocks anchor trick degenerate solution |
+| new-depth8-stabilize | finetune new-depth8-constraint/itr_5000, const lr=1e-5, nonzero hinge, 5k iters | **59.2%** (itr_5000) | ~52% | 74–79% | Nonzero hinge BROKE the 50.0% w=1.0 ceiling — **+9.2pp** over all prior stabilize peaks; scale at itr_5000: avg_max_abs=1.723 |
+| new-depth8-constraint-w2 | finetune new-depth8-stabilize/itr_5000, w=2.0, const lr=1e-5, nonzero hinge, 5k iters | **59.8%** (itr_5000) | ~54% | 73–79% | New 50-step all-time record; 400-step: **78.1%**/87.8%/MAE 0.472/scale 1.458; -2.4pp vs old best but **+0.158 scale** |
+| new-depth8-constraint-w2-nohinge | finetune new-depth8-stabilize/itr_2000 (51.6%), w=2.0, const lr=1e-5, NO nonzero hinge, 5k iters | 58.4% (itr_5000) | ~53% | 73–79% | 400-step: **80.6%**/85.6%/MAE 0.476/scale 1.153; ties old accuracy record but validity -5.6pp and scale WORSE (scale collapses from 1.529 to 1.153 through 400 inference steps as trivial minimum reasserts) |
+| new-depth8-relative-w2 | finetune new-depth8-stabilize/itr_5000 (59.2%), w=2.0, use_relative, const lr=1e-5, nonzero hinge, 5k iters | 58.9% (itr_3000) | ~56% | 68–73% | 400-step itr_3000: **81.1%**/77.2%/MAE 0.485/scale **1.007**; accuracy new high but scale collapses (1.468→1.007) through 400 inference steps; validity -14pp vs old best — DOMINATED |
+| new-depth8-mmd-w05 | finetune new-depth8-constraint-w2/itr_5000, w=2.0, mmd_weight=0.5, nonzero hinge, const lr=1e-5 | 50.4% (itr_1000) | ~47% | 73–77% | 50-step acc ~44-50%, scale growing 1.860→2.366; 400-step/itr_1000: **71.0%**/86.8%/scale 2.211 (scale GROWS at inference!) ← new high-scale Pareto |
+| new-depth8-mmd-finetune-w01 | finetune new-depth8-mmd-w05/itr_1000, mmd_weight=0.1, w=2.0, nonzero hinge, const lr=1e-5, 5k iters | 53.4% (itr_2500) | ~50% | 70–78% | Scale maintained ~1.79–2.04; 400-step/itr_2500: **71.3%**/85.0%/scale 1.834 (scale grows 1.788→1.834 at inference) ← Pareto point |
+| new-depth8-mmd-nommd | finetune new-depth8-mmd-w05/itr_1000, NO mmd, w=2.0, nonzero hinge, const lr=1e-5, 5k iters | 54.6% (itr_2500) | ~51% | 70–78% | Scale declined 2.003→1.754; 400-step/itr_2500: **74.6%**/84.2%/scale 1.553 (scale SHRINKS 1.687→1.553 at inference) ← Pareto point |
+| new-depth8-mmd-from-w2 | finetune depth8-constraint-w2/itr_3000, mmd_weight=0.1, w=2.0, nonzero hinge, const lr=1e-5, 5k iters | RUNNING | — | — | Testing MMD from best-accuracy baseline; hypothesis: higher starting accuracy preserves better Pareto |
 
 ### Diagnosis log
 
@@ -333,12 +371,13 @@ ROOT CAUSE: the constraint loss (L-R)² pulls numeric predictions toward 0 (all 
 - 400-step eval of itr_2500: 63.8% accuracy / 89.4% validity / MAE 0.586 / avg_max_abs 1.757
 - Verdict: scale grew by only 0.18 units while accuracy dropped 16.7pp at 400 steps vs baseline (80.5%). Hinge removes gradient for already-balanced samples, weakening the constraint and allowing L-R precision to erode. Not a viable approach.
 
-**Scale-accuracy tradeoff — FUNDAMENTAL CONCLUSION (as of 2026-05-01):** Every attempt to grow scale has traded accuracy:
+**Scale-accuracy tradeoff — FUNDAMENTAL CONCLUSION (updated 2026-05-02):** Every attempt to grow scale has traded accuracy:
 - Standard (L-R)² constraint → scale ~1.2-1.6, accuracy 80.5% ← best Pareto point for accuracy
-- Scale hinge sw=0.05 → scale 1.895, accuracy 70.4% (-10.1pp for +0.3 scale); scale stabilized at 2.056 (50-step) immediately and held; better Pareto than balance hinge
-- Balance hinge → scale 1.76, accuracy 63.8% (-16.7pp for +0.18 scale) ← dominated by sw=0.05
+- **Nonzero hinge (floor=0.5, w=1.0) → scale 1.458, accuracy 78.1%** (-2.4pp for +0.158 scale) ← NEW BEST SCALE PARETO (dominated sw=0.05)
+- Scale hinge sw=0.05 → scale 1.895, accuracy 70.4% (-10.1pp for +0.3 scale) ← DOMINATED by nonzero hinge
+- Balance hinge → scale 1.76, accuracy 63.8% (-16.7pp for +0.18 scale) ← dominated by nonzero hinge and sw=0.05
 - Scale hinge sw=1.0 → scale 2.9, accuracy 33.9% (catastrophic)
-The (L-R)² constraint has a global minimum at x=0 (all L=R=0 trivially). The diffusion model finds this equilibrium by generating small-magnitude numbers where |L-R|<0.5 is easy to satisfy. Any loss that rewards accuracy without penalizing small numbers converges to this equilibrium. A fundamentally different constraint formulation is needed to escape it.
+The per-position nonzero hinge blocks the anchor trick (two matching anchors + zeros) and creates a genuinely better Pareto point. However, the fundamental trivial minimum at x=0 persists — dropping the nonzero hinge at inference time (400 steps) collapses scale from 1.529 → 1.153 as the denoising process finds the small-magnitude equilibrium.
 
 **Scale-normalized constraint (active terms only, done, FAILED):** Added `detach()` to active_scale computation (was missing — gradient flowed through normalization). Used `--use_normalized --normalized_scale_target 5.0 --constraint_weight 200` starting from depth8-baseline/itr_10000. Scale collapsed to 1.260 in the first 500 iters and FROZE there for all 10 checkpoints. 50-step accuracy: 31.1%→53.4%→57.1%→50.3%→52.6%→50.4%→55.8%→50.3%→53.3%→50.0% (avg 50.4%, same as standard w=1.0).
 CONCLUSION: Scale shrinkage is NOT caused by the gradient direction. It is a consequence of the optimization landscape: small-magnitude balanced equations are a local optimum easier to find than large-magnitude balanced ones. Regardless of whether the constraint gradient points toward x=0 or not, the model converges to small scale because small numbers make |L-R|<0.5 trivially satisfiable. No loss function formulation within the single-optimizer framework can fix this.
@@ -351,11 +390,31 @@ Results:
 Root cause: The head is a tiny MLP trained to minimize `(sum coeff_i*(x_i+delta_i))²` which has the same global minimum at x=0 as the main constraint. Applied 400 times at inference, the head pushes numbers from backbone scale 2.89 → 1.03 (collapsing 3× over 400 corrections). Training/inference mismatch: at training time, backbone x0_pred residuals are moderate (backbone learns DSM), but the head is applied 400× at inference compounding small corrections into large scale collapse.
 CONCLUSION: Architectural separation of objectives preserves backbone scale but the head reintroduces the scale-shrinkage problem. Any loss that minimizes |L-R| has a global minimum at x=0.
 
+**Threshold curriculum (done, FAILED — depth8-threshold-curriculum):** Finetune from depth8-constraint-w2/itr_3000, hinge threshold decays 2.0→0.5 over 5k iters, w=2.0, const lr=1e-5.
+Scale behavior: grew 1.575→2.029 (peak at iter 2000 when threshold=1.4) then declined to 1.854 as threshold tightened. Accuracy: 50-step floored at 31-40%; 400-step recovered to 61.1% at itr_5000 (threshold=0.5, fully tightened).
+Key comparison: scale hinge sw=0.05 gives **70.4% at scale 1.895** while curriculum gives **61.1% at scale 1.854** — nearly identical scale but 9.3pp worse accuracy. CURRICULUM IS DOMINATED BY SW=0.05.
+Root cause: During the loose phase, DSM does grow scale (to 2.029), but when the threshold tightens below ~1.0, the constraint reasserts and pulls scale back down. The final state (scale 1.854, acc 61.1%) is not better than what scale hinge achieves directly.
+
+**H1-corrected (depth8-w2-long-s2, done 2026-05-02):** Finetune depth8-stabilize2/itr_2000, w=2.0, const lr=1e-5, 50k iters.
+50-step trajectory: 47.3%→48.4%→50.0%→50.0%→51.4%→54.6%→51.8%→52.2%→57.4% (itr_16k)→...→killed @ itr_22k.
+H1 SUCCESS CRITERION MET: 57.4% > 57% threshold. Second oscillation peak (57.4%) > first (54.6%) confirms rising envelope.
+Key finding: extended training does slowly improve ceiling but requires 16k iters to beat 5k record (55.6%); impractical for rapid iteration.
+
+**Per-position nonzero hinge (2026-05-02, new-depth8-* pipeline):** `mean_active(max(0, 0.5 - |x_i|)²)` added with weight=1.0.
+This directly targets the anchor trick: without it, the model pairs two matching non-zero anchor values and zeros all other active positions, trivially satisfying |L-R|<0.5 at zero scale cost.
+Results (160k dataset, 4-stage pipeline):
+- Stage 2 peak: 53.3% (old pipeline: 49.7%) — +3.6pp from hinge alone
+- Stage 3 (stabilize) peak: 59.2% (old pipeline: exactly 50.0% every time) — BROKE the w=1.0 50% ceiling! Scale: avg_max_abs=1.723
+- Stage 4 (w=2.0, all-hinge) peak: 59.8% (50-step); 400-step: 78.1%/87.8%/MAE 0.472/scale 1.458
+- Comparison: dropping hinge at Stage 4 → 400-step 80.6%/85.6%/scale 1.153 — scale collapses through 400 inference steps even from a better starting point
+KEY INSIGHT: The hinge is necessary AT INFERENCE TIME. Dropping it for Stage 4 (letting the model optimize without it) causes the 400-step denoising process to find the trivial minimum again, collapsing scale from 1.529 (50-step) to 1.153 (400-step). The model must keep the hinge active during generation to preserve scale.
+
 **Future work directions (all loss-function and architectural approaches tried — fundamental bottleneck confirmed):**
 1. **Separate numeric head** ← TRIED AND FAILED (see above)
-2. **Relative evaluation criterion**: change |L-R|<0.5 threshold to |L-R|/max(|L|,|R|)<0.1 in both loss and eval. Small-scale equations can no longer trivially satisfy the criterion.
-3. **Wasserstein/MMD on numeric marginals**: add a distribution-matching loss forcing generated numbers to match training data scale distribution directly.
-4. **Threshold curriculum**: hinge threshold decaying 2.0→0.5 over 5k iters (already implemented; `--hinge_threshold_start 2.0 --hinge_curriculum_iters 5000`). During the loose phase the constraint gives zero gradient → DSM pulls scale toward l5. Then tightening forces balance at higher scale.
+2. **Threshold curriculum** ← TRIED AND FAILED (see above)
+3. **Per-position nonzero hinge** ← TRIED, new Pareto point but -2.4pp accuracy; best scale Pareto so far
+4. **Relative evaluation criterion**: change |L-R|<0.5 threshold to |L-R|/max(|L|,|R|)<0.1 in both loss and eval. Small-scale equations can no longer trivially satisfy the criterion.
+5. **Wasserstein/MMD on numeric marginals**: add a distribution-matching loss forcing generated numbers to match training data scale distribution directly.
 
 ---
 
