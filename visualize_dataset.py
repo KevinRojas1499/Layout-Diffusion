@@ -6,9 +6,6 @@ import matplotlib.patches as patches
 import seaborn as sns
 from utils.datasets import get_dataset
 from utils.tokenizer import VocabTokenizer
-from rdkit import Chem
-from rdkit.Chem import rdMolDescriptors
-from openbabel import openbabel as ob
 import sys
 import os
 from contextlib import contextmanager
@@ -246,6 +243,8 @@ def plot_layout_sample(
 
     pad_id = tokenizer.pad_token_id
     mask_id = tokenizer.mask_token_id
+    bos_id = tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 10))
     ax.set_xlim(0, 1)
@@ -255,10 +254,14 @@ def plot_layout_sample(
     colors = ["#2ecc71", "#3498db", "#e74c3c", "#9b59b6", "#f39c12"]
     cat_colors = {f"<{c}>": colors[i % len(colors)] for i, c in enumerate(["text", "title", "list", "table", "figure"])}
 
-    n_valid = int(mask_np.sum())
+    n_valid = 0
     for i in range(len(mask_np)):
         if not mask_np[i]:
             continue
+        token_id = int(yt_np[i])
+        if token_id in (bos_id, eos_id):
+            continue
+
         x_center, y_center, w, h = xt_np[i]
         x_min = x_center - w / 2
         y_min = y_center - h / 2
@@ -267,13 +270,13 @@ def plot_layout_sample(
         w = np.clip(w, 0.01, 1 - x_min)
         h = np.clip(h, 0.01, 1 - y_min)
 
-        token_id = int(yt_np[i])
         if token_id in (pad_id, mask_id):
             label = "<pad>" if token_id == pad_id else "<M>"
             color = "#95a5a6"
         else:
             label = tokenizer.idx_to_atom.get(token_id, str(token_id))
             color = cat_colors.get(label, "#34495e")
+        n_valid += 1
 
         rect = patches.Rectangle((x_min, y_min), w, h, linewidth=1.5, edgecolor=color, facecolor="none")
         ax.add_patch(rect)
@@ -299,6 +302,9 @@ def plot_layout_sample(
 
 
 def plot_molecule(symbols, positions, out_file_name, smiles=None):
+    from openbabel import openbabel as ob
+    from rdkit import Chem
+    from rdkit.Chem import rdMolDescriptors
     """
     Plots a molecule in 3D with accurate bond detection using OpenBabel pipeline.
     Matches evaluation methodology: xyz → sdf (OpenBabel) → RDKit.

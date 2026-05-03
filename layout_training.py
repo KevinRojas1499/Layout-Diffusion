@@ -1,5 +1,6 @@
 """Layout training with Hydra config."""
 
+import json
 import os
 import torch
 import wandb
@@ -14,12 +15,14 @@ from omegaconf import OmegaConf
 from multimodal_interpolant import MultimodalInterpolant
 from branching_flows_interpolant import BranchingFlowsInterpolant
 from custom_datasets.multimodal_math import EquationsDataset, ParenthesizedEquationsDataset
-from custom_datasets.publaynet import PublayNetDataset, PUBLAYNET_VOCAB
+from custom_datasets.layout_labels import DATASET_REGISTRY as LAYOUT_REGISTRY, build_tokenizer as build_layout_tokenizer
+from custom_datasets.layoutflow_h5 import LayoutFlowH5Dataset
+from eval.layout import LayoutEvaluator
 from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler, CombinedOptimizer
-from models.mmdit_qm9 import MMDiTQM9, MMDiTBothVar
-from visualize_dataset import plot_sample, plot_sample_2, plot_layout_sample
-from multimodal_interpolant_both_var import MultimodalInterpolantBoth
+from models.mmdit_qm9 import MMDiTQM9
+from models.transformer import Transformer
+from visualize_dataset import plot_sample, plot_layout_sample
 
 from conf.schema import register_configs, LayoutConfigSchema
 
@@ -56,14 +59,14 @@ def _get_dataset_and_dims(cfg: LayoutConfigSchema):
     ds_cfg = cfg.dataset
     max_length = ds_cfg.max_length
 
-    if ds_cfg.name == "publaynet":
-        tokenizer = VocabTokenizer(vocab=PUBLAYNET_VOCAB)
-        dataset = PublayNetDataset(
-            tokenizer,
-            max_length=max_length,
+    if ds_cfg.name in LAYOUT_REGISTRY:
+        tokenizer = build_layout_tokenizer(ds_cfg.name)
+        dataset = LayoutFlowH5Dataset(
+            tokenizer=tokenizer,
+            dataset_name=ds_cfg.name,
             split=ds_cfg.split,
-            max_samples=ds_cfg.max_samples,
-            annotations_dir=ds_cfg.data_path,
+            max_length=max_length,
+            data_path=ds_cfg.data_path,
         )
         euclidean_dim = 4  # bbox: x_center, y_center, w, h
         hidden_dim = cfg.model.hidden_dim
@@ -97,18 +100,7 @@ def _get_model(cfg: LayoutConfigSchema, vocab_size: int, euclidean_dim: int, hid
     dim_modalities = [hidden_dim, hidden_dim]
     dim_conds = [hidden_dim, hidden_dim]
 
-    if m_cfg.name == "MMDiTBothVar":
-        model = MMDiTBothVar(
-            euclidean_dim=euclidean_dim,
-            vocab_size=vocab_size,
-            symbols_depth=m_cfg.symbols_depth,
-            positions_depth=m_cfg.positions_depth,
-            depth=m_cfg.depth,
-            dim_modalities=dim_modalities,
-            dim_joint_attn=hidden_dim,
-            dim_conds=dim_conds,
-        )
-    elif m_cfg.name == "DiT":
+    if m_cfg.name == "DiT":
         model = MMDiTQM9(
             branching_flows=cfg.interpolant.name == "branching",
             euclidean_dim=euclidean_dim,
@@ -119,6 +111,13 @@ def _get_model(cfg: LayoutConfigSchema, vocab_size: int, euclidean_dim: int, hid
             dim_modalities=dim_modalities,
             dim_joint_attn=hidden_dim,
             dim_conds=dim_conds,
+        )
+    elif m_cfg.name == "Transformer":
+        model = Transformer(
+            euclidean_dim=euclidean_dim,
+            vocab_size=vocab_size,
+            dim=hidden_dim,
+            depth=m_cfg.depth,
         )
     else:
         raise ValueError(f"Unknown model: {m_cfg.name}")
@@ -165,15 +164,6 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
             bos_token=tokenizer.bos_token_id,
             euclidean_dim=euclidean_dim,
         )
-    elif int_cfg.name == "multimodal_both":
-        return MultimodalInterpolantBoth(
-            max_length=max_length,
-            vocab_size=tokenizer.vocab_size,
-            mask_token=tokenizer.mask_token_id,
-            pad_token=tokenizer.pad_token_id,
-            bos_token=tokenizer.bos_token_id,
-            euclidean_dim=euclidean_dim,
-        )
     elif int_cfg.name == "branching":
         return BranchingFlowsInterpolant(
             vocab_size=tokenizer.vocab_size,
@@ -182,6 +172,38 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
             euclidean_dim=euclidean_dim,
         )
     raise ValueError(f"Unknown interpolant: {int_cfg.name}")
+
+
+def _build_evaluator(cfg: LayoutConfigSchema, tokenizer: VocabTokenizer, device: torch.device):
+    """Construct a LayoutEvaluator if eval is enabled and dataset is supported."""
+    eval_cfg = getattr(cfg, "eval", None)
+    if eval_cfg is None or not getattr(eval_cfg, "enabled", False):
+        return None
+    if cfg.dataset.name not in LAYOUT_REGISTRY:
+        return None
+    return LayoutEvaluator.for_dataset(
+        dataset_name=cfg.dataset.name,
+        tokenizer=tokenizer,
+        device=device,
+        layoutflow_root=getattr(eval_cfg, "layoutflow_root", None),
+    )
+
+
+@torch.no_grad()
+def _run_eval(evaluator, interpolant, model, eval_cfg, max_length, device):
+    """Generate `eval_cfg.num_samples` and compute FID + Alignment metrics."""
+    samples = interpolant.sampling(
+        model,
+        eval_cfg.num_steps,
+        eval_cfg.num_samples,
+        max_length + 1,
+        device,
+        return_trace=False,
+    )
+    mask = samples.y_mask_t if hasattr(samples, "y_mask_t") else samples.mask_t
+    return evaluator.evaluate_samples(
+        samples.xt, samples.yt, mask, batch_size=eval_cfg.batch_size,
+    )
 
 
 def load_checkpoint(
@@ -231,12 +253,14 @@ def main(cfg: LayoutConfigSchema) -> None:
 
     dataset, tokenizer, euclidean_dim, hidden_dim, max_length = _get_dataset_and_dims(cfg)
 
+    collate_fn = getattr(dataset, "dynamic_collate", None)
     dataloader = DataLoader(
         dataset,
         batch_size=run_cfg.batch_size,
         shuffle=True,
         num_workers=run_cfg.num_workers,
         drop_last=True,
+        collate_fn=collate_fn,
     )
 
     if run_cfg.enable_wandb:
@@ -248,6 +272,9 @@ def main(cfg: LayoutConfigSchema) -> None:
     scheduler = WarmUpScheduler(opt, run_cfg.warmup_iters)
     scaler = torch.amp.GradScaler()
     interpolant = _get_interpolant(cfg, dataset, tokenizer, euclidean_dim)
+
+    evaluator = _build_evaluator(cfg, tokenizer, device)
+    metrics_log_path = os.path.join(run_cfg.dir, "metrics.jsonl")
 
     start_iter = 0
     if run_cfg.load_checkpoint:
@@ -277,7 +304,18 @@ def main(cfg: LayoutConfigSchema) -> None:
                 data_[key] = value.to(device=device)
 
             opt.zero_grad()
-            losses = interpolant.compute_loss(model, data_)
+            if int_name == "multimodal" and run_cfg.aux_l1_weight > 0:
+                def aux_l1_loss_fn(prediction, sample, x1, y1):
+                    mask_t_shaped = sample.mask_t.unsqueeze(-1)
+                    masked_positions = (sample.yt == interpolant.mask_token)
+                    l1 = (sample.x1_ordered - prediction.clean_data).abs() * mask_t_shaped
+                    l1[:, 0] = 0.0
+                    l1 = l1.sum(dim=-1)[~masked_positions]
+                    l1 = l1.mean() / x1.shape[-1]
+                    return {"aux_l1_loss": l1}
+                losses = interpolant.compute_loss(model, data_, extra_loss_fn=aux_l1_loss_fn)
+            else:
+                losses = interpolant.compute_loss(model, data_)
 
             if int_name == "multimodal":
                 loss = (
@@ -286,13 +324,8 @@ def main(cfg: LayoutConfigSchema) -> None:
                     + losses["euclidean_unmasking_loss"]
                     + losses["insertion_loss"]
                 )
-            elif int_name == "multimodal_both":
-                loss = (
-                    losses["dsm_loss"]
-                    + losses["discrete_unmasking_loss"]
-                    + losses["euc_insertion_loss"]
-                    + losses["disc_insertion_loss"]
-                )
+                if "aux_l1_loss" in losses:
+                    loss = loss + run_cfg.aux_l1_weight * losses["aux_l1_loss"]
             elif int_name == "branching":
                 loss = (
                     losses["dsm_loss"]
@@ -324,13 +357,6 @@ def main(cfg: LayoutConfigSchema) -> None:
                     f"Euc: {losses['euclidean_unmasking_loss']:.4f}, "
                     f"Ins: {losses['insertion_loss']:.4f}"
                 )
-            elif int_name == "multimodal_both":
-                pbar.set_description(
-                    f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
-                    f"Disc: {losses['discrete_unmasking_loss']:.4f}, "
-                    f"EucIns: {losses['euc_insertion_loss']:.4f}, "
-                    f"DiscIns: {losses['disc_insertion_loss']:.4f}"
-                )
             elif int_name == "branching":
                 pbar.set_description(
                     f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
@@ -352,9 +378,26 @@ def main(cfg: LayoutConfigSchema) -> None:
                 if cfg.dataset.name == "publaynet":
                     vis_dir = os.path.join(path, "layouts")
                     os.makedirs(vis_dir, exist_ok=True)
+
+                if evaluator is not None:
+                    metrics = _run_eval(
+                        evaluator, interpolant, ema, cfg.eval, max_length, device,
+                    )
+                    metrics["iter"] = training_iter
+                    with open(metrics_log_path, "a") as f:
+                        f.write(json.dumps(metrics) + "\n")
+                    print(
+                        f"[eval @ iter {training_iter}] "
+                        f"FID={metrics['fid']:.3f} "
+                        f"Align={metrics['alignment-LayoutGAN++']:.4f} "
+                        f"Overlap={metrics['overlap-LayoutGAN++']:.4f}"
+                    )
+                    if run_cfg.enable_wandb:
+                        wandb.log({f"eval/{k}": v for k, v in metrics.items() if k != "iter"})
+
                 for i, sample in enumerate(samples):
                     if cfg.dataset.name == "publaynet":
-                        mask_t = getattr(sample, "y_mask_t", sample.mask_t)
+                        mask_t = sample.y_mask_t if hasattr(sample, "y_mask_t") else sample.mask_t
                         plot_layout_sample(
                             sample.xt.cpu(),
                             sample.yt.cpu(),
@@ -369,15 +412,6 @@ def main(cfg: LayoutConfigSchema) -> None:
                             sample.xt.cpu(),
                             sample.yt.cpu(),
                             sample.mask_t.cpu(),
-                            os.path.join(path, f"sample_{i}.png"),
-                            tokenizer,
-                        )
-                    elif int_name == "multimodal_both":
-                        plot_sample_2(
-                            sample.xt.cpu(),
-                            sample.yt.cpu(),
-                            sample.x_mask_t.cpu(),
-                            sample.y_mask_t.cpu(),
                             os.path.join(path, f"sample_{i}.png"),
                             tokenizer,
                         )

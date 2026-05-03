@@ -1,0 +1,11 @@
+defaults:
+  - base_model
+
+name: Transformer
+euclidean_dim: 4
+depth: 8
+hidden_dim: 256
+# unused for Transformer but required by ModelSchema:
+symbols_depth: 0
+positions_depth: 0
+use_spatial_bias: false

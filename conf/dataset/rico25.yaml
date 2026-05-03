@@ -1,0 +1,11 @@
+defaults:
+  - base_dataset
+
+name: rico25
+max_length: 25
+split: train
+max_samples: null
+# Where layout-dm's processed .pt files live. Default expects
+#   download/datasets/rico25-max25/processed/{train,val,test}.pt
+# (populated by `wget layoutdm_starter.zip && unzip ...`).
+data_path: download/datasets

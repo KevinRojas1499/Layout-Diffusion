@@ -6,9 +6,10 @@ defaults:
   - _self_
   - run: default
   - dataset: publaynet
-  - model: mmdit_dit
+  - model: transformer
   - optimizer: adamw
   - interpolant: multimodal
+  - eval: default
 
 # Root structure - config groups merge into these keys
 run: {}
@@ -16,3 +17,4 @@ dataset: {}
 model: {}
 optimizer: {}
 interpolant: {}
+eval: {}

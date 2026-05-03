@@ -18,3 +18,7 @@ num_steps_ablation/
 runs/
 eval/cache/
 .claude/
+layout-dm
+LayoutDM/
+layoutdm_starter.zip
+download/

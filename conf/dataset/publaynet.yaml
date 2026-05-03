@@ -2,9 +2,10 @@ defaults:
   - base_dataset
 
 name: publaynet
-max_length: 25
+max_length: 20
 split: train
 max_samples: null
-# data_path: path to annotations-only dir (train.json, val.json) to avoid ~130GB image download.
-# Run extract_annotations_to_json() once, upload the output dir, then set this path.
-data_path: null  # e.g. "data/publaynet_labels"
+# Directory containing the LayoutFlow h5 splits (publaynet_{train,val,test}.h5).
+# Populate with: `git clone https://huggingface.co/JulianGuerreiro/LayoutFlow`
+# and point at `<that-clone>/dataset/publaynet`.
+data_path: /workspace/LayoutFlow-data/dataset/publaynet

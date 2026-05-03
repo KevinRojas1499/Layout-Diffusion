@@ -7,3 +7,4 @@ symbols_depth: 4
 positions_depth: 4
 depth: 4
 hidden_dim: 256
+use_spatial_bias: true

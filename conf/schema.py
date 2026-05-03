@@ -1,6 +1,6 @@
 """Hydra schema definitions for layout training config validation."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from hydra.core.config_store import ConfigStore
 from hydra.types import MISSING
@@ -21,6 +21,7 @@ class RunSchema:
     enable_wandb: bool = False
     run_name: str = ""
     ema_beta: float = 0.9999
+    aux_l1_weight: float = 0.0
 
 
 @dataclass
@@ -38,12 +39,13 @@ class DatasetSchema:
 class ModelSchema:
     """Schema for model configuration."""
 
-    name: str = "MMDiTBothVar"
+    name: str = "Transformer"
     euclidean_dim: int = 4
     symbols_depth: int = 4
     positions_depth: int = 4
     depth: int = 4
     hidden_dim: int = 256
+    use_spatial_bias: bool = True
 
 
 @dataclass
@@ -61,7 +63,18 @@ class OptimizerSchema:
 class InterpolantSchema:
     """Schema for interpolant configuration."""
 
-    name: str = "multimodal_both"
+    name: str = "multimodal"
+
+
+@dataclass
+class EvalSchema:
+    """Schema for evaluation (FID + Alignment) during training."""
+
+    enabled: bool = True
+    num_samples: int = 2000
+    num_steps: int = 200
+    batch_size: int = 64
+    layoutflow_root: str | None = None
 
 
 @dataclass
@@ -73,6 +86,7 @@ class LayoutConfigSchema:
     model: ModelSchema = MISSING
     optimizer: OptimizerSchema = MISSING
     interpolant: InterpolantSchema = MISSING
+    eval: EvalSchema = field(default_factory=EvalSchema)
 
 
 def register_configs() -> None:
@@ -92,3 +106,4 @@ def register_configs() -> None:
     cs.store(group="model", name="base_model", node=ModelSchema)
     cs.store(group="optimizer", name="base_optimizer", node=OptimizerSchema)
     cs.store(group="interpolant", name="base_interpolant", node=InterpolantSchema)
+    cs.store(group="eval", name="base_eval", node=EvalSchema)

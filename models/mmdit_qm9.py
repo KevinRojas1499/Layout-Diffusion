@@ -410,15 +410,18 @@ class MMDiTQM9(nn.Module):
         # Compute pairwise spatial attention biases for each layer
         # Only apply to the euclidean/image modality
         # Get depth from joint_embedding
-        depth = len(self.joint_embedding.blocks)
-        spatial_biases = []
-        for layer_idx in range(depth):
-            # Compute spatial bias for this layer: (B, H, L, L)
-            spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=pos_mask)
-            spatial_biases.append(spatial_bias)
-        
-        # Format: (None for text, spatial_bias for image) for each layer
-        attn_biases = [(None, spatial_biases[layer_idx]) for layer_idx in range(depth)]
+        if self.spatial_bias is not None:
+            depth = len(self.joint_embedding.blocks)
+            spatial_biases = []
+            for layer_idx in range(depth):
+                # Compute spatial bias for this layer: (B, H, L, L)
+                spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=pos_mask)
+                spatial_biases.append(spatial_bias)
+
+            # Format: (None for text, spatial_bias for image) for each layer
+            attn_biases = [(None, spatial_biases[layer_idx]) for layer_idx in range(depth)]
+        else:
+            attn_biases = None
 
         text_tokens_hidden, euclidean_tokens_hidden = self.joint_embedding(
             modality_tokens = (cat_tokens, euclidean_tokens),
@@ -485,7 +488,7 @@ class MMDiTQM9(nn.Module):
 
 
 class MMDiTBothVar(nn.Module):
-    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, **kwargs):
+    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, use_spatial_bias=True, **kwargs):
         super().__init__()
         self.euclidean_dim = euclidean_dim
         self.vocab_size = vocab_size
@@ -493,6 +496,7 @@ class MMDiTBothVar(nn.Module):
         self.dim_conds = kwargs['dim_conds']
         self.dim_symbols = self.dim_modalities[0]
         self.dim_positions = self.dim_modalities[1]
+        self.use_spatial_bias = use_spatial_bias
         # Extract attention parameters for rotary embeddings
         self.dim_head = kwargs.get('dim_head', 64)
         self.heads = kwargs.get('heads', 8)
@@ -526,12 +530,15 @@ class MMDiTBothVar(nn.Module):
         # We'll get depth from kwargs
         depth = kwargs.get('depth', 4)
         heads = kwargs.get('heads', 8)
-        self.spatial_bias = PairwiseSpatialBias(
-            num_heads=heads,
-            num_layers=depth,
-            spatial_feat_dim=32,
-            max_distance=10.0
-        )
+        if self.use_spatial_bias:
+            self.spatial_bias = PairwiseSpatialBias(
+                num_heads=heads,
+                num_layers=depth,
+                spatial_feat_dim=32,
+                max_distance=10.0
+            )
+        else:
+            self.spatial_bias = None
 
         # Joint Embedding
         self.joint_embedding = MMDiT(**kwargs)
@@ -580,9 +587,10 @@ class MMDiTBothVar(nn.Module):
         muon_params_, adam_params_ = self._split_params_by_size(self.positions_dit.parameters())
         muon_params.extend(muon_params_)
         adam_params.extend(adam_params_)
-        muon_params_, adam_params_ = self._split_params_by_size(self.spatial_bias.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
+        if self.spatial_bias is not None:
+            muon_params_, adam_params_ = self._split_params_by_size(self.spatial_bias.parameters())
+            muon_params.extend(muon_params_)
+            adam_params.extend(adam_params_)
         return {"muon_params": muon_params, "adam_params": adam_params}
 
     def freeze_last_block(self, idx):
@@ -678,15 +686,18 @@ class MMDiTBothVar(nn.Module):
         # Compute pairwise spatial attention biases for each layer
         # Only apply to the euclidean/image modality
         # Get depth from joint_embedding
-        depth = len(self.joint_embedding.blocks)
-        spatial_biases = []
-        for layer_idx in range(depth):
-            # Compute spatial bias for this layer: (B, H, L, L)
-            spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=pos_mask)
-            spatial_biases.append(spatial_bias)
-        
-        # Format: (None for text, spatial_bias for image) for each layer
-        attn_biases = [(None, spatial_biases[layer_idx]) for layer_idx in range(depth)]
+        if self.spatial_bias is not None:
+            depth = len(self.joint_embedding.blocks)
+            spatial_biases = []
+            for layer_idx in range(depth):
+                # Compute spatial bias for this layer: (B, H, L, L)
+                spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=pos_mask)
+                spatial_biases.append(spatial_bias)
+
+            # Format: (None for text, spatial_bias for image) for each layer
+            attn_biases = [(None, spatial_biases[layer_idx]) for layer_idx in range(depth)]
+        else:
+            attn_biases = None
 
         text_tokens_hidden, euclidean_tokens_hidden = self.joint_embedding(
             modality_tokens = (cat_tokens, euclidean_tokens),
