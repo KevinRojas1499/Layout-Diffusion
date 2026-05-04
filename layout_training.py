@@ -120,6 +120,7 @@ def _get_model(cfg: LayoutConfigSchema, vocab_size: int, euclidean_dim: int, hid
             vocab_size=vocab_size,
             dim=hidden_dim,
             depth=m_cfg.depth,
+            use_rope=m_cfg.use_rope,
         )
     else:
         raise ValueError(f"Unknown model: {m_cfg.name}")
@@ -166,6 +167,7 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
             bos_token=tokenizer.bos_token_id,
             euclidean_dim=euclidean_dim,
             dsm_t_reweight=int_cfg.dsm_t_reweight,
+            cfg_dropout_prob=int_cfg.cfg_dropout_prob,
         )
     elif int_cfg.name == "branching":
         return BranchingFlowsInterpolant(

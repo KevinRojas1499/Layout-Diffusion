@@ -35,9 +35,12 @@ def parse_args():
     p.add_argument("--use_ema", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--sampler", type=str, default="split")
+    p.add_argument("--cfg_weight", type=float, default=0.0,
+                   help="Classifier-free guidance weight. 0 = no CFG.")
     p.add_argument("--depth", type=int, default=8)
     p.add_argument("--hidden_dim", type=int, default=256)
     p.add_argument("--use_spatial_bias", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--use_rope", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max_length", type=int, default=20, help="Our model's training max_length.")
     p.add_argument("--layoutflow_root", default="/workspace/LayoutFlow")
     p.add_argument("--out", default=None)
@@ -70,8 +73,9 @@ def main() -> None:
             "depth": args.depth,
             "hidden_dim": args.hidden_dim,
             "use_spatial_bias": args.use_spatial_bias,
+            "use_rope": args.use_rope,
         },
-        "interpolant": {"name": "multimodal", "dsm_t_reweight": False},
+        "interpolant": {"name": "multimodal", "dsm_t_reweight": False, "cfg_dropout_prob": 0.0},
     })
 
     # The dataset is constructed by _get_dataset_and_dims so the interpolant has a max_length;
@@ -102,6 +106,7 @@ def main() -> None:
         samples = interpolant.sampling(
             model, args.num_steps, b, max_length + 1, device,
             return_trace=False, sampler=args.sampler,
+            cfg_weight=args.cfg_weight,
         )
         xt_chunks.append(samples.xt)
         yt_chunks.append(samples.yt)
@@ -126,6 +131,7 @@ def main() -> None:
         "sampler": args.sampler,
         "seed": int(args.seed),
         "use_ema": bool(args.use_ema),
+        "cfg_weight": float(args.cfg_weight),
     })
 
     out_path = args.out or os.path.join(os.path.dirname(args.checkpoint), "metrics_layoutflow.json")

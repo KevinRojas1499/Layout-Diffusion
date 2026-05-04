@@ -253,6 +253,7 @@ class Transformer(nn.Module):
         head_dim: int = 64,
         max_seq_len: int = 1000,
         qk_norm: bool = True,
+        use_rope: bool = True,
         **kwargs,  # absorb (and ignore) extra kwargs for API parity
     ):
         super().__init__()
@@ -288,6 +289,9 @@ class Transformer(nn.Module):
         # ------- Rotary positional embeddings -------
         # Reuse the existing ``Rotary`` module so the rotary layout matches
         # what `apply_rotary_pos_emb` expects elsewhere in this codebase.
+        # Always construct the module (so checkpoint state_dicts load cleanly);
+        # skip its application in forward when use_rope is False.
+        self.use_rope = use_rope
         self.rope = Rotary(dim=head_dim, base=10_000)
         self.max_seq_len = max_seq_len
 
@@ -399,11 +403,16 @@ class Transformer(nn.Module):
 
         # ---- RoPE: cache uses the largest seq len seen so far. ----
         # Match the Julia indexing `rope[1:size(locs, 2)]` by slicing the cache
-        # to the current sequence length.
-        rope_cos, rope_sin = self.rope(x, seq_dim=1)
-        rope_cos = rope_cos[:, :L]
-        rope_sin = rope_sin[:, :L]
-        rotary_emb = (rope_cos, rope_sin)
+        # to the current sequence length. When use_rope=False, we pass None so
+        # attention skips the rotary application — the model becomes
+        # permutation-equivariant over tokens.
+        if self.use_rope:
+            rope_cos, rope_sin = self.rope(x, seq_dim=1)
+            rope_cos = rope_cos[:, :L]
+            rope_sin = rope_sin[:, :L]
+            rotary_emb = (rope_cos, rope_sin)
+        else:
+            rotary_emb = None
 
         # ---- Transformer stack ----
         for block in self.transformers:

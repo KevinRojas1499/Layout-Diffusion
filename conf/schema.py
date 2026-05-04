@@ -46,6 +46,7 @@ class ModelSchema:
     depth: int = 4
     hidden_dim: int = 256
     use_spatial_bias: bool = True
+    use_rope: bool = True
 
 
 @dataclass
@@ -65,6 +66,7 @@ class InterpolantSchema:
 
     name: str = "multimodal"
     dsm_t_reweight: bool = False
+    cfg_dropout_prob: float = 0.0
 
 
 @dataclass

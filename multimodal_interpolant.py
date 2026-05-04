@@ -115,6 +115,7 @@ class MultimodalInterpolant():
         bos_token: int = 10002,
         euclidean_dim: int = 3,
         dsm_t_reweight: bool = False,
+        cfg_dropout_prob: float = 0.0,
     ):
         super().__init__()
         self.max_length = max_length
@@ -125,6 +126,7 @@ class MultimodalInterpolant():
         self.bos_token = bos_token
         self.non_special_tokens = non_special_tokens
         self.dsm_t_reweight = dsm_t_reweight
+        self.cfg_dropout_prob = cfg_dropout_prob
 
     def dalpha(self, t):
         return torch.ones_like(t)
@@ -229,9 +231,28 @@ class MultimodalInterpolant():
         t = self.sample_time(_x1.shape[0], _x1.device)
         interpolant_sample = self.sample_interpolant(t, x1, y1, mask_1)
 
+        # CFG dropout: with probability cfg_dropout_prob per sample, replace yt with
+        # all mask_token in the model input. xt is left as-is (noised bbox).
+        # Loss masks below still use the original interpolant_sample.yt, so the
+        # *target* coverage is unchanged — only the model's input view of labels
+        # is dropped. Trains the "predict labels-and-clean-bbox from noised-bbox-
+        # only" pathway needed for the CFG uncond branch at inference.
+        if self.cfg_dropout_prob > 0.0:
+            B = interpolant_sample.yt.shape[0]
+            drop = (torch.rand(B, device=interpolant_sample.yt.device) < self.cfg_dropout_prob)
+            yt_in = torch.where(drop.unsqueeze(-1),
+                                torch.full_like(interpolant_sample.yt, self.mask_token),
+                                interpolant_sample.yt)
+            # BOS stays BOS even when dropped
+            yt_in[:, 0] = self.bos_token
+            xt_in = interpolant_sample.xt
+        else:
+            yt_in = interpolant_sample.yt
+            xt_in = interpolant_sample.xt
+
         prediction: MultimodalModelPrediction = model(
-            euclidean_tokens=interpolant_sample.xt,
-            cat_tokens=interpolant_sample.yt,
+            euclidean_tokens=xt_in,
+            cat_tokens=yt_in,
             symbols_mask=interpolant_sample.mask_t,
             pos_mask=interpolant_sample.mask_t,
             symbols_time=t,
@@ -398,6 +419,31 @@ class MultimodalInterpolant():
 
         return xt, yt, mask_t
     
+    def _predict(self, model, xt, yt, mask_t, t, cfg_weight: float):
+        cond = model(
+            cat_tokens=yt, euclidean_tokens=xt,
+            symbols_mask=mask_t, pos_mask=mask_t,
+            symbols_time=t, pos_time=t,
+        )
+        if cfg_weight == 0.0:
+            return cond
+        yt_uncond = torch.full_like(yt, self.mask_token)
+        yt_uncond[:, 0] = self.bos_token
+        uncond = model(
+            cat_tokens=yt_uncond, euclidean_tokens=xt,
+            symbols_mask=mask_t, pos_mask=mask_t,
+            symbols_time=t, pos_time=t,
+        )
+        w = cfg_weight
+        # Only guide the continuous bbox prediction — discrete-sampling outputs
+        # (label_logits, clean_data_unmasking, insertion_rate) stay conditional.
+        return MultimodalModelPrediction(
+            clean_data=(1 + w) * cond.clean_data - w * uncond.clean_data,
+            label_logits=cond.label_logits,
+            clean_data_unmasking=cond.clean_data_unmasking,
+            insertion_rate=cond.insertion_rate,
+        )
+
     @torch.no_grad()
     def sampling(
         self,
@@ -408,6 +454,7 @@ class MultimodalInterpolant():
         device: torch.device,
         return_trace: bool = False,
         sampler: str = 'split',
+        cfg_weight: float = 0.0,
     ) -> SamplingResult:
         if sampler == 'staggered':
             return self.staggered_sampler(model, steps, batch_size, max_length, device, return_trace)
@@ -433,14 +480,7 @@ class MultimodalInterpolant():
 
             is_last_step = (i == steps - 1)
 
-            prediction: MultimodalModelPrediction = model(
-                cat_tokens=yt,
-                euclidean_tokens=xt,
-                symbols_mask=mask_t,
-                pos_mask=mask_t,
-                symbols_time=t0,
-                pos_time=t0
-            )
+            prediction: MultimodalModelPrediction = self._predict(model, xt, yt, mask_t, t0, cfg_weight)
             if sampler == 'euler':
                 step_size = dt
             else:
@@ -466,14 +506,7 @@ class MultimodalInterpolant():
                     is_last_step=is_last_step,
                 )
             elif not is_last_step:
-                prediction_2: MultimodalModelPrediction = model(
-                    cat_tokens=yt,
-                    euclidean_tokens=xt,
-                    symbols_mask=mask_t,
-                    pos_mask=mask_t,
-                    symbols_time=t_mid,
-                    pos_time=t_mid
-                )
+                prediction_2: MultimodalModelPrediction = self._predict(model, xt, yt, mask_t, t_mid, cfg_weight)
                 xt, yt, mask_t = self.perform_insertions(
                     prediction=prediction_2,
                     xt=xt,
@@ -484,14 +517,7 @@ class MultimodalInterpolant():
                     max_length=max_length,
                     is_last_step=is_last_step,
                 )
-                prediction_3: MultimodalModelPrediction = model(
-                    cat_tokens=yt,
-                    euclidean_tokens=xt,
-                    symbols_mask=mask_t,
-                    pos_mask=mask_t,
-                    symbols_time=t1,
-                    pos_time=t1
-                )
+                prediction_3: MultimodalModelPrediction = self._predict(model, xt, yt, mask_t, t1, cfg_weight)
                 xt, yt = self.update_xt_yt(
                     prediction=prediction_3,
                     xt=xt,

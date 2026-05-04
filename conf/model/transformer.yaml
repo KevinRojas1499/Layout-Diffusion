@@ -9,3 +9,4 @@ hidden_dim: 256
 symbols_depth: 0
 positions_depth: 0
 use_spatial_bias: false
+use_rope: true

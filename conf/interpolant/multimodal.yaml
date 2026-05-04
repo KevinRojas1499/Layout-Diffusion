@@ -3,3 +3,4 @@ defaults:
 
 name: multimodal
 dsm_t_reweight: false
+cfg_dropout_prob: 0.0
