@@ -7,3 +7,4 @@ num_samples: 2000
 num_steps: 200
 batch_size: 64
 layoutflow_root: null
+sampler: split

@@ -64,6 +64,7 @@ class InterpolantSchema:
     """Schema for interpolant configuration."""
 
     name: str = "multimodal"
+    dsm_t_reweight: bool = False
 
 
 @dataclass
@@ -75,6 +76,7 @@ class EvalSchema:
     num_steps: int = 200
     batch_size: int = 64
     layoutflow_root: str | None = None
+    sampler: str = "split"
 
 
 @dataclass

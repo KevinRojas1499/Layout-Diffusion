@@ -39,6 +39,8 @@ def init_wandb(cfg: LayoutConfigSchema) -> None:
         tags=["training", "layout"],
         config=OmegaConf.to_container(cfg, resolve=True),
     )
+    wandb.define_metric("step")
+    wandb.define_metric("*", step_metric="step")
 
 
 @torch.no_grad()
@@ -163,6 +165,7 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
             pad_token=tokenizer.pad_token_id,
             bos_token=tokenizer.bos_token_id,
             euclidean_dim=euclidean_dim,
+            dsm_t_reweight=int_cfg.dsm_t_reweight,
         )
     elif int_cfg.name == "branching":
         return BranchingFlowsInterpolant(
@@ -199,6 +202,7 @@ def _run_eval(evaluator, interpolant, model, eval_cfg, max_length, device):
         max_length + 1,
         device,
         return_trace=False,
+        sampler=eval_cfg.sampler,
     )
     mask = samples.y_mask_t if hasattr(samples, "y_mask_t") else samples.mask_t
     return evaluator.evaluate_samples(
@@ -270,7 +274,6 @@ def main(cfg: LayoutConfigSchema) -> None:
     ema = deepcopy(model)
     opt = _get_optimizer(cfg, model)
     scheduler = WarmUpScheduler(opt, run_cfg.warmup_iters)
-    scaler = torch.amp.GradScaler()
     interpolant = _get_interpolant(cfg, dataset, tokenizer, euclidean_dim)
 
     evaluator = _build_evaluator(cfg, tokenizer, device)
@@ -304,39 +307,39 @@ def main(cfg: LayoutConfigSchema) -> None:
                 data_[key] = value.to(device=device)
 
             opt.zero_grad()
-            if int_name == "multimodal" and run_cfg.aux_l1_weight > 0:
-                def aux_l1_loss_fn(prediction, sample, x1, y1):
-                    mask_t_shaped = sample.mask_t.unsqueeze(-1)
-                    masked_positions = (sample.yt == interpolant.mask_token)
-                    l1 = (sample.x1_ordered - prediction.clean_data).abs() * mask_t_shaped
-                    l1[:, 0] = 0.0
-                    l1 = l1.sum(dim=-1)[~masked_positions]
-                    l1 = l1.mean() / x1.shape[-1]
-                    return {"aux_l1_loss": l1}
-                losses = interpolant.compute_loss(model, data_, extra_loss_fn=aux_l1_loss_fn)
-            else:
-                losses = interpolant.compute_loss(model, data_)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                if int_name == "multimodal" and run_cfg.aux_l1_weight > 0:
+                    def aux_l1_loss_fn(prediction, sample, x1, y1):
+                        mask_t_shaped = sample.mask_t.unsqueeze(-1)
+                        masked_positions = (sample.yt == interpolant.mask_token)
+                        l1 = (sample.x1_ordered - prediction.clean_data).abs() * mask_t_shaped
+                        l1[:, 0] = 0.0
+                        l1 = l1.sum(dim=-1)[~masked_positions]
+                        l1 = l1.mean() / x1.shape[-1]
+                        return {"aux_l1_loss": l1}
+                    losses = interpolant.compute_loss(model, data_, extra_loss_fn=aux_l1_loss_fn)
+                else:
+                    losses = interpolant.compute_loss(model, data_)
 
-            if int_name == "multimodal":
-                loss = (
-                    losses["dsm_loss"]
-                    + losses["discrete_unmasking_loss"]
-                    + losses["euclidean_unmasking_loss"]
-                    + losses["insertion_loss"]
-                )
-                if "aux_l1_loss" in losses:
-                    loss = loss + run_cfg.aux_l1_weight * losses["aux_l1_loss"]
-            elif int_name == "branching":
-                loss = (
-                    losses["dsm_loss"]
-                    + losses["discrete_unmasking_loss"]
-                    + losses["insertion_loss"]
-                )
-            else:
-                raise ValueError(f"Unknown interpolant: {int_name}")
+                if int_name == "multimodal":
+                    loss = (
+                        losses["dsm_loss"]
+                        + losses["discrete_unmasking_loss"]
+                        + losses["euclidean_unmasking_loss"]
+                        + losses["insertion_loss"]
+                    )
+                    if "aux_l1_loss" in losses:
+                        loss = loss + run_cfg.aux_l1_weight * losses["aux_l1_loss"]
+                elif int_name == "branching":
+                    loss = (
+                        losses["dsm_loss"]
+                        + losses["discrete_unmasking_loss"]
+                        + losses["insertion_loss"]
+                    )
+                else:
+                    raise ValueError(f"Unknown interpolant: {int_name}")
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             update_ema(ema, model, decay=run_cfg.ema_beta)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -344,8 +347,7 @@ def main(cfg: LayoutConfigSchema) -> None:
                 if param.grad is not None:
                     torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
 
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             scheduler.step()
             training_iter += 1
             loss_val = loss.detach().item()
@@ -393,7 +395,9 @@ def main(cfg: LayoutConfigSchema) -> None:
                         f"Overlap={metrics['overlap-LayoutGAN++']:.4f}"
                     )
                     if run_cfg.enable_wandb:
-                        wandb.log({f"eval/{k}": v for k, v in metrics.items() if k != "iter"})
+                        eval_log = {f"eval/{k}": v for k, v in metrics.items() if k != "iter"}
+                        eval_log["step"] = training_iter
+                        wandb.log(eval_log)
 
                 for i, sample in enumerate(samples):
                     if cfg.dataset.name == "publaynet":

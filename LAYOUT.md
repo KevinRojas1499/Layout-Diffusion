@@ -179,11 +179,34 @@ Each iteration:
 ### Current best (PubLayNet, LayoutFlow metric)
 
 ```
-Run dir:  (not yet — fresh baseline pending)
+Run dir:  runs/layout/publaynet-trial-015-dsm-tsqrt
+          (resumed from trial-014/itr_200000 → 400k total iters, dsm_t_reweight=true)
 Config:   Transformer (single-stream), depth=8, hidden_dim=256, ~15M params,
           multimodal interpolant, adamw lr=1e-4, batch=128,
-          aux_l1_weight=1.0, max_length=20, LayoutFlow h5 data.
-EMA FID:  unknown
+          aux_l1_weight=1.0, dsm_t_reweight=true (sqrt(t/(1-t))),
+          max_length=20, LayoutFlow h5 data.
+EMA FID:  Best single-checkpoint = 42.56 @ iter 390k. Last-5 mean (360-400k) = 43.27.
+          (Compare: trial-008 fully trained = 41.2; LayoutFlow paper uncond = 8.87.)
+
+⚠ Phase-A verdict — INCONCLUSIVE: trial-015 had +200k iters of training over the
+trial-014 checkpoint, so we can't isolate the reweight benefit from "more
+training." trial-014 was still descending at iter 200k. Need a counterfactual
+trial-016: trial-014/itr_200000 → 400k WITHOUT reweight (otherwise identical
+config) to attribute gains correctly.
+```
+
+### Trial-014 baseline reference (for Phase-A trial @ 50k anchor)
+
+```
+Run dir:  runs/layout/publaynet-trial-014-baseline (200k iters)
+Config:   Same as above but interpolant.dsm_t_reweight=false.
+EMA FID trajectory:
+  iter  10k: 438.39   align 0.0136   overlap 2.5069
+  iter  50k:  69.21   align 0.0038   overlap 0.2596
+  iter 100k:  59.74   align 0.0033   overlap 0.2870
+  iter 150k:  52.99   align 0.0033   overlap 0.2671
+  iter 200k:  47.45   align 0.0030   overlap 0.2392
+Phase-A comparison anchor: iter-50k EMA FID 69.21 (vs from-scratch trials).
 ```
 
 ### Stale reference (different metric / dataset, kept for context)

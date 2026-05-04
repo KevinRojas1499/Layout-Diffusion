@@ -114,6 +114,7 @@ class MultimodalInterpolant():
         pad_token: int = 10001,
         bos_token: int = 10002,
         euclidean_dim: int = 3,
+        dsm_t_reweight: bool = False,
     ):
         super().__init__()
         self.max_length = max_length
@@ -123,6 +124,7 @@ class MultimodalInterpolant():
         self.pad_token = pad_token
         self.bos_token = bos_token
         self.non_special_tokens = non_special_tokens
+        self.dsm_t_reweight = dsm_t_reweight
 
     def dalpha(self, t):
         return torch.ones_like(t)
@@ -245,6 +247,9 @@ class MultimodalInterpolant():
         # not masked: masked_positions.unsqueeze(-1)
         dsm_loss = (interpolant_sample.x1_ordered - prediction.clean_data)**2 * mask_t_shaped
         dsm_loss[:,0] = 0. # Don't take loss at the start of the sequence
+        if self.dsm_t_reweight:
+            weight = torch.sqrt(t / (1.0 - t).clamp(min=1e-5))
+            dsm_loss = dsm_loss * weight.view(-1, 1, 1)
         dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions]
         dsm_loss = dsm_loss.mean() / x1.shape[-1]
         # Insertion loss

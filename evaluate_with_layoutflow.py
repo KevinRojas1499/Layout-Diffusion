@@ -71,7 +71,7 @@ def main() -> None:
             "hidden_dim": args.hidden_dim,
             "use_spatial_bias": args.use_spatial_bias,
         },
-        "interpolant": {"name": "multimodal"},
+        "interpolant": {"name": "multimodal", "dsm_t_reweight": False},
     })
 
     # The dataset is constructed by _get_dataset_and_dims so the interpolant has a max_length;

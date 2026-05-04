@@ -2,3 +2,4 @@ defaults:
   - base_interpolant
 
 name: multimodal
+dsm_t_reweight: false
