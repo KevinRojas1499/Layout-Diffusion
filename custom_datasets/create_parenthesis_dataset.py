@@ -124,8 +124,6 @@ def evaluate_expression(text: str) -> float:
 
 def evaluate_equation_text(text: str) -> tuple[float, float]:
     text = text.strip()
-    if text.endswith("."):
-        text = text[:-1]
     if "=" not in text:
         raise ValueError("Equation text missing '='.")
     left_text, right_text = text.split("=", 1)
@@ -256,29 +254,28 @@ def generate_equation(
         
         left_text, left_symbols = format_side(left_terms, left_groups)
         right_text, right_symbols = format_side(right_terms, right_groups)
-        equation = f"{left_text}={right_text}."
-        
+        equation = f"{left_text}={right_text}"
+
         # Build parsed representation
         numbers = []
         symbols = []
-        
+
         for i, (sign, val) in enumerate(left_terms):
             if i == 0:
                 numbers.append(sign * val)
             else:
                 numbers.append(val)
-        
+
         symbols.extend(left_symbols)
         symbols.append("=")
-        
+
         for i, (sign, val) in enumerate(right_terms):
             if i == 0:
                 numbers.append(sign * val)
             else:
                 numbers.append(val)
-        
+
         symbols.extend(right_symbols)
-        symbols.append(".")
         
         return {
             "equation": equation,

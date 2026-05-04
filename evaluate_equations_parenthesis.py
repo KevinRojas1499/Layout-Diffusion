@@ -20,14 +20,6 @@ def _normalize_symbols(symbols) -> List[str]:
     return list(symbols)
 
 
-def _trim_until_dot(symbols: List[str]) -> List[str]:
-    out = []
-    for sym in symbols:
-        if sym == ".":
-            break
-        out.append(sym)
-    return out
-
 
 def _eval_implicit_numbers_expr(
     symbols: List[str],
@@ -110,10 +102,10 @@ def parse_equation(
     if not numbers:
         raise ValueError("No numbers available.")
 
-    symbols_seq = _trim_until_dot(_normalize_symbols(symbols))
+    symbols_seq = _normalize_symbols(symbols)
     eq_positions = [i for i, sym in enumerate(symbols_seq) if sym == "="]
     if len(eq_positions) != 1:
-        raise ValueError("Equation must contain exactly one '=' before '.'.")
+        raise ValueError("Equation must contain exactly one '='.")
 
     eq_idx = eq_positions[0]
     left_syms = symbols_seq[:eq_idx]
@@ -152,20 +144,14 @@ def parse_equation(
 
 
 def count_equation_symbols(symbols: List[str]) -> int:
-    symbols_seq = _normalize_symbols(symbols)
-    count = 0
-    for sym in symbols_seq:
-        count += 1
-        if sym == ".":
-            break
-    return count
+    return len(_normalize_symbols(symbols))
 
 
 def count_equation_symbols_from_text(text: str) -> int:
     text = text.strip()
     if not text:
         return 0
-    return sum(1 for ch in text if ch in {"+", "-", "*", "/", "=", "."})
+    return sum(1 for ch in text if ch in {"+", "-", "*", "/", "="})
 
 
 @click.command()
