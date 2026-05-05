@@ -22,6 +22,9 @@ import os
 import torch
 from omegaconf import OmegaConf
 
+from torch.utils.data import DataLoader
+
+from custom_datasets.layoutflow_h5 import LayoutFlowH5Dataset
 from eval.layout import LayoutEvaluator
 from layout_training import _get_dataset_and_dims, _get_interpolant, _get_model
 
@@ -42,7 +45,10 @@ def parse_args():
     p.add_argument("--use_spatial_bias", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--use_rope", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max_length", type=int, default=20, help="Our model's training max_length.")
-    p.add_argument("--layoutflow_root", default="/workspace/LayoutFlow")
+    p.add_argument("--dataset", choices=["publaynet", "rico25"], default="publaynet")
+    p.add_argument("--cond_mode", choices=["uncond", "cat_cond"], default="uncond",
+                   help="cat_cond: draw real test-set categories and only diffuse positions.")
+    p.add_argument("--layoutflow_root", default="/workspace/Variable-Length-Diffusion-Toy/LayoutFlow")
     p.add_argument("--out", default=None)
     return p.parse_args()
 
@@ -58,10 +64,14 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    data_path = {
+        "publaynet": "/workspace/LayoutFlow-data/dataset/publaynet",
+        "rico25": "/workspace/LayoutFlow-data/dataset/rico",
+    }[args.dataset]
     cfg = OmegaConf.create({
         "dataset": {
-            "name": "publaynet",
-            "data_path": None,  # not loaded — we sample from the model, not the dataset
+            "name": args.dataset,
+            "data_path": data_path,
             "max_length": args.max_length,
             "split": "val",
             "max_samples": None,
@@ -78,9 +88,6 @@ def main() -> None:
         "interpolant": {"name": "multimodal", "dsm_t_reweight": False, "cfg_dropout_prob": 0.0},
     })
 
-    # The dataset is constructed by _get_dataset_and_dims so the interpolant has a max_length;
-    # the data itself is unused at evaluation time. Skip dataset load by stubbing data_path.
-    cfg.dataset.data_path = "/workspace/LayoutFlow-data/dataset/publaynet"
     dataset, tokenizer, euclidean_dim, hidden_dim, max_length = _get_dataset_and_dims(cfg)
     model = _get_model(cfg, tokenizer.vocab_size, euclidean_dim, hidden_dim, device)
     interpolant = _get_interpolant(cfg, dataset, tokenizer, euclidean_dim)
@@ -91,7 +98,7 @@ def main() -> None:
     model.eval()
 
     evaluator = LayoutEvaluator.for_dataset(
-        dataset_name="publaynet", tokenizer=tokenizer, device=device,
+        dataset_name=args.dataset, tokenizer=tokenizer, device=device,
         layoutflow_root=args.layoutflow_root,
     )
 
@@ -101,17 +108,55 @@ def main() -> None:
 
     xt_chunks, yt_chunks, mask_chunks = [], [], []
     n_done = 0
-    while n_done < args.num_samples:
-        b = min(args.batch_size, args.num_samples - n_done)
-        samples = interpolant.sampling(
-            model, args.num_steps, b, max_length + 1, device,
-            return_trace=False, sampler=args.sampler,
-            cfg_weight=args.cfg_weight,
+
+    if args.cond_mode == "cat_cond":
+        # Pull real (y, mask) pairs from the TEST split — same source the FID
+        # mu/sigma was computed against. This makes cat_cond FID a true
+        # conditional metric (predict positions given test categories).
+        test_ds = LayoutFlowH5Dataset(
+            tokenizer=tokenizer,
+            dataset_name=args.dataset,
+            split="test",
+            max_length=args.max_length,
+            data_path=data_path,
         )
-        xt_chunks.append(samples.xt)
-        yt_chunks.append(samples.yt)
-        mask_chunks.append(_get_layout_mask(samples))
-        n_done += b
+        test_loader = DataLoader(
+            test_ds, batch_size=args.batch_size, shuffle=False,
+            collate_fn=test_ds.dynamic_collate,
+        )
+        test_iter = iter(test_loader)
+        while n_done < args.num_samples:
+            try:
+                batch = next(test_iter)
+            except StopIteration:
+                test_iter = iter(test_loader)
+                batch = next(test_iter)
+            b = min(batch["x"].size(0), args.num_samples - n_done)
+            x_real = batch["x"][:b].to(device)
+            y_real = batch["y"][:b].to(device)
+            mask_real = batch["mask"][:b].to(device)
+            # Match the BOS-prepending the trainer does (interpolant.pad_sequence).
+            _, y_padded, mask_padded = interpolant.pad_sequence(x_real, y_real, mask_real)
+            samples = interpolant.cat_cond_sampling(
+                model, y_padded, mask_padded, args.num_steps, device,
+                return_trace=False,
+            )
+            xt_chunks.append(samples.xt)
+            yt_chunks.append(samples.yt)
+            mask_chunks.append(_get_layout_mask(samples))
+            n_done += b
+    else:
+        while n_done < args.num_samples:
+            b = min(args.batch_size, args.num_samples - n_done)
+            samples = interpolant.sampling(
+                model, args.num_steps, b, max_length + 1, device,
+                return_trace=False, sampler=args.sampler,
+                cfg_weight=args.cfg_weight,
+            )
+            xt_chunks.append(samples.xt)
+            yt_chunks.append(samples.yt)
+            mask_chunks.append(_get_layout_mask(samples))
+            n_done += b
 
     # Concatenate along batch and pad to common L for evaluator.
     L = max(c.size(1) for c in xt_chunks)
@@ -132,6 +177,7 @@ def main() -> None:
         "seed": int(args.seed),
         "use_ema": bool(args.use_ema),
         "cfg_weight": float(args.cfg_weight),
+        "cond_mode": args.cond_mode,
     })
 
     out_path = args.out or os.path.join(os.path.dirname(args.checkpoint), "metrics_layoutflow.json")

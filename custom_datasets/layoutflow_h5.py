@@ -3,9 +3,12 @@
 LayoutFlow (Guerreiro et al., ECCV'24) ships preprocessed HDF5 data on Hugging
 Face with the LayoutFormer++/LayoutDiffusion split. Each top-level key is one
 layout, with fields:
-    bbox       : [L, 4]  (x_top_left, y_top_left, w, h)  in [0, 1]
-    categories : [L]     int in 1..num_classes (0 reserved for padding)
-    length     : []      int in [1, 20]
+    bbox                : [L, 4]  (x_top_left, y_top_left, w, h)  in [0, 1]
+    categories / type   : [L]     int in 1..num_classes (0 reserved for padding)
+    length              : []      int in [1, 20]
+
+The category-index field is named `categories` in the PubLayNet h5 and `type`
+in the RICO h5 — LayoutFlow's own loaders paper over this same gap.
 
 We expose layouts in the form expected by this repo's training loop:
     x : [max_length, 4]  bbox in (cx, cy, w, h) normalized to [-1, 1]
@@ -51,6 +54,13 @@ _LABELS_BY_DATASET = {
     "rico25": RICO25_LABELS,
 }
 
+# h5 field name holding the category index per element. PubLayNet uses
+# `categories`; RICO uses `type`.
+_CAT_FIELD_BY_DATASET = {
+    "publaynet": "categories",
+    "rico25": "type",
+}
+
 
 def _cat_to_token_id(tokenizer: VocabTokenizer, dataset_name: str) -> torch.LongTensor:
     """Map h5 category id (1..N) -> tokenizer's token id. Index 0 stays as pad."""
@@ -93,6 +103,7 @@ class LayoutFlowH5Dataset(Dataset):
                 f"{path} not found. Clone https://huggingface.co/JulianGuerreiro/LayoutFlow."
             )
 
+        cat_field = _CAT_FIELD_BY_DATASET[dataset_name]
         # Read everything into memory once at construction. The PubLayNet train h5 is ~700MB
         # but flattened bboxes/labels are small (~100MB), and avoids per-worker h5 file handles.
         with h5py.File(path, "r") as f:
@@ -113,7 +124,7 @@ class LayoutFlowH5Dataset(Dataset):
                 if L == 0:
                     continue
                 bbox = np.array(f[k]["bbox"])[:L].astype(np.float32)
-                cats = np.array(f[k]["categories"])[:L].astype(np.int64).flatten()
+                cats = np.array(f[k][cat_field])[:L].astype(np.int64).flatten()
                 # (x_topleft, y_topleft, w, h) in [0,1] -> (cx, cy, w, h) in [-1, 1]
                 bbox[:, 0] = bbox[:, 0] + bbox[:, 2] / 2.0
                 bbox[:, 1] = bbox[:, 1] + bbox[:, 3] / 2.0

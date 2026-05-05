@@ -41,6 +41,8 @@ class CustomJSONEncoder(JSONEncoder):
 @click.option('--enable_plotting', is_flag=True, default=False)
 @click.option('--use_ema', is_flag=True, default=False)
 @click.option('--model', type=click.Choice(['radd', 'DiT', 'Transformer']), default='DiT')
+@click.option('--amp_dtype', type=click.Choice(['fp32', 'bf16', 'fp16']), default='fp32',
+              help='Mixed-precision dtype for the sampling forward pass. fp32 disables autocast.')
 def sampling(**opts):
     opts = dotdict(opts)
     batch_size = opts.batch_size
@@ -107,17 +109,23 @@ def sampling(**opts):
     if not os.path.exists(opts.dir) and rank == 0:
         os.makedirs(opts.dir)
 
+    amp_dtype_map = {'fp32': None, 'bf16': torch.bfloat16, 'fp16': torch.float16}
+    amp_dtype = amp_dtype_map[opts.amp_dtype]
+    if rank == 0:
+        print(f"AMP dtype: {opts.amp_dtype} (autocast {'enabled' if amp_dtype is not None else 'disabled'})")
+
     output_samples = {"molecules": []}
     for _ in tqdm(range(num_samples // batch_size + 1), desc="Sampling"):
-        samples = interpolant.sampling(
-            model,
-            num_steps,
-            batch_size,
-            dataset.max_length,
-            device,
-            return_trace=opts.return_trace,
-            sampler=opts.sampler,
-        )
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            samples = interpolant.sampling(
+                model,
+                num_steps,
+                batch_size,
+                dataset.max_length,
+                device,
+                return_trace=opts.return_trace,
+                sampler=opts.sampler,
+            )
         for i, sample in enumerate(samples):
             symbols = character_tokenizer.decode(sample.yt.cpu())
             positions = sample.xt.cpu()[1:len(symbols)+1, :]

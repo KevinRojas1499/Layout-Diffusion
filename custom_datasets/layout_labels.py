@@ -13,12 +13,16 @@ from utils.tokenizer import VocabTokenizer
 # (`pretrained/fid_publaynet.pth.tar`) was trained against these orderings;
 # using a different one scrambles emb_label lookups.
 PUBLAYNET_LABELS = ["text", "title", "list", "table", "figure"]
+# Order matches LayoutFlow's RICO `TYPE_2_CAT` (positions 1..25). The h5 files
+# encode element type as `type ∈ 1..25` using this exact order, and LayoutFlow's
+# RICO LayoutNet was trained with the same label index → embedding mapping.
+# Keeping the position alignment is what lets the FID metric round-trip.
 RICO25_LABELS = [
-    "Text", "Image", "Icon", "Text Button", "List Item", "Input",
-    "Background Image", "Card", "Web View", "Radio Button", "Drawer",
-    "Checkbox", "Advertisement", "Modal", "Pager Indicator", "Slider",
-    "On/Off Switch", "Button Bar", "Toolbar", "Number Stepper",
-    "Multi-Tab", "Date Picker", "Map View", "Video", "Bottom Navigation",
+    "Advertisement", "Video", "Checkbox", "Drawer", "Icon",
+    "Image", "Input", "List Item", "Modal", "Pager Indicator",
+    "Text", "Toolbar", "Web View", "Map View", "Text Button",
+    "Background Image", "Slider", "Multi-Tab", "Radio Button", "Date Picker",
+    "Number Stepper", "Card", "On/Off Switch", "Bottom Navigation", "Button Bar",
 ]
 
 

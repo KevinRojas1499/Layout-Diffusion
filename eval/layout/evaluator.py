@@ -39,6 +39,14 @@ from .metrics import compute_alignment, compute_overlap, frechet_from_stats
 LAYOUTFLOW_MAX_BBOX = 20
 LAYOUTFLOW_DEFAULT_ROOT = "/workspace/LayoutFlow"
 
+# Our dataset_name → the suffix LayoutFlow uses on its pretrained asset filenames
+# (`fid_<suffix>.pth.tar`, `FIDNet_musig_test_<suffix>.pt`). They drop the "25"
+# from rico25.
+_LAYOUTFLOW_ASSET_SUFFIX = {
+    "publaynet": "publaynet",
+    "rico25": "rico",
+}
+
 
 @dataclass
 class LayoutEvaluator:
@@ -70,16 +78,13 @@ class LayoutEvaluator:
             raise ValueError(
                 f"Unknown dataset_name {dataset_name!r}. Known: {list(DATASET_REGISTRY)}"
             )
-        if dataset_name != "publaynet":
-            raise ValueError(
-                f"LayoutFlow eval pipeline currently only supports 'publaynet', got {dataset_name!r}."
-            )
         ordered_tokens, num_classes = DATASET_REGISTRY[dataset_name]
         id_to_class, _ = build_class_index_map(tokenizer, ordered_tokens)
 
         root = layoutflow_root or LAYOUTFLOW_DEFAULT_ROOT
-        weight_path = os.path.join(root, "pretrained", f"fid_{dataset_name}.pth.tar")
-        musig_path = os.path.join(root, "pretrained", f"FIDNet_musig_test_{dataset_name}.pt")
+        suffix = _LAYOUTFLOW_ASSET_SUFFIX[dataset_name]
+        weight_path = os.path.join(root, "pretrained", f"fid_{suffix}.pth.tar")
+        musig_path = os.path.join(root, "pretrained", f"FIDNet_musig_test_{suffix}.pt")
         if not os.path.exists(weight_path) or not os.path.exists(musig_path):
             raise FileNotFoundError(
                 f"LayoutFlow assets not found under {root}/pretrained. "

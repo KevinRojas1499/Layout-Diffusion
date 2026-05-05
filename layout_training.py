@@ -19,7 +19,7 @@ from custom_datasets.layout_labels import DATASET_REGISTRY as LAYOUT_REGISTRY, b
 from custom_datasets.layoutflow_h5 import LayoutFlowH5Dataset
 from eval.layout import LayoutEvaluator
 from utils.tokenizer import VocabTokenizer
-from utils.optimizers import WarmUpScheduler, CombinedOptimizer
+from utils.optimizers import WarmUpScheduler, CosineDecayScheduler, CombinedOptimizer
 from models.mmdit_qm9 import MMDiTQM9
 from models.transformer import Transformer
 from visualize_dataset import plot_sample, plot_layout_sample
@@ -168,6 +168,7 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
             euclidean_dim=euclidean_dim,
             dsm_t_reweight=int_cfg.dsm_t_reweight,
             cfg_dropout_prob=int_cfg.cfg_dropout_prob,
+            cat_cond_prob=int_cfg.cat_cond_prob,
         )
     elif int_cfg.name == "branching":
         return BranchingFlowsInterpolant(
@@ -212,21 +213,26 @@ def _run_eval(evaluator, interpolant, model, eval_cfg, max_length, device):
     )
 
 
-def load_checkpoint(
+def load_checkpoint_state(
     load_path: str,
     device: torch.device,
     model: torch.nn.Module,
     ema: torch.nn.Module,
     opt: torch.optim.Optimizer,
-    scheduler: WarmUpScheduler,
-) -> int:
-    """Load checkpoint and return start iteration."""
+) -> tuple[int, dict]:
+    """Load model+ema+optimizer state and return (start_iter, scheduler_state).
+
+    Scheduler state is returned separately so the caller can either rehydrate
+    the original scheduler or build a new one (e.g. swap to cosine decay on
+    resume).
+    """
     snapshot = torch.load(load_path, weights_only=True)
     model.load_state_dict(snapshot["model"], strict=False)
     ema.load_state_dict(snapshot["ema"], strict=False)
     opt.load_state_dict(snapshot["optimizer"])
-    scheduler.load_state_dict(snapshot["scheduler"])
-    return scheduler.last_epoch
+    sched_state = snapshot["scheduler"]
+    start_iter = int(sched_state.get("last_epoch", -1)) + 1
+    return start_iter, sched_state
 
 
 def save_ckpt(
@@ -275,22 +281,27 @@ def main(cfg: LayoutConfigSchema) -> None:
     model = _get_model(cfg, tokenizer.vocab_size, euclidean_dim, hidden_dim, device)
     ema = deepcopy(model)
     opt = _get_optimizer(cfg, model)
-    scheduler = WarmUpScheduler(opt, run_cfg.warmup_iters)
     interpolant = _get_interpolant(cfg, dataset, tokenizer, euclidean_dim)
 
     evaluator = _build_evaluator(cfg, tokenizer, device)
     metrics_log_path = os.path.join(run_cfg.dir, "metrics.jsonl")
 
     start_iter = 0
+    saved_sched_state = None
     if run_cfg.load_checkpoint:
-        start_iter = load_checkpoint(
-            run_cfg.load_checkpoint,
-            device,
-            model,
-            ema,
-            opt,
-            scheduler,
+        start_iter, saved_sched_state = load_checkpoint_state(
+            run_cfg.load_checkpoint, device, model, ema, opt,
         )
+
+    if run_cfg.lr_decay:
+        # Skip warmup on resume; decay from optimizer.lr to lr_min over the
+        # remaining training budget. Don't replay the saved scheduler state.
+        decay_steps = max(1, run_cfg.num_iters - start_iter)
+        scheduler = CosineDecayScheduler(opt, total_steps=decay_steps, min_lr=run_cfg.lr_min)
+    else:
+        scheduler = WarmUpScheduler(opt, run_cfg.warmup_iters)
+        if saved_sched_state is not None:
+            scheduler.load_state_dict(saved_sched_state)
 
     model.train()
 
@@ -379,7 +390,7 @@ def main(cfg: LayoutConfigSchema) -> None:
                 model.eval()
 
                 samples = interpolant.sampling(model, 50, 20, max_length + 1, device, return_trace=True)
-                if cfg.dataset.name == "publaynet":
+                if cfg.dataset.name in LAYOUT_REGISTRY:
                     vis_dir = os.path.join(path, "layouts")
                     os.makedirs(vis_dir, exist_ok=True)
 
@@ -402,7 +413,7 @@ def main(cfg: LayoutConfigSchema) -> None:
                         wandb.log(eval_log)
 
                 for i, sample in enumerate(samples):
-                    if cfg.dataset.name == "publaynet":
+                    if cfg.dataset.name in LAYOUT_REGISTRY:
                         mask_t = sample.y_mask_t if hasattr(sample, "y_mask_t") else sample.mask_t
                         plot_layout_sample(
                             sample.xt.cpu(),

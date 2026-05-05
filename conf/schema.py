@@ -22,6 +22,11 @@ class RunSchema:
     run_name: str = ""
     ema_beta: float = 0.9999
     aux_l1_weight: float = 0.0
+    # Cosine LR decay from optimizer.lr down to lr_min, applied AFTER any
+    # checkpoint resume (warmup is skipped in this mode — the model is
+    # already warm). Decays over (num_iters - start_iter) steps.
+    lr_decay: bool = False
+    lr_min: float = 1e-5
 
 
 @dataclass
@@ -67,6 +72,10 @@ class InterpolantSchema:
     name: str = "multimodal"
     dsm_t_reweight: bool = False
     cfg_dropout_prob: float = 0.0
+    # Per-batch probability of training in category-conditioned mode:
+    # symbols_time=1 (categories given clean), only the position flow is denoised.
+    # 0.0 = pure uncond (current behavior). 0.5 = even mix.
+    cat_cond_prob: float = 0.0
 
 
 @dataclass
