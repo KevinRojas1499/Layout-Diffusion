@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from models.mmdit import MMDiT, FinalLayer
 from multimodal_interpolant import MultimodalModelPrediction
 from multimodal_interpolant_both_var import MultimodalModelPredictionBothVar
-from fixed_length_multimodal_interpolant import FixedLengthMultimodalModelPrediction
 from model.rotary import Rotary
 
 
@@ -200,7 +199,7 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 class MMDiTQM9(nn.Module):
-    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, branching_flows: bool = False, autoregressive: bool = False, **kwargs):
+    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, branching_flows: bool = False, **kwargs):
         super().__init__()
         self.euclidean_dim = euclidean_dim
         self.vocab_size = vocab_size
@@ -209,7 +208,6 @@ class MMDiTQM9(nn.Module):
         self.dim_symbols = self.dim_modalities[0]
         self.dim_positions = self.dim_modalities[1]
         self.branching_flows = branching_flows
-        self.autoregressive = autoregressive
         # Extract attention parameters for rotary embeddings
         self.dim_head = kwargs.get('dim_head', 64)
         self.heads = kwargs.get('heads', 8)
@@ -259,11 +257,6 @@ class MMDiTQM9(nn.Module):
         self.symbols_dit = MMDiT(depth = symbols_depth, dim_modalities = [self.dim_symbols], dim_conds = [self.dim_symbols], **block_kwargs)
         self.positions_dit = MMDiT(depth = positions_depth, dim_modalities = [self.dim_positions], dim_conds = [self.dim_positions], **block_kwargs)
 
-        # Fusing layers
-        self.label_fuse = nn.Sequential(nn.Linear(self.dim_symbols + self.dim_positions, self.dim_symbols), nn.SiLU())
-        self.insert_fuse = nn.Sequential(nn.Linear(self.dim_symbols + self.dim_positions, self.dim_symbols), nn.SiLU())
-        self.euclidean_fuse = nn.Sequential(nn.Linear(self.dim_symbols + self.dim_positions, self.dim_positions), nn.SiLU())
-
         # Final Layers
         self.insertion_rate = FinalLayer(self.dim_positions, 1)
         self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
@@ -308,10 +301,6 @@ class MMDiTQM9(nn.Module):
         muon_params_, adam_params_ = self.split_params_by_size(self.positions_dit.parameters())
         muon_params.extend(muon_params_)
         adam_params.extend(adam_params_)
-        # Fusing layers
-        adam_params.extend(self.label_fuse.parameters())
-        adam_params.extend(self.insert_fuse.parameters())
-        adam_params.extend(self.euclidean_fuse.parameters())
         # Spatial Bias
         muon_params_, adam_params_ = self.split_params_by_size(self.spatial_bias.parameters())
         muon_params.extend(muon_params_)
@@ -440,6 +429,8 @@ class MMDiTQM9(nn.Module):
             rotary_pos_emb = ((text_cos, text_sin),),
         )[0]
 
+        # Predict unmasking probabilities for symbols
+        label_logits = self.symbols_pred_layer(cat_tokens, symbols_time)
 
         euclidean_tokens = self.positions_dit(
             modality_tokens = (euclidean_tokens_hidden,),
@@ -447,28 +438,16 @@ class MMDiTQM9(nn.Module):
             time_cond = (pos_time,),
             rotary_pos_emb = ((image_cos, image_sin),),
         )[0]
-        # Fuse the tokens
-        hidden_representation = torch.cat([cat_tokens, euclidean_tokens], dim=-1)
-        label_representation = cat_tokens + self.label_fuse(hidden_representation)
-        insert_representation = cat_tokens + self.insert_fuse(hidden_representation)
-        euclidean_representation = euclidean_tokens + self.euclidean_fuse(hidden_representation)
-
-        # Predict unmasking probabilities for symbols
-        label_logits = self.symbols_pred_layer(label_representation, symbols_time)
         # Clean data prediction
-        clean_data_pred = self.positions_pred_layer(euclidean_representation, pos_time)
+        clean_data_pred = self.positions_pred_layer(euclidean_tokens, pos_time)
         # Clean data prediction for the insertion
         if not self.branching_flows:
-            clean_data_unmasking= self.positions_unmask_pred(euclidean_representation, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
+            clean_data_unmasking= self.positions_unmask_pred(euclidean_tokens, pos_time).view(B, L, self.vocab_size, self.euclidean_dim)
         # Insertion rate prediction
-        if self.autoregressive:
-            # Single sequence-level output: pool over valid positions, then predict once
-            insert_pooled = (insert_representation * pos_mask.unsqueeze(-1)).sum(dim=1) / pos_mask.sum(dim=1, keepdim=True).clamp(min=1)
-            insertion_rate = self.insertion_rate(insert_pooled.unsqueeze(1), pos_time).squeeze(-1)  # [B, 1]
-        else:
-            insertion_rate = self.insertion_rate(insert_representation, pos_time).squeeze(-1)  # [B, L]
-            insertion_rate = insertion_rate * pos_mask
+        # TODO : Maybe the insertion rate could use both cat tokens and euclidean ones
+        insertion_rate = self.insertion_rate(cat_tokens, pos_time).squeeze(-1)  # [B, L]
         insertion_rate = F.softplus(insertion_rate)
+        insertion_rate = insertion_rate * pos_mask
 
         if self.branching_flows:
             return BranchingFlowsPrediction(
@@ -548,43 +527,6 @@ class MMDiTBothVar(nn.Module):
         self.disc_insertion_rate = FinalLayer(self.dim_symbols, 1)
         self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
         self.positions_pred_layer = FinalLayer(self.dim_positions, euclidean_dim)
-
-    def _split_params_by_size(self, params):
-        muon_params = []
-        adam_params = []
-        for p in params:
-            if p.ndim == 2:
-                muon_params.append(p)
-            else:
-                adam_params.append(p)
-        return muon_params, adam_params
-
-    def get_muon_adam_params(self):
-        adam_params = []
-        adam_params.extend(list(self.symbols_time_encoder.mlp.parameters()))
-        adam_params.extend(list(self.positions_time_encoder.mlp.parameters()))
-        adam_params.extend(list(self.symbols_embedder.parameters()))
-        adam_params.extend(list(self.gaussian_fourier_projs.parameters()))
-        adam_params.extend(list(self.euclidean_proj.parameters()))
-        adam_params.extend(list(self.euc_insertion_rate.parameters()))
-        adam_params.extend(list(self.disc_insertion_rate.parameters()))
-        adam_params.extend(list(self.symbols_pred_layer.parameters()))
-        adam_params.extend(list(self.positions_pred_layer.parameters()))
-
-        muon_params = []
-        muon_params_, adam_params_ = self._split_params_by_size(self.joint_embedding.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        muon_params_, adam_params_ = self._split_params_by_size(self.symbols_dit.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        muon_params_, adam_params_ = self._split_params_by_size(self.positions_dit.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        muon_params_, adam_params_ = self._split_params_by_size(self.spatial_bias.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        return {"muon_params": muon_params, "adam_params": adam_params}
 
     def freeze_last_block(self, idx):
         last_block = self.joint_embedding.blocks[-1]
@@ -734,211 +676,5 @@ class MMDiTBothVar(nn.Module):
             label_logits=label_logits,
             euc_insertion_rate=euc_insertion_rate,
             disc_insertion_rate=disc_insertion_rate,
-        )
-
-
-class MMDiTFixedLength(nn.Module):
-    def __init__(self, euclidean_dim, vocab_size, symbols_depth, positions_depth, **kwargs):
-        super().__init__()
-        self.euclidean_dim = euclidean_dim
-        self.vocab_size = vocab_size
-        self.dim_modalities = kwargs['dim_modalities']
-        self.dim_conds = kwargs['dim_conds']
-        self.dim_symbols = self.dim_modalities[0]
-        self.dim_positions = self.dim_modalities[1]
-        # Extract attention parameters for rotary embeddings
-        self.dim_head = kwargs.get('dim_head', 64)
-        self.heads = kwargs.get('heads', 8)
-
-        # Time Encoders
-        self.symbols_time_encoder = TimestepEmbedder(self.dim_symbols)
-        self.positions_time_encoder = TimestepEmbedder(self.dim_positions)
-
-        # Text Embeddings
-        self.symbols_embedder = nn.Embedding(vocab_size, self.dim_symbols)
-
-        # Euclidean Embeddings        # Handle multi-dimensional coordinates [B, L, D] where D is the feature dimension
-        # Each dimension is embedded separately using GaussianFourierProjection
-        # Then combined and projected to dim_image
-        # Each dimension gets embedded_dim features, so total is euclidean_dim * embedded_dim
-        self.embedded_dim_per_feature = self.dim_positions // euclidean_dim
-        self.gaussian_fourier_projs = nn.ModuleList([
-            GaussianFourierProjection(self.embedded_dim_per_feature, scale=1.0)
-            for _ in range(euclidean_dim)
-        ])
-        # Project the concatenated embeddings to dim_image
-        # Total embedding size after concatenation: euclidean_dim * embedded_dim_per_feature
-        total_embed_dim = euclidean_dim * self.embedded_dim_per_feature
-        self.euclidean_proj = nn.Linear(total_embed_dim, self.dim_positions)
-
-        # Rotary Positional Embeddings
-        self.symbols_rotary = Rotary(dim=self.dim_head, base=10_000)
-        self.positions_rotary = Rotary(dim=self.dim_head, base=10_000)
-
-        # Pairwise spatial attention biases (layer-specific, head-specific)
-        # We'll get depth from kwargs
-        depth = kwargs.get('depth', 4)
-        heads = kwargs.get('heads', 8)
-        self.spatial_bias = PairwiseSpatialBias(
-            num_heads=heads,
-            num_layers=depth,
-            spatial_feat_dim=32,
-            max_distance=10.0
-        )
-
-        # Joint Embedding
-        self.joint_embedding = MMDiT(**kwargs)
-
-        # Single Embeddings
-        sep_keys = ['depth', 'dim_modalities', 'dim_conds']
-        block_kwargs = {k: v for k, v in kwargs.items() if k not in sep_keys}
-        self.symbols_dit = MMDiT(depth = symbols_depth, dim_modalities = [self.dim_symbols], dim_conds = [self.dim_symbols], **block_kwargs)
-        self.positions_dit = MMDiT(depth = positions_depth, dim_modalities = [self.dim_positions], dim_conds = [self.dim_positions], **block_kwargs)
-
-        # Final Layers
-        self.symbols_pred_layer = FinalLayer(self.dim_symbols, vocab_size)
-        self.positions_pred_layer = FinalLayer(self.dim_positions, euclidean_dim)
-
-    def _split_params_by_size(self, params):
-        muon_params = []
-        adam_params = []
-        for p in params:
-            if p.ndim == 2:
-                muon_params.append(p)
-            else:
-                adam_params.append(p)
-        return muon_params, adam_params
-
-    def get_muon_adam_params(self):
-        adam_params = []
-        adam_params.extend(list(self.symbols_time_encoder.mlp.parameters()))
-        adam_params.extend(list(self.positions_time_encoder.mlp.parameters()))
-        adam_params.extend(list(self.symbols_embedder.parameters()))
-        adam_params.extend(list(self.gaussian_fourier_projs.parameters()))
-        adam_params.extend(list(self.euclidean_proj.parameters()))
-        adam_params.extend(list(self.euc_insertion_rate.parameters()))
-        adam_params.extend(list(self.disc_insertion_rate.parameters()))
-        adam_params.extend(list(self.symbols_pred_layer.parameters()))
-        adam_params.extend(list(self.positions_pred_layer.parameters()))
-
-        muon_params = []
-        muon_params_, adam_params_ = self._split_params_by_size(self.joint_embedding.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        muon_params_, adam_params_ = self._split_params_by_size(self.symbols_dit.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        muon_params_, adam_params_ = self._split_params_by_size(self.positions_dit.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        muon_params_, adam_params_ = self._split_params_by_size(self.spatial_bias.parameters())
-        muon_params.extend(muon_params_)
-        adam_params.extend(adam_params_)
-        return {"muon_params": muon_params, "adam_params": adam_params}
-
-    def forward(
-        self,
-        *,
-        cat_tokens,
-        euclidean_tokens,
-        symbols_mask = None,
-        pos_mask = None,
-        pos_time = None,
-        symbols_time = None,
-        detach_hidden = [False, False]
-    ):
-        # Shapes will be:
-        # cat_tokens: [B, L]
-        # euclidean_tokens: [B, L, D] where D is feature dimension (e.g., 3 for 3D coordinates)
-        # text_mask: [B, L]
-        # image_mask: [B, L]
-        # text_time_cond: [B] - scalar timesteps per batch element
-        # image_time_cond: [B] - scalar timesteps per batch element
-
-        # Handle euclidean_tokens: [B, L, D] where D is the feature dimension
-        # Embed each dimension separately and concatenate
-        B, L = euclidean_tokens.shape[:2]
-        
-        if euclidean_tokens.dim() == 2:
-            # If 2D [B, L], treat as single dimension and add feature dim
-            euclidean_tokens = euclidean_tokens.unsqueeze(-1)  # [B, L] -> [B, L, 1]
-        
-        D = euclidean_tokens.shape[-1]
-        assert D == self.euclidean_dim, f"Expected euclidean_tokens to have {self.euclidean_dim} dimensions, got {D}"
-        
-        # Store original positions for computing pairwise spatial biases
-        atom_positions = euclidean_tokens  # [B, L, D]
-        
-        # Embed each dimension separately
-        dim_embeddings = []
-        for d in range(D):
-            dim_token = euclidean_tokens[..., d:d+1]  # [B, L, 1]
-            dim_emb = self.gaussian_fourier_projs[d](dim_token)  # [B, L, embedded_dim_per_feature]
-            dim_embeddings.append(dim_emb)
-        
-        # Concatenate all dimension embeddings
-        euclidean_tokens = torch.cat(dim_embeddings, dim=-1)  # [B, L, euclidean_dim * embedded_dim_per_feature]
-        
-        # Project to final embedding dimension
-        euclidean_tokens = self.euclidean_proj(euclidean_tokens)  # [B, L, dim_image]
-        
-        cat_tokens = self.symbols_embedder(cat_tokens)
-        symbols_time = self.symbols_time_encoder(symbols_time)  # [B] -> [B, dim_text]
-        pos_time = self.positions_time_encoder(pos_time)  # [B] -> [B, dim_image]
-
-        # Generate rotary positional embeddings for each modality
-        # The Rotary class returns (1, seq_len, 3, 1, dim_head) which is what we need
-        text_cos, text_sin = get_rotary_emb(self.symbols_rotary, cat_tokens)
-        image_cos, image_sin = get_rotary_emb(self.positions_rotary, euclidean_tokens)
-        rotary_pos_emb = ((text_cos, text_sin), (image_cos, image_sin))
-
-        # Compute pairwise spatial attention biases for each layer
-        # Only apply to the euclidean/image modality
-        # Get depth from joint_embedding
-        depth = len(self.joint_embedding.blocks)
-        spatial_biases = []
-        for layer_idx in range(depth):
-            # Compute spatial bias for this layer: (B, H, L, L)
-            spatial_bias = self.spatial_bias(atom_positions, layer_idx, mask=pos_mask)
-            spatial_biases.append(spatial_bias)
-        
-        # Format: (None for text, spatial_bias for image) for each layer
-        attn_biases = [(None, spatial_biases[layer_idx]) for layer_idx in range(depth)]
-
-        text_tokens_hidden, euclidean_tokens_hidden = self.joint_embedding(
-            modality_tokens = (cat_tokens, euclidean_tokens),
-            modality_masks = (symbols_mask, pos_mask),
-            time_cond = (symbols_time, pos_time),
-            rotary_pos_emb = rotary_pos_emb,
-            attn_bias = attn_biases,
-        )
-        if detach_hidden[0]:
-            text_tokens_hidden = text_tokens_hidden.detach()
-        if detach_hidden[1]:
-            euclidean_tokens_hidden = euclidean_tokens_hidden.detach()
-
-        cat_tokens = self.symbols_dit(
-            modality_tokens = (text_tokens_hidden,),
-            modality_masks = (symbols_mask,),
-            time_cond = (symbols_time,),
-            rotary_pos_emb = ((text_cos, text_sin),),
-        )[0]
-
-        # Predict unmasking probabilities for symbols
-        label_logits = self.symbols_pred_layer(cat_tokens, symbols_time)
-
-        euclidean_tokens = self.positions_dit(
-            modality_tokens = (euclidean_tokens_hidden,),
-            modality_masks = (pos_mask,),
-            time_cond = (pos_time,),
-            rotary_pos_emb = ((image_cos, image_sin),),
-        )[0]
-        # Clean data prediction
-        clean_data_pred = self.positions_pred_layer(euclidean_tokens, pos_time)
-
- 
-        return FixedLengthMultimodalModelPrediction(
-            clean_data=clean_data_pred,
-            label_logits=label_logits,
         )
 

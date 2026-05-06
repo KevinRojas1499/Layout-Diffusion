@@ -18,3 +18,7 @@ num_steps_ablation/
 runs/
 eval/cache/
 .claude/
+num_steps_ablation*
+samples-fresh
+samples-full
+samples-our-best*
