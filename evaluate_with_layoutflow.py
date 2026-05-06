@@ -85,7 +85,7 @@ def main() -> None:
             "use_spatial_bias": args.use_spatial_bias,
             "use_rope": args.use_rope,
         },
-        "interpolant": {"name": "multimodal", "dsm_t_reweight": False, "cfg_dropout_prob": 0.0},
+        "interpolant": {"name": "multimodal", "dsm_t_reweight": False, "cfg_dropout_prob": 0.0, "cat_cond_prob": 0.0},
     })
 
     dataset, tokenizer, euclidean_dim, hidden_dim, max_length = _get_dataset_and_dims(cfg)

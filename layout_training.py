@@ -13,6 +13,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from multimodal_interpolant import MultimodalInterpolant
+from autoregressive_interpolant import MultimodalInterpolant as AutoregressiveInterpolant
 from branching_flows_interpolant import BranchingFlowsInterpolant
 from custom_datasets.multimodal_math import EquationsDataset, ParenthesizedEquationsDataset
 from custom_datasets.layout_labels import DATASET_REGISTRY as LAYOUT_REGISTRY, build_tokenizer as build_layout_tokenizer
@@ -169,6 +170,18 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
             dsm_t_reweight=int_cfg.dsm_t_reweight,
             cfg_dropout_prob=int_cfg.cfg_dropout_prob,
             cat_cond_prob=int_cfg.cat_cond_prob,
+            size_cond_prob=int_cfg.size_cond_prob,
+            fixed_length=int_cfg.fixed_length,
+        )
+    elif int_cfg.name == "autoregressive":
+        return AutoregressiveInterpolant(
+            max_length=max_length,
+            vocab_size=tokenizer.vocab_size,
+            mask_token=tokenizer.mask_token_id,
+            pad_token=tokenizer.pad_token_id,
+            bos_token=tokenizer.bos_token_id,
+            euclidean_dim=euclidean_dim,
+            cat_cond_prob=int_cfg.cat_cond_prob,
         )
     elif int_cfg.name == "branching":
         return BranchingFlowsInterpolant(
@@ -195,9 +208,35 @@ def _build_evaluator(cfg: LayoutConfigSchema, tokenizer: VocabTokenizer, device:
     )
 
 
+def _build_fixed_length_mask(lengths: torch.Tensor, max_length: int, device: torch.device) -> torch.Tensor:
+    """Build a [B, max_length+1] bool mask: BOS + first `lengths[i]` positions True."""
+    B = lengths.shape[0]
+    L = max_length + 1
+    idx = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+    lens = lengths.to(device).unsqueeze(1)             # [B, 1]
+    # Position 0 is BOS (always active); positions 1..len_i are valid.
+    return (idx == 0) | ((idx >= 1) & (idx <= lens))
+
+
 @torch.no_grad()
-def _run_eval(evaluator, interpolant, model, eval_cfg, max_length, device):
+def _run_eval(evaluator, interpolant, model, eval_cfg, max_length, device, train_lengths=None):
     """Generate `eval_cfg.num_samples` and compute FID + Alignment metrics."""
+    if getattr(interpolant, "fixed_length", False):
+        # Sample lengths from the training distribution, build masks, then run
+        # the fixed-length sampler. No insertions/deletions involved.
+        if train_lengths is None or train_lengths.numel() == 0:
+            raise ValueError("fixed_length eval requires train_lengths to be passed in.")
+        n = eval_cfg.num_samples
+        idx = torch.randint(0, train_lengths.shape[0], (n,), device=train_lengths.device)
+        lens = train_lengths[idx]
+        mask = _build_fixed_length_mask(lens, max_length, device)
+        samples = interpolant.fixed_length_sampling(
+            model, mask, eval_cfg.num_steps, device,
+            sampler=eval_cfg.sampler, return_trace=False,
+        )
+        return evaluator.evaluate_samples(
+            samples.xt, samples.yt, samples.mask_t, batch_size=eval_cfg.batch_size,
+        )
     samples = interpolant.sampling(
         model,
         eval_cfg.num_steps,
@@ -283,6 +322,12 @@ def main(cfg: LayoutConfigSchema) -> None:
     opt = _get_optimizer(cfg, model)
     interpolant = _get_interpolant(cfg, dataset, tokenizer, euclidean_dim)
 
+    # Cache the training-set length tensor for fixed_length eval. LayoutFlowH5Dataset
+    # exposes per-sample lengths via `_lens` (truncated at max_length).
+    train_lengths = getattr(dataset, "_lens", None)
+    if train_lengths is not None:
+        train_lengths = train_lengths.clone()
+
     evaluator = _build_evaluator(cfg, tokenizer, device)
     metrics_log_path = os.path.join(run_cfg.dir, "metrics.jsonl")
 
@@ -321,7 +366,7 @@ def main(cfg: LayoutConfigSchema) -> None:
 
             opt.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                if int_name == "multimodal" and run_cfg.aux_l1_weight > 0:
+                if int_name in ("multimodal", "autoregressive") and run_cfg.aux_l1_weight > 0:
                     def aux_l1_loss_fn(prediction, sample, x1, y1):
                         mask_t_shaped = sample.mask_t.unsqueeze(-1)
                         masked_positions = (sample.yt == interpolant.mask_token)
@@ -334,7 +379,7 @@ def main(cfg: LayoutConfigSchema) -> None:
                 else:
                     losses = interpolant.compute_loss(model, data_)
 
-                if int_name == "multimodal":
+                if int_name in ("multimodal", "autoregressive"):
                     loss = (
                         losses["dsm_loss"]
                         + losses["discrete_unmasking_loss"]
@@ -365,7 +410,7 @@ def main(cfg: LayoutConfigSchema) -> None:
             training_iter += 1
             loss_val = loss.detach().item()
 
-            if int_name == "multimodal":
+            if int_name in ("multimodal", "autoregressive"):
                 pbar.set_description(
                     f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
                     f"Disc: {losses['discrete_unmasking_loss']:.4f}, "
@@ -397,6 +442,7 @@ def main(cfg: LayoutConfigSchema) -> None:
                 if evaluator is not None:
                     metrics = _run_eval(
                         evaluator, interpolant, ema, cfg.eval, max_length, device,
+                        train_lengths=train_lengths,
                     )
                     metrics["iter"] = training_iter
                     with open(metrics_log_path, "a") as f:

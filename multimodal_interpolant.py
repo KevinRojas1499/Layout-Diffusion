@@ -117,6 +117,8 @@ class MultimodalInterpolant():
         dsm_t_reweight: bool = False,
         cfg_dropout_prob: float = 0.0,
         cat_cond_prob: float = 0.0,
+        size_cond_prob: float = 0.0,
+        fixed_length: bool = False,
     ):
         super().__init__()
         self.max_length = max_length
@@ -129,6 +131,12 @@ class MultimodalInterpolant():
         self.dsm_t_reweight = dsm_t_reweight
         self.cfg_dropout_prob = cfg_dropout_prob
         self.cat_cond_prob = cat_cond_prob
+        self.size_cond_prob = size_cond_prob
+        self.fixed_length = fixed_length
+        assert cat_cond_prob + size_cond_prob <= 1.0, (
+            f"cat_cond_prob + size_cond_prob must be <= 1.0, got "
+            f"{cat_cond_prob} + {size_cond_prob}"
+        )
 
     def dalpha(self, t):
         return torch.ones_like(t)
@@ -167,7 +175,14 @@ class MultimodalInterpolant():
 
         # Masking data
         # Deletion and masking times are independent for every position, thats why we pass y1
-        masking_time, deletion_time = self.get_masking_and_deletion_time(y1)
+        if self.fixed_length:
+            # No deletion: every active position stays active throughout. Use
+            # an independent uniform masking time (without the u1 coupling that
+            # exists to interleave masking with deletion).
+            masking_time = torch.rand_like(y1, dtype=torch.float32)
+            deletion_time = torch.zeros_like(y1, dtype=torch.float32)
+        else:
+            masking_time, deletion_time = self.get_masking_and_deletion_time(y1)
 
         # Discrete data
         mask_positions = (t_shaped_disc <= masking_time) & attn_mask
@@ -226,11 +241,16 @@ class MultimodalInterpolant():
             return torch.gather(xt, 1, st_expanded)
 
     def compute_loss(self, model, batch, extra_loss_fn=None):
-        # Per-batch random choice: with probability cat_cond_prob, train in
-        # category-conditioned mode (categories given clean, only positions
-        # diffused). Otherwise the existing unconditional path runs.
-        if self.cat_cond_prob > 0.0 and torch.rand(()).item() < self.cat_cond_prob:
-            return self._compute_loss_cat_cond(model, batch, extra_loss_fn)
+        # Per-batch single-draw dispatch among (cat_cond, size_cond, uncond).
+        # cat_cond  : categories clean, all 4 bbox dims diffused.
+        # size_cond : categories AND (w, h) clean, only (x, y) diffused.
+        # uncond    : full denoising + insertions (existing path).
+        if self.cat_cond_prob + self.size_cond_prob > 0.0:
+            r = torch.rand(()).item()
+            if r < self.cat_cond_prob:
+                return self._compute_loss_cat_cond(model, batch, extra_loss_fn)
+            if r < self.cat_cond_prob + self.size_cond_prob:
+                return self._compute_loss_size_cond(model, batch, extra_loss_fn)
         return self._compute_loss_uncond(model, batch, extra_loss_fn)
 
     def _compute_loss_uncond(self, model, batch, extra_loss_fn=None):
@@ -284,10 +304,16 @@ class MultimodalInterpolant():
         dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions]
         dsm_loss = dsm_loss.mean() / x1.shape[-1]
         # Insertion loss
-        insertion_rate = prediction.insertion_rate
-        gaps, gaps_mask = interpolant_sample.gaps_and_mask
-        insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
-        insertion_loss = insertion_loss.sum() / (y1.shape[0] * self.max_length) # This is not the best scaling factor
+        if self.fixed_length:
+            # No deletions in fixed-length mode, so gaps are all zero and the
+            # insertion head is meaningless. Zero out to keep the loss structure
+            # the same for the training loop without supervising a dead head.
+            insertion_loss = torch.zeros((), device=x1.device, dtype=dsm_loss.dtype)
+        else:
+            insertion_rate = prediction.insertion_rate
+            gaps, gaps_mask = interpolant_sample.gaps_and_mask
+            insertion_loss = self.jump_kernel_elbo(gaps[gaps_mask], insertion_rate[gaps_mask])
+            insertion_loss = insertion_loss.sum() / (y1.shape[0] * self.max_length) # This is not the best scaling factor
         # Unmasking loss
         # Reshape for cross_entropy: [batch, seq_len, num_classes] -> [batch * seq_len, num_classes]
         # and [batch, seq_len] -> [batch * seq_len]
@@ -526,6 +552,172 @@ class MultimodalInterpolant():
             losses.update(extra)
 
         return losses
+
+    def _compute_loss_size_cond(self, model, batch, extra_loss_fn=None):
+        """Loss for size+category-conditioned training (LayoutFlow's size_cond).
+
+        Categories AND box sizes (w, h) are passed clean; only positions
+        (x, y) are diffused. Length is given. Mirrors _compute_loss_cat_cond
+        except (a) the noise is restricted to the first 2 bbox dims and
+        (b) dsm_loss is computed only on those dims.
+
+        Caveat: the model has no per-dim conditioning signal — it only sees
+        a single pos_time scalar. The "w,h are clean" fact is implicit in
+        the input value distribution (noised x,y are ~N(0,1) at high t,
+        clean w,h stay in their data range). Plumbing through an explicit
+        per-dim mask would be a larger refactor.
+        """
+        _x1 = batch["x"]
+        _y1 = batch["y"]
+        _mask_1 = batch["mask"]
+        x1, y1, mask_1 = self.pad_sequence(_x1, _y1, _mask_1)
+        B, L = y1.shape
+        device = x1.device
+
+        t = self.sample_time(B, device)
+        t_shaped = t.view(-1, 1, 1)
+        # Noise only x,y; keep w,h (and any further dims) clean.
+        xt_noised = self.alpha(t_shaped) * x1 + (1 - self.alpha(t_shaped)) * torch.randn_like(x1)
+        xt = torch.cat([xt_noised[..., :2], x1[..., 2:]], dim=-1)
+        xt = torch.where(mask_1.unsqueeze(-1), xt, 0.)
+        xt[:, 0] = 0.  # BOS stays at 0
+
+        yt = y1  # categories given clean
+        mask_t = mask_1
+        symbols_time = torch.ones_like(t)
+        pos_time = t
+
+        prediction: MultimodalModelPrediction = model(
+            cat_tokens=yt,
+            euclidean_tokens=xt,
+            symbols_mask=mask_t,
+            pos_mask=mask_t,
+            symbols_time=symbols_time,
+            pos_time=pos_time,
+        )
+
+        mask_t_shaped = mask_t.unsqueeze(-1)
+        # Loss only on the predicted dims (x, y); w,h were not noised.
+        dsm_loss = (x1[..., :2] - prediction.clean_data[..., :2]) ** 2 * mask_t_shaped
+        dsm_loss[:, 0] = 0.  # exclude BOS
+        if self.dsm_t_reweight:
+            weight = torch.sqrt(t / (1.0 - t).clamp(min=1e-5))
+            dsm_loss = dsm_loss * weight.view(-1, 1, 1)
+        masked_positions = (yt == self.mask_token)
+        # Per-dim averaging matches the cat_cond branch's `/ x1.shape[-1]`.
+        dsm_loss = dsm_loss.sum(dim=-1)[~masked_positions].mean() / 2
+
+        zero = torch.zeros((), device=device, dtype=dsm_loss.dtype)
+        losses = {
+            "dsm_loss": dsm_loss,
+            "discrete_unmasking_loss": zero,
+            "euclidean_unmasking_loss": zero,
+            "insertion_loss": zero,
+        }
+
+        if extra_loss_fn is not None:
+            st_identity = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+            sample = JointMultimodalInterpolantResult(
+                pad_token=self.pad_token,
+                xt=xt, yt=yt, st=st_identity, mask_t=mask_t, t=t,
+                xt_original_order=xt, mask_original_order=mask_t,
+                x1=x1, y1=y1, x1_ordered=x1, y1_ordered=y1,
+            )
+            extra = extra_loss_fn(prediction, sample, x1, y1)
+            losses.update(extra)
+
+        return losses
+
+    @torch.no_grad()
+    def fixed_length_sampling(
+        self,
+        model: torch.nn.Module,
+        mask_t: Tensor,
+        steps: int,
+        device: torch.device,
+        sampler: str = 'split',
+        return_trace: bool = False,
+    ) -> SamplingResult:
+        """Sample (categories, positions) at a fixed length per sample.
+
+        No deletions, no insertions — sequence shape is fully determined by
+        `mask_t` (caller decides the length). Both modalities are noised at
+        t=0 (yt all-mask except BOS, xt all-noise except BOS=0) and the model
+        denoises positions + unmasks categories step by step.
+
+        Args:
+            mask_t: [B, L] bool, True at BOS + valid positions.
+        """
+        B, L = mask_t.shape
+        # Initialize: all valid positions start masked.
+        yt = torch.full((B, L), self.mask_token, dtype=torch.long, device=device)
+        yt[:, 0] = self.bos_token
+        yt = torch.where(mask_t, yt, torch.full_like(yt, self.pad_token))
+
+        xt = torch.randn(B, L, self.euclidean_dim, device=device)
+        xt = torch.where(mask_t.unsqueeze(-1), xt, 0.)
+        xt[:, 0] = 0.
+
+        dt = 1.0 / steps
+        t = torch.zeros(B, device=device)
+
+        trajectory = []
+        if return_trace:
+            trajectory.append(SamplingTrajectoryResult(
+                xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t,
+            ))
+
+        for i in tqdm(range(steps), leave=False):
+            is_last_step = (i == steps - 1)
+            t0 = t
+
+            prediction: MultimodalModelPrediction = model(
+                cat_tokens=yt,
+                euclidean_tokens=xt,
+                symbols_mask=mask_t,
+                pos_mask=mask_t,
+                symbols_time=t0,
+                pos_time=t0,
+            )
+            step_size = dt if (sampler == 'euler' or is_last_step) else dt / 2
+            xt, yt = self.update_xt_yt(
+                prediction=prediction,
+                xt=xt,
+                yt=yt,
+                mask_t=mask_t,
+                t=t0,
+                dt=step_size,
+                is_last_step=is_last_step,
+            )
+
+            # Split sampler: midpoint refinement WITHOUT insertions.
+            if sampler != 'euler' and not is_last_step:
+                t1 = t0 + dt
+                prediction_2: MultimodalModelPrediction = model(
+                    cat_tokens=yt,
+                    euclidean_tokens=xt,
+                    symbols_mask=mask_t,
+                    pos_mask=mask_t,
+                    symbols_time=t1,
+                    pos_time=t1,
+                )
+                xt, yt = self.update_xt_yt(
+                    prediction=prediction_2,
+                    xt=xt,
+                    yt=yt,
+                    mask_t=mask_t,
+                    t=t1,
+                    dt=dt / 2,
+                    is_last_step=is_last_step,
+                )
+
+            t = t0 + dt
+            if return_trace:
+                trajectory.append(SamplingTrajectoryResult(
+                    xt=xt.clone(), yt=yt.clone(), mask_t=mask_t.clone(), t=t,
+                ))
+
+        return SamplingResult(xt=xt, yt=yt, mask_t=mask_t, trajectory=trajectory)
 
     @torch.no_grad()
     def cat_cond_sampling(

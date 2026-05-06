@@ -76,6 +76,15 @@ class InterpolantSchema:
     # symbols_time=1 (categories given clean), only the position flow is denoised.
     # 0.0 = pure uncond (current behavior). 0.5 = even mix.
     cat_cond_prob: float = 0.0
+    # Per-batch probability of training in size+category-conditioned mode
+    # (LayoutFlow's size_cond): categories AND box sizes (w, h) clean, only
+    # positions (x, y) diffused. cat_cond_prob + size_cond_prob must be <= 1.0;
+    # the remainder runs the uncond path.
+    size_cond_prob: float = 0.0
+    # Disable the variable-length component entirely: no deletions in the
+    # forward process, no insertions in sampling. Lengths come from the
+    # training distribution at eval time.
+    fixed_length: bool = False
 
 
 @dataclass
