@@ -82,6 +82,55 @@ class RandomFourierFeatures(nn.Module):
 
 
 # -----------------------------------------------------------------------------
+# Pairwise-distance attention bias (3D-geometry inductive bias for QM9)
+# -----------------------------------------------------------------------------
+
+class RBFDistanceBias(nn.Module):
+    """Pairwise-distance attention bias for 3D-coordinate inputs.
+
+    Computes ``||r_i - r_j||``, expands into Gaussian RBF features, and maps
+    to a per-head additive bias for attention logits. Padded keys are set to
+    ``-inf`` so they're excluded from softmax (this replaces the bool pad
+    mask elsewhere in the block).
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        num_rbf: int = 32,
+        cutoff: float = 20.0,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        centers = torch.linspace(0.0, cutoff, num_rbf)
+        self.register_buffer("centers", centers, persistent=True)
+        self.log_gamma = nn.Parameter(torch.zeros(1))
+        self.mlp = nn.Sequential(
+            nn.Linear(num_rbf, hidden_dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_heads, bias=True),
+        )
+        # Zero-init final layer so the bias is 0 at start; block starts as
+        # vanilla attention and learns the geometric prior gradually.
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, r: Tensor, pad_mask: Tensor | None = None) -> Tensor:
+        # r: (B, L, D); pad_mask: (B, L) bool, True = valid.
+        dists = torch.cdist(r, r)                         # (B, L, L)
+        gamma = F.softplus(self.log_gamma)                # > 0
+        rbf = torch.exp(-gamma * (dists.unsqueeze(-1) - self.centers) ** 2)
+        bias = self.mlp(rbf)                              # (B, L, L, H)
+        bias = bias.permute(0, 3, 1, 2).contiguous()      # (B, H, L, L)
+        if pad_mask is not None:
+            invalid = ~pad_mask                           # (B, L)
+            mask_value = torch.finfo(bias.dtype).min
+            bias = bias.masked_fill(invalid[:, None, None, :], mask_value)
+        return bias
+
+
+# -----------------------------------------------------------------------------
 # Adaptive transformer block (single-stream DiT block w/ RoPE + QK norm)
 # -----------------------------------------------------------------------------
 
@@ -148,6 +197,7 @@ class AdaTransformerBlock(nn.Module):
         x: Tensor,
         rotary_emb: Tuple[Tensor, Tensor] | None = None,
         kpad_mask: Tensor | None = None,
+        attn_bias: Tensor | None = None,
     ) -> Tensor:
         B, L, _ = x.shape
         qkv = self.qkv(x)  # (B, L, 3 * H * D)
@@ -172,10 +222,14 @@ class AdaTransformerBlock(nn.Module):
             qkv_rotated = rearrange(qkv_rotated, "b n qkv h d -> qkv b h n d")
             q, k, v = qkv_rotated
 
-        # Build attention mask (True = attend) with shape (B, 1, 1, L).
-        attn_mask = None
-        if exists(kpad_mask):
+        # Pick the attention mask. attn_bias (float, with -inf already baked
+        # in for padded keys) takes priority over kpad_mask.
+        if exists(attn_bias):
+            attn_mask = attn_bias.to(dtype=q.dtype)
+        elif exists(kpad_mask):
             attn_mask = kpad_mask[:, None, None, :].to(dtype=torch.bool)
+        else:
+            attn_mask = None
 
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = rearrange(out, "b h n d -> b n (h d)")
@@ -188,6 +242,7 @@ class AdaTransformerBlock(nn.Module):
         cond: Tensor,
         rotary_emb: Tuple[Tensor, Tensor] | None = None,
         kpad_mask: Tensor | None = None,
+        attn_bias: Tensor | None = None,
     ) -> Tensor:
         # cond: (B, dim_cond) -> chunked into 6 modulation vectors of dim ``dim``
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -196,7 +251,7 @@ class AdaTransformerBlock(nn.Module):
 
         # Attention sub-layer.
         h = self._modulate(self.norm1(x), shift_msa, scale_msa)
-        h = self._attention(h, rotary_emb=rotary_emb, kpad_mask=kpad_mask)
+        h = self._attention(h, rotary_emb=rotary_emb, kpad_mask=kpad_mask, attn_bias=attn_bias)
         x = x + gate_msa.unsqueeze(1) * h
 
         # Feedforward sub-layer.
@@ -308,6 +363,13 @@ class Transformer(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(dim, elementwise_affine=True, eps=1e-6)
 
+        # ------- Pairwise-distance attention bias (3D geometry prior) -------
+        # Shared across all blocks: pairwise distances depend on input
+        # coordinates, not on per-block features. Zero-init on the final MLP
+        # layer means the bias is 0 at start, so the model behaves like the
+        # plain Transformer until it learns to use the geometric prior.
+        self.dist_bias = RBFDistanceBias(num_heads=num_heads)
+
         # ------- Output heads (FinalLayer = AdaLN + Linear, matches MMDiTQM9) -------
         self.loc_decoder = FinalLayer(dim, euclidean_dim)
         self.d_decoder = FinalLayer(dim, vocab_size)
@@ -339,6 +401,8 @@ class Transformer(nn.Module):
         adam_params.extend(self.t_rff_sym.parameters())
         adam_params.extend(self.t_embed_sym.parameters())
         adam_params.extend(self.final_norm.parameters())
+        # Distance-bias module: small MLP + scalar gamma, all on AdamW.
+        adam_params.extend(self.dist_bias.parameters())
 
         # Output heads.
         for head in (self.loc_decoder, self.d_decoder,
@@ -414,9 +478,13 @@ class Transformer(nn.Module):
         else:
             rotary_emb = None
 
+        # ---- Pairwise-distance attention bias (computed once, shared) ----
+        attn_bias = self.dist_bias(euclidean_tokens, pad_mask=kpad_mask)
+
         # ---- Transformer stack ----
         for block in self.transformers:
-            x = block(x, cond=t_cond, rotary_emb=rotary_emb, kpad_mask=kpad_mask)
+            x = block(x, cond=t_cond, rotary_emb=rotary_emb,
+                      kpad_mask=kpad_mask, attn_bias=attn_bias)
         x = self.final_norm(x)
 
         # ---- Output heads ----

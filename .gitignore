@@ -22,3 +22,7 @@ layout-dm
 LayoutDM/
 layoutdm_starter.zip
 download/
+num_steps_ablation*
+samples-fresh
+samples-full
+samples-our-best*

@@ -1,33 +1,48 @@
+"""Training script for the fixed-length multimodal interpolant baseline.
+
+This is an oracle baseline: at sampling time the sequence length is drawn from
+the empirical training distribution (perfect length model), so the model only
+has to learn content given a known length.
+"""
 import json
 import os
+import random
 import click
 import numpy as np
 import torch
-import wandb
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from multimodal_interpolant import MultimodalInterpolant
-from autoregressive_interpolant import MultimodalInterpolant as AutoregressiveInterpolant
-from branching_flows_interpolant import BranchingFlowsInterpolant
+from fixed_length_multimodal_interpolant import (
+    FixedLengthMultimodalInterpolant,
+    SamplingResult,
+)
 from custom_datasets.multimodal_math import ParenthesizedEquationsDataset
 from utils.misc import dotdict
 from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler
-from models.mmdit_qm9 import MMDiTQM9
+from models.mmdit_qm9 import MMDiTFixedLength
 from evaluate_equations_parenthesis import parse_equation
-from multimodal_interpolant_both_var import MultimodalInterpolantBoth
 
+
+# ---------------------------------------------------------------------------
+# W&B helper
+# ---------------------------------------------------------------------------
 
 def init_wandb(opts):
+    import wandb
     wandb.init(
         project='MMDiT-Toy',
         name=f'toy-{opts.run_name}',
-        tags=['training'],
+        tags=['training', 'fixed-length'],
         config=opts,
     )
 
+
+# ---------------------------------------------------------------------------
+# EMA
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -36,6 +51,10 @@ def update_ema(ema_model, model, decay=0.9999):
     for name, param in model_params.items():
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
+
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
 
 def evaluate_samples(samples, character_tokenizer, euclidean_dim=1, delta=0.5, num_scale=1.0):
     """Compute accuracy metrics on a SamplingResult batch."""
@@ -75,7 +94,7 @@ def evaluate_samples(samples, character_tokenizer, euclidean_dim=1, delta=0.5, n
 
 
 def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1, num_scale=1.0):
-    """Write generated samples to a JSONL file compatible with evaluate_equations_parenthesis.py."""
+    """Write generated samples to a JSONL file."""
     with open(path, 'w') as f:
         for i in range(samples.xt.shape[0]):
             symbols_str = character_tokenizer.decode(samples.yt[i].cpu())
@@ -85,26 +104,117 @@ def save_samples_jsonl(samples, character_tokenizer, path, euclidean_dim=1, num_
             f.write(json.dumps({'symbols': symbols, 'numbers': numbers, 'length': len(symbols)}) + '\n')
 
 
+def collect_length_pairs(dataset) -> list:
+    """Return ordered list of (x_length, y_length) pairs from a dataset."""
+    return [(len(item['numbers']), len(item['symbols'])) for item in dataset.data]
+
+
+@torch.no_grad()
+def oracle_sampling(
+    interpolant: FixedLengthMultimodalInterpolant,
+    model: torch.nn.Module,
+    steps: int,
+    eval_samples: int,
+    length_pairs: list,
+    device: torch.device,
+) -> SamplingResult:
+    """Generate eval_samples using lengths drawn in order from the eval dataset.
+
+    Each generated sample gets the length of the corresponding eval dataset entry
+    (cycling through the list if eval_samples > len(length_pairs)).  This is a
+    strict oracle: no random resampling — the exact test-set length distribution
+    is replicated sample-for-sample.
+    """
+    max_length = interpolant.max_length
+    full_len = max_length + 1  # includes BOS
+
+    # Use test lengths in order, cycling if eval_samples > dataset size.
+    sampled_lengths = [length_pairs[i % len(length_pairs)] for i in range(eval_samples)]
+
+    # Group indices by length pair to enable batched sampling.
+    groups = defaultdict(list)
+    for i, pair in enumerate(sampled_lengths):
+        groups[pair].append(i)
+
+    all_xt = torch.zeros(eval_samples, full_len, interpolant.euclidean_dim, device=device)
+    all_yt = torch.full((eval_samples, full_len), interpolant.pad_token, dtype=torch.long, device=device)
+    all_x_mask = torch.zeros(eval_samples, full_len, dtype=torch.bool, device=device)
+    all_y_mask = torch.zeros(eval_samples, full_len, dtype=torch.bool, device=device)
+
+    for (x_len, y_len), indices in tqdm(groups.items(), desc='oracle lengths', leave=False):
+        result = interpolant.sampling(
+            model=model,
+            steps=steps,
+            batch_size=len(indices),
+            x_length=x_len,
+            y_length=y_len,
+            max_length=max_length,
+            device=device,
+        )
+        for j, orig_idx in enumerate(indices):
+            all_xt[orig_idx] = result.xt[j]
+            all_yt[orig_idx] = result.yt[j]
+            all_x_mask[orig_idx] = result.x_mask_t[j]
+            all_y_mask[orig_idx] = result.y_mask_t[j]
+
+    return SamplingResult(
+        xt=all_xt,
+        yt=all_yt,
+        x_mask_t=all_x_mask,
+        y_mask_t=all_y_mask,
+        trajectory=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def save_ckpt(model, ema, opt, scheduler, path):
+    torch.save({
+        'model': model.state_dict(),
+        'ema': ema.state_dict(),
+        'optimizer': opt.state_dict(),
+        'scheduler': scheduler.state_dict(),
+    }, path)
+
+
+def load_checkpoint(opts, device, model, ema, opt, scheduler):
+    snapshot = torch.load(opts.load_checkpoint, weights_only=True, map_location=device)
+    model.load_state_dict(snapshot['model'], strict=False)
+    ema.load_state_dict(snapshot['ema'], strict=False)
+    opt.load_state_dict(snapshot['optimizer'])
+    scheduler.load_state_dict(snapshot['scheduler'])
+    last = snapshot['scheduler'].get('last_epoch', None)
+    return last if last is not None else scheduler.last_epoch
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
 @click.command()
-@click.option('--interpolant', type=click.Choice(['multimodal', 'autoregressive', 'branching', 'multimodal_both']), default='multimodal')
 @click.option('--data_path', type=str, default=None)
-@click.option('--optimizer', type=click.Choice(['adam', 'adamw']), default='adam')
-@click.option('--ema_beta', type=float, default=.9999)
+@click.option('--eval_data_path', type=str, default=None,
+              help='Dataset to draw evaluation lengths from (defaults to --data_path)')
+@click.option('--optimizer', type=click.Choice(['adam', 'adamw']), default='adamw')
+@click.option('--ema_beta', type=float, default=0.9999)
 @click.option('--lr', type=float, default=1e-4)
 @click.option('--batch_size', type=int, default=128)
 @click.option('--log_rate', type=int, default=500)
 @click.option('--num_iters', type=int, default=5000)
-@click.option('--warmup_iters', type=int, default=100)
+@click.option('--warmup_iters', type=int, default=500)
 @click.option('--num_workers', type=int, default=2)
 @click.option('--seed', type=int, default=42)
 @click.option('--dir', type=str)
-@click.option('--load_checkpoint', type=str, help='Path to a snapshot.pt to resume from (restores model+optimizer+scheduler)')
+@click.option('--load_checkpoint', type=str, default=None,
+              help='Path to a snapshot.pt to resume from')
 @click.option('--finetune_checkpoint', type=str, default=None,
-              help='Load model weights only from this snapshot (fresh optimizer/scheduler)')
+              help='Load model weights only (fresh optimizer/scheduler)')
 @click.option('--enable_wandb', is_flag=True, default=False)
 @click.option('--run_name', type=str, default='')
 @click.option('--eval_samples', type=int, default=200)
-@click.option('--eval_steps', type=int, default=20)
+@click.option('--eval_steps', type=int, default=50)
 @click.option('--eval_delta', type=float, default=0.5)
 @click.option('--lr_schedule', type=click.Choice(['warmup_only', 'cosine']), default='warmup_only')
 @click.option('--lr_min', type=float, default=1e-6)
@@ -116,6 +226,7 @@ def training(**opts):
     torch.manual_seed(opts.seed)
     torch.cuda.manual_seed(opts.seed)
     torch.cuda.manual_seed_all(opts.seed)
+    random.seed(opts.seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -124,11 +235,20 @@ def training(**opts):
     character_tokenizer = VocabTokenizer(vocab={'+', '-', '*', '=', '(', ')'})
     dataset = ParenthesizedEquationsDataset(character_tokenizer, data_path=opts.data_path)
 
+    eval_data_path = opts.eval_data_path if opts.eval_data_path else opts.data_path
+    if eval_data_path != opts.data_path:
+        eval_dataset = ParenthesizedEquationsDataset(character_tokenizer, data_path=eval_data_path)
+    else:
+        eval_dataset = dataset
+    eval_length_pairs = collect_length_pairs(eval_dataset)
+
     print('Vocab')
     print('--------------------------------')
     for token, idx in character_tokenizer.atom_to_idx.items():
         print(f'{token}: {idx}')
     print('--------------------------------')
+    print(f'Train dataset max_length: {dataset.max_length}  ({len(dataset)} samples)')
+    print(f'Eval dataset: {eval_data_path}  ({len(eval_dataset)} samples, {len(set(eval_length_pairs))} unique length pairs)')
 
     dataloader = DataLoader(
         dataset, batch_size=opts.batch_size, shuffle=True,
@@ -138,9 +258,7 @@ def training(**opts):
     if opts.enable_wandb:
         init_wandb(opts)
 
-    model = MMDiTQM9(
-        branching_flows=opts.interpolant == 'branching',
-        autoregressive=opts.interpolant == 'autoregressive',
+    model = MMDiTFixedLength(
         euclidean_dim=euclidean_dim,
         vocab_size=character_tokenizer.vocab_size,
         symbols_depth=opts.depth,
@@ -167,40 +285,14 @@ def training(**opts):
         scheduler = WarmUpScheduler(opt, opts.warmup_iters)
     scaler = torch.amp.GradScaler()
 
-    if opts.interpolant == 'multimodal':
-        interpolant = MultimodalInterpolant(
-            max_length=dataset.max_length,
-            vocab_size=character_tokenizer.vocab_size,
-            mask_token=character_tokenizer.mask_token_id,
-            pad_token=character_tokenizer.pad_token_id,
-            bos_token=character_tokenizer.bos_token_id,
-            euclidean_dim=euclidean_dim,
-        )
-    elif opts.interpolant == 'autoregressive':
-        interpolant = AutoregressiveInterpolant(
-            max_length=dataset.max_length,
-            vocab_size=character_tokenizer.vocab_size,
-            mask_token=character_tokenizer.mask_token_id,
-            pad_token=character_tokenizer.pad_token_id,
-            bos_token=character_tokenizer.bos_token_id,
-            euclidean_dim=euclidean_dim,
-        )
-    elif opts.interpolant == 'multimodal_both':
-        interpolant = MultimodalInterpolantBoth(
-            max_length=dataset.max_length,
-            vocab_size=character_tokenizer.vocab_size,
-            mask_token=character_tokenizer.mask_token_id,
-            pad_token=character_tokenizer.pad_token_id,
-            bos_token=character_tokenizer.bos_token_id,
-            euclidean_dim=euclidean_dim,
-        )
-    elif opts.interpolant == 'branching':
-        interpolant = BranchingFlowsInterpolant(
-            vocab_size=character_tokenizer.vocab_size,
-            mask_token=character_tokenizer.mask_token_id,
-            pad_token=character_tokenizer.pad_token_id,
-            euclidean_dim=euclidean_dim,
-        )
+    interpolant = FixedLengthMultimodalInterpolant(
+        max_length=dataset.max_length,
+        vocab_size=character_tokenizer.vocab_size,
+        mask_token=character_tokenizer.mask_token_id,
+        pad_token=character_tokenizer.pad_token_id,
+        bos_token=character_tokenizer.bos_token_id,
+        euclidean_dim=euclidean_dim,
+    )
 
     start_iter = 0
     if opts.load_checkpoint is not None:
@@ -231,15 +323,7 @@ def training(**opts):
             with torch.autocast('cuda', dtype=torch.float16):
                 losses = interpolant.compute_loss(model, data_)
 
-            if opts.interpolant in ('multimodal', 'autoregressive'):
-                loss = (losses["dsm_loss"] + losses["discrete_unmasking_loss"]
-                        + losses["euclidean_unmasking_loss"] + losses["insertion_loss"])
-            elif opts.interpolant == 'multimodal_both':
-                loss = (losses["dsm_loss"] + losses["discrete_unmasking_loss"]
-                        + losses["euc_insertion_loss"] + losses["disc_insertion_loss"])
-            elif opts.interpolant == 'branching':
-                loss = (losses["dsm_loss"] + losses["discrete_unmasking_loss"]
-                        + losses["insertion_loss"])
+            loss = losses['dsm_loss'] + losses['discrete_unmasking_loss']
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -254,31 +338,14 @@ def training(**opts):
 
             training_iter += 1
 
-            if opts.interpolant in ('multimodal', 'autoregressive'):
-                pbar.set_description(
-                    f'Iter {training_iter} --- '
-                    f'DSM: {losses["dsm_loss"]:.4f}  '
-                    f'Disc: {losses["discrete_unmasking_loss"]:.4f}  '
-                    f'EucUnmask: {losses["euclidean_unmasking_loss"]:.4f}  '
-                    f'Ins: {losses["insertion_loss"]:.4f}'
-                )
-            elif opts.interpolant == 'multimodal_both':
-                pbar.set_description(
-                    f'Iter {training_iter} --- '
-                    f'DSM: {losses["dsm_loss"]:.4f}  '
-                    f'Disc: {losses["discrete_unmasking_loss"]:.4f}  '
-                    f'EucIns: {losses["euc_insertion_loss"]:.4f}  '
-                    f'DiscIns: {losses["disc_insertion_loss"]:.4f}'
-                )
-            elif opts.interpolant == 'branching':
-                pbar.set_description(
-                    f'Iter {training_iter} --- '
-                    f'DSM: {losses["dsm_loss"]:.4f}  '
-                    f'Disc: {losses["discrete_unmasking_loss"]:.4f}  '
-                    f'Ins: {losses["insertion_loss"]:.4f}'
-                )
+            pbar.set_description(
+                f'Iter {training_iter} --- '
+                f'DSM: {losses["dsm_loss"]:.4f}  '
+                f'Disc: {losses["discrete_unmasking_loss"]:.4f}'
+            )
 
             if opts.enable_wandb:
+                import wandb
                 log_dict = {'loss': loss.detach().item(), 'step': training_iter}
                 log_dict.update({k: v.item() for k, v in losses.items()})
                 wandb.log(log_dict)
@@ -290,9 +357,13 @@ def training(**opts):
 
                 ema.eval()
                 with torch.no_grad():
-                    samples = interpolant.sampling(
-                        ema, opts.eval_steps, opts.eval_samples,
-                        dataset.max_length, device, return_trace=False,
+                    samples = oracle_sampling(
+                        interpolant=interpolant,
+                        model=ema,
+                        steps=opts.eval_steps,
+                        eval_samples=opts.eval_samples,
+                        length_pairs=eval_length_pairs,
+                        device=device,
                     )
 
                 save_samples_jsonl(
@@ -322,6 +393,7 @@ def training(**opts):
                     mf.write(json.dumps(metrics) + '\n')
 
                 if opts.enable_wandb:
+                    import wandb
                     wandb.log({
                         'eval/accuracy': metrics['accuracy'],
                         'eval/mean_abs_error': metrics['mean_abs_error'],
@@ -336,26 +408,8 @@ def training(**opts):
     save_ckpt(model, ema, opt, scheduler, os.path.join(opts.dir, 'final_checkpoint.pt'))
 
     if opts.enable_wandb:
+        import wandb
         wandb.finish()
-
-
-def load_checkpoint(opts, device, model, ema, opt, scheduler):
-    snapshot = torch.load(opts.load_checkpoint, weights_only=True, map_location=device)
-    model.load_state_dict(snapshot['model'], strict=False)
-    ema.load_state_dict(snapshot['ema'], strict=False)
-    opt.load_state_dict(snapshot['optimizer'])
-    scheduler.load_state_dict(snapshot['scheduler'])
-    last = snapshot['scheduler'].get('last_epoch', None)
-    return last if last is not None else scheduler.last_epoch
-
-
-def save_ckpt(model, ema, opt, scheduler, path):
-    torch.save({
-        'model': model.state_dict(),
-        'ema': ema.state_dict(),
-        'optimizer': opt.state_dict(),
-        'scheduler': scheduler.state_dict(),
-    }, path)
 
 
 if __name__ == '__main__':

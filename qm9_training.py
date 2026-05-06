@@ -156,7 +156,7 @@ def compute_ks_metrics(gen_symbols, gen_positions, precomputed_real):
 
 @click.command()
 @click.option('--model', type=click.Choice(['radd', 'DiT', 'Transformer']), default='DiT')
-@click.option('--optimizer', type=click.Choice(['adam', 'adamw', 'muon']), default='adam')
+@click.option('--optimizer', type=click.Choice(['adam', 'adamw', 'muon']), default='adamw')
 @click.option('--ema_beta', type=float, default=.999)
 @click.option('--lr', type=float, default=1e-4)
 @click.option('--batch_size', type=int, default=128)
@@ -173,13 +173,13 @@ def compute_ks_metrics(gen_symbols, gen_positions, precomputed_real):
 @click.option('--lr_schedule', type=click.Choice(['warmup_only', 'cosine']), default='cosine',
               help='LR schedule after warmup: constant or cosine decay to lr_min')
 @click.option('--lr_min', type=float, default=1e-6, help='Minimum LR for cosine schedule')
-@click.option('--eval_samples', type=int, default=1000,
+@click.option('--eval_samples', type=int, default=2500,
               help='Molecules to generate at each eval checkpoint (0 disables KS eval)')
 @click.option('--eval_steps', type=int, default=100, help='Sampling steps for eval generation')
 @click.option('--eval_batch_size', type=int, default=100, help='Batch size for eval generation')
-@click.option('--eval_sampler', type=click.Choice(['euler', 'split', 'staggered']), default='staggered')
 @click.option('--eval_use_ema', is_flag=True, default=False,
               help='Use EMA model for eval generation (default: raw model)')
+@click.option('--eval_sampler', type=click.Choice(['euler', 'split', 'staggered']), default='euler')
 @click.option('--eval_seed', type=int, default=42, help='RNG seed for eval generation')
 def training(**opts):
     opts = dotdict(opts)

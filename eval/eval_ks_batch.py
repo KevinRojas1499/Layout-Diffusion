@@ -2,7 +2,8 @@
 Batch evaluation of KS statistics at multiple generated sample sizes.
 
 Loads QM9 once unless a matching real-side cache exists (default path under eval/cache/;
-use --no-real-cache to always load QM9). With --generated, loads one JSON and evaluates each n_gen size.
+use --no-real-cache to always load QM9). With --generated, loads one JSON and evaluates each requested --n-gen-samples size,
+or all molecules when --n-gen-samples is omitted.
 With --folder, walks for .json files and evaluates each valid file (invalid files skipped).
 Skips UMAP and plots. Much faster than running test_qm9_distribution.py
 multiple times.
@@ -20,7 +21,9 @@ import os
 import pickle
 import sys
 from contextlib import redirect_stdout
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import numpy as np
 
 REAL_CACHE_VERSION = 1
 QM9_EXTRACT_SEED = 42
@@ -94,6 +97,7 @@ from eval.evaluate_distribution import (
     compute_molecular_properties,
     compute_molecular_fingerprints,
     evaluate_molecule_distributions,
+    _positions_to_molecule_via_openbabel,
 )
 
 
@@ -114,6 +118,57 @@ def eval_output_dir_next_to_json(
     if n_repeats > 1:
         return os.path.join(base, f'repeat-{repeat}')
     return base
+
+
+def subsample_generated_molecules(
+    generated_symbols: List,
+    generated_positions: List,
+    n_gen_samples: Optional[int],
+    random_seed: Optional[int],
+) -> Tuple[List, List]:
+    """Same subsampling logic as evaluate_molecule_distributions (deterministic)."""
+    rng = np.random.RandomState(random_seed) if random_seed is not None else np.random
+    if n_gen_samples is not None and len(generated_symbols) > n_gen_samples:
+        indices = rng.choice(len(generated_symbols), n_gen_samples, replace=False)
+        indices = np.sort(indices)
+        symbols = [generated_symbols[i] for i in indices]
+        positions = [generated_positions[i] for i in indices]
+        return symbols, positions
+    return generated_symbols, generated_positions
+
+
+def count_valid_generated_like_ks_filter(
+    symbols_list: List,
+    positions_list: List,
+) -> Tuple[int, int]:
+    """
+    Count molecules that pass the same checks as compute_molecular_fingerprints with
+    filter_invalid=True (conversion succeeds, RDKit-valid, fully connected).
+    """
+    valid = 0
+    total = len(symbols_list)
+    with redirect_stdout(io.StringIO()):
+        for symbols, positions in zip(symbols_list, positions_list):
+            mol, _, is_valid, is_fully_connected = _positions_to_molecule_via_openbabel(
+                symbols, positions
+            )
+            if mol is None or not is_valid or not is_fully_connected:
+                continue
+            valid += 1
+    return valid, total
+
+
+def append_validity_pct_to_ks_summary(output_dir: str, valid_count: int, total_count: int) -> None:
+    summary_path = os.path.join(output_dir, 'ks_statistics_summary.txt')
+    pct = (100.0 * valid_count / total_count) if total_count else 0.0
+    block = (
+        "\nGenerated molecule validity (evaluation subsample)\n"
+        f"  Total molecules: {total_count}\n"
+        f"  Valid (same criterion as valid_only KS): {valid_count}\n"
+        f"  Percent valid: {pct:.2f}%\n"
+    )
+    with open(summary_path, 'a', encoding='utf-8') as f:
+        f.write(block)
 
 
 def try_load_valid_molecules_json(path: str) -> Optional[Tuple[list, list]]:
@@ -141,7 +196,8 @@ def run_eval_loop(
     label: str = '',
 ):
     n_repeats = max(1, args.n_repeats)
-    for n_gen in args.n_gen_samples:
+    n_gen_list = args.n_gen_samples if args.n_gen_samples else [len(gen_symbols)]
+    for n_gen in n_gen_list:
         for repeat in range(n_repeats):
             output_dir = get_eval_output_dir(n_gen, repeat)
 
@@ -166,12 +222,17 @@ def run_eval_loop(
                 print(f"{label}Evaluating n_gen_samples={n_gen}")
                 print(f"{'='*50}")
 
+            subs_syms, subs_pos = subsample_generated_molecules(
+                gen_symbols, gen_positions, n_gen, seed
+            )
+            valid_ct, total_ct = count_valid_generated_like_ks_filter(subs_syms, subs_pos)
+
             evaluate_molecule_distributions(
                 real_symbols, real_positions,
-                gen_symbols, gen_positions,
+                subs_syms, subs_pos,
                 output_dir=all_dir,
                 n_real_samples=None,
-                n_gen_samples=n_gen,
+                n_gen_samples=None,
                 real_smiles=real_smiles,
                 fingerprint_type='rdkit',
                 random_seed=seed,
@@ -179,13 +240,14 @@ def run_eval_loop(
                 ks_only=True,
                 precomputed_real=precomputed_real_all,
             )
+            append_validity_pct_to_ks_summary(all_dir, valid_ct, total_ct)
 
             evaluate_molecule_distributions(
                 real_symbols, real_positions,
-                gen_symbols, gen_positions,
+                subs_syms, subs_pos,
                 output_dir=valid_dir,
                 n_real_samples=None,
-                n_gen_samples=n_gen,
+                n_gen_samples=None,
                 real_smiles=real_smiles,
                 fingerprint_type='rdkit',
                 random_seed=seed,
@@ -193,6 +255,7 @@ def run_eval_loop(
                 ks_only=True,
                 precomputed_real=precomputed_real_valid,
             )
+            append_validity_pct_to_ks_summary(valid_dir, valid_ct, total_ct)
             print(f"   Saved to {output_dir}/")
 
 
@@ -207,8 +270,11 @@ def main():
                      help='Root directory: recursively find .json files; each valid file is evaluated '
                           'and results go under <same-dir>/<stem>/n_gen_<n>/valid_only|all_samples '
                           '(stem = filename without .json). Invalid JSON files are skipped silently.')
-    parser.add_argument('--n-gen-samples', type=int, nargs='+', required=True,
-                        help='Generated sample sizes to evaluate (e.g. 1000 2500 5000 10000)')
+    parser.add_argument('--n-gen-samples', type=int, nargs='*', default=None,
+                        metavar='N',
+                        help='Subset sizes to evaluate (random subsample per size). '
+                             'If omitted, evaluates once using all molecules in each JSON '
+                             '(output under n_gen_<total>). Example: --n-gen-samples 1000 2500 5000')
     parser.add_argument('--n-real-samples', type=int, default=132008,
                         help='QM9 samples (default: 132008 = all)')
     parser.add_argument('--n-repeats', type=int, default=1,
