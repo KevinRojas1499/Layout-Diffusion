@@ -1,3 +1,5 @@
+> **Current project:** content-aware design generation (canvas → variable number of layout elements + per-element text). **Read `CONTENT_AWARE.md` first.** The parenthesis notes below are from an earlier project and remain for reference; see also `LAYOUT.md` and `RICO.md`.
+
 # Variable-Length Diffusion — Parenthesis Training Loop
 
 ## Goal
