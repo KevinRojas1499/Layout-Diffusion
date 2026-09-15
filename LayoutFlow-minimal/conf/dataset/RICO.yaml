@@ -1,0 +1,18 @@
+_target_: torch.utils.data.DataLoader
+
+dataset:
+  _target_: src.data.RICO
+  data_path: ???     # dir containing ldm_rico_{train,val,test}.h5
+  num_cat: 26
+
+batch_size: 512
+num_workers: 12
+pin_memory: True
+persistent_workers: True
+shuffle: True
+drop_last: False
+collate_fn:
+  _target_: src.data.collate_fn
+  _partial_: true
+  max_len: ${data.max_len}
+  format: ${data.format}

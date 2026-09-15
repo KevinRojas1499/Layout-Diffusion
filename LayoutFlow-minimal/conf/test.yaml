@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+  - dataset: null
+  - model: LayoutFlow
+
+dataset_name: ???
+checkpoint: ???
+pretrained_dir: ???
+device: cuda:0
+inference_steps: 100
+calc_miou: false
+multirun_n: 1
+small: false      # if true, only generate one batch (for a quick smoke test)
+visualize: false
+
+data:
+  max_len: 20
+  format: xywh
+
+# Per-dataset element-count distribution (from the training set), used to sample
+# how many elements to generate per unconditional layout -- copied from upstream.
+length_dist_by_dataset:
+  RICO: [0.0000, 0.0483, 0.0351, 0.0504, 0.0619, 0.0614, 0.0700, 0.0727, 0.0636, 0.0625,
+         0.0636, 0.0552, 0.0523, 0.0400, 0.0461, 0.0534, 0.0373, 0.0333, 0.0322, 0.0276, 0.0333]
+  PubLayNet: [0.0000, 0.0032, 0.0334, 0.0423, 0.0422, 0.0540, 0.0723, 0.0825, 0.0905, 0.0950,
+              0.0959, 0.0895, 0.0781, 0.0620, 0.0478, 0.0359, 0.0262, 0.0188, 0.0140, 0.0097, 0.0066]
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
