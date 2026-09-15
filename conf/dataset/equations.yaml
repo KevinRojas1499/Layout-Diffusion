@@ -1,6 +1,0 @@
-defaults:
-  - base_dataset
-
-name: equations
-max_length: 18
-data_path: data/equations_l5.jsonl

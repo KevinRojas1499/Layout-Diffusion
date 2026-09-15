@@ -1,109 +1,49 @@
-## This is a readme
+# Layout Diffusion
 
+Content-aware design generation: canvas → variable number of layout elements +
+per-element text. **Read `CONTENT_AWARE.md` first** for the actual project goal;
+`LAYOUT.md` and `RICO.md` track the current best configs and experiment log for
+the two datasets (PubLayNet, RICO) this is validated against.
 
-## Installing open babel
+This branch has been trimmed to the layout-only subset of the codebase (the
+parent repo also contains earlier QM9 and parenthesized-arithmetic-equation
+projects, stripped out here for readability — see `CLAUDE.md` in the full repo
+if you need that history).
 
-In my case I needed to create a symlink with the openbabel installation.
-```bash
-sudo pacman -S swig openbabel
-uv add openbabel
-
-
-# Create a symlink so the build finds headers in the expected location
-sudo mkdir -p /usr/local/include
-sudo ln -s /usr/include/openbabel3 /usr/local/include/openbabel3
-
-# Then install
-uv add openbabel
-```
-
-For vast ai server using apt
-```bash
-sudo apt install openbabel openbabel-gui
-sudo apt install libopenbabel-dev
-sudo apt install python3-openbabel
-sudo apt install swig
-sudo mkdir -p /usr/local/include
-sudo ln -s /usr/include/openbabel3 /usr/local/include/openbabel3
-uv sync
-```
-
-
-## Preprocess the dataset
-
-```{bash}
-PYTHONPATH=. uv run python -m custom_datasets.preprocess_qm9 --output_dir data/qm9_preprocessed
-```
-
-### Math dataset
-
-```{bash}
-python custom_datasets/create_dataset.py -L 10 --decimals 2 \
-  --min-terms 1 --max-terms 8 \
-  --length-dist "1:0.05,2:0.1,3:0.2,4:0.25,5:0.2,6:0.1,7:0.07,8:0.03"
-```
-
-### Parenthesis Creation
-
-python custom_datasets/create_parenthesis_dataset.py -L 10 --decimals 2 \
-  --min-terms 1 --max-terms 6 \
-  --length-dist "1:0.05,2:0.1,3:0.2,4:0.25,5:0.2,6:0.2"
-
-### Parenthesis training
-
-uv run torchrun --master-port 29502 toy_training.py --interpolant multimodal_both --dataset parenthesis --dir experiments/parenthesis  --data_path data/parenthesis/equations_l5.jsonl --model MMDiTBothVar --log_rate 2500
-
-### Parenthesis sampling
-
-uv run torchrun sampling_toy.py --num_samples 10000 --dataset parenthesis --data_path data/parenthesis/equations_l10.jsonl --interpolant multimodal_both --num_steps 1000 --dir samples-parenthesis/l10 --load_checkpoint experiments/parenthesis_l10/itr_100000/snapshot.pt --model MMDiTBothVar
-
-### Samplers Grid Search Figure 3
-uv run python run_equations_grid_search.py --steps-min 50 --steps-max 500 --steps-num 5 --nfe-min 50 --nfe-max 1500 --nfe-num 5 --num-samples 10000 --seed 1 --seed 2 --seed 3
-
-
-## QM9 Distribution Evaluation
-
-Evaluate generated molecules at different sample sizes (1k, 2.5k, 5k, 10k, etc.) to see how KS statistics change:
+## Running
 
 ```bash
-uv run python grid_search.py eval-sample-sizes --generated samples/muon-fused-residual-80k/samples.json
+uv run python layout_training.py \
+  dataset=publaynet model=transformer optimizer=adamw interpolant=multimodal \
+  dataset.dataset.data_path=<path-to-h5-data> \
+  run.dir=runs/layout/<run-name> run.num_iters=1000000
 ```
 
-### Changing the output folder
+See `conf/config.yaml` for the full config group structure (`run`, `dataset`,
+`model`, `optimizer`, `interpolant`, `eval`) and `conf/schema.py` for every
+field's meaning and default.
 
-Use `--comparison-output-template` to control where results are written. Use `{n_gen}` for the sample size:
+## Layout
 
-```bash
-uv run python grid_search.py eval-sample-sizes \
-  --generated samples/muon-fused-residual-80k/samples.json \
-  --comparison-output-template "results-diff-samples/muon-fused-80k-eval-{n_gen}"
+```
+layout_training.py          # training entry point (Hydra config, PyTorch Lightning-free loop)
+multimodal_interpolant.py   # the insert/unmask/denoise forward+reverse process
+models/transformer.py       # the model (joint geometry + category transformer)
+models/mmdit.py              # shared building blocks models/transformer.py depends on
+model/rotary.py              # RoPE, used by models/transformer.py
+custom_datasets/layoutflow_h5.py, layout_labels.py   # dataset loading + tokenizer vocab
+eval/layout/                 # FID + alignment/overlap evaluator (LayoutFlow's FIDNet)
+utils/{tokenizer,optimizers}.py
+visualize_dataset.py         # plot_layout_sample: renders a generated layout to PNG
+conf/                        # Hydra config groups
+LayoutFlow-minimal/          # separate, standalone reimplementation of upstream LayoutFlow's
+                              # own recipe, used as ground truth to diff this pipeline against
+LayoutFlow/                  # pristine upstream LayoutFlow clone (untouched reference)
 ```
 
-This writes to `results-diff-samples/muon-fused-80k-eval-1000/`, `results-diff-samples/muon-fused-80k-eval-2500/`, etc. Default is `results/eval-n-gen-{n_gen}`.
+## Docs
 
-### Stability analysis (multiple subsamples per size)
-
-To assess metric variance, run multiple independent subsamples of the same size. Each repeat uses a different random subset:
-
-```bash
-uv run python eval/eval_ks_batch.py \
-  --generated samples/muon-fused-residual-80k/samples.json \
-  --n-gen-samples 2500 \
-  --n-repeats 10 \
-  --comparison-output-template "results/stability-2500"
-```
-
-This creates `results/stability-2500/repeat-0/`, `repeat-1/`, ... `repeat-9/`, each with KS stats from a different random 2500-sample subset. Compare the metrics across repeats to study statistical stability.
-
-### Direct batch script
-
-```bash
-uv run python eval/eval_ks_batch.py \
-  --generated samples/muon-fused-residual-80k/samples.json \
-  --n-gen-samples 1000 2500 5000 10000 20000 \
-  --comparison-output-template "my_results/eval-{n_gen}"
-```
-
-### Evaluate a folder
-
-uv run eval/eval_ks_batch.py --folder qm9_sampling_grid/ 
+- `CONTENT_AWARE.md` — the actual project goal and staged plan.
+- `LAYOUTFLOW_REPLICATION.md` — the Stage A effort (match LayoutFlow's published
+  numbers with our own pipeline) and its full experiment log.
+- `LAYOUT.md`, `RICO.md` — best-known configs per dataset.

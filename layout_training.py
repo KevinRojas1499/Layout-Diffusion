@@ -13,17 +13,13 @@ import hydra
 from omegaconf import OmegaConf
 
 from multimodal_interpolant import MultimodalInterpolant
-from autoregressive_interpolant import MultimodalInterpolant as AutoregressiveInterpolant
-from branching_flows_interpolant import BranchingFlowsInterpolant
-from custom_datasets.multimodal_math import EquationsDataset, ParenthesizedEquationsDataset
 from custom_datasets.layout_labels import DATASET_REGISTRY as LAYOUT_REGISTRY, build_tokenizer as build_layout_tokenizer
 from custom_datasets.layoutflow_h5 import LayoutFlowH5Dataset
 from eval.layout import LayoutEvaluator
 from utils.tokenizer import VocabTokenizer
 from utils.optimizers import WarmUpScheduler, CosineDecayScheduler, CombinedOptimizer
-from models.mmdit_qm9 import MMDiTQM9
 from models.transformer import Transformer
-from visualize_dataset import plot_sample, plot_layout_sample
+from visualize_dataset import plot_layout_sample
 
 from conf.schema import register_configs, LayoutConfigSchema
 
@@ -62,37 +58,18 @@ def _get_dataset_and_dims(cfg: LayoutConfigSchema):
     ds_cfg = cfg.dataset
     max_length = ds_cfg.max_length
 
-    if ds_cfg.name in LAYOUT_REGISTRY:
-        tokenizer = build_layout_tokenizer(ds_cfg.name)
-        dataset = LayoutFlowH5Dataset(
-            tokenizer=tokenizer,
-            dataset_name=ds_cfg.name,
-            split=ds_cfg.split,
-            max_length=max_length,
-            data_path=ds_cfg.data_path,
-        )
-        euclidean_dim = 4  # bbox: x_center, y_center, w, h
-        hidden_dim = cfg.model.hidden_dim
-    elif ds_cfg.name == "equations":
-        tokenizer = VocabTokenizer(vocab={"+", "-", "*", "=", ".", "(", ")"})
-        dataset = EquationsDataset(
-            tokenizer,
-            max_length=max_length,
-            data_path=ds_cfg.data_path or "data/equations_l5.jsonl",
-        )
-        euclidean_dim = 1
-        hidden_dim = 256
-    elif ds_cfg.name == "parenthesis":
-        tokenizer = VocabTokenizer(vocab={"+", "-", "*", "=", ".", "(", ")"})
-        dataset = ParenthesizedEquationsDataset(
-            tokenizer,
-            data_path=ds_cfg.data_path or "data/equations_l5.jsonl",
-        )
-        max_length = dataset.max_length
-        euclidean_dim = 1
-        hidden_dim = 256
-    else:
+    if ds_cfg.name not in LAYOUT_REGISTRY:
         raise ValueError(f"Unknown dataset: {ds_cfg.name}")
+    tokenizer = build_layout_tokenizer(ds_cfg.name)
+    dataset = LayoutFlowH5Dataset(
+        tokenizer=tokenizer,
+        dataset_name=ds_cfg.name,
+        split=ds_cfg.split,
+        max_length=max_length,
+        data_path=ds_cfg.data_path,
+    )
+    euclidean_dim = 4  # bbox: x_center, y_center, w, h
+    hidden_dim = cfg.model.hidden_dim
 
     return dataset, tokenizer, euclidean_dim, hidden_dim, max_length
 
@@ -100,32 +77,15 @@ def _get_dataset_and_dims(cfg: LayoutConfigSchema):
 def _get_model(cfg: LayoutConfigSchema, vocab_size: int, euclidean_dim: int, hidden_dim: int, device: torch.device):
     """Build model from config."""
     m_cfg = cfg.model
-    dim_modalities = [hidden_dim, hidden_dim]
-    dim_conds = [hidden_dim, hidden_dim]
-
-    if m_cfg.name == "DiT":
-        model = MMDiTQM9(
-            branching_flows=cfg.interpolant.name == "branching",
-            euclidean_dim=euclidean_dim,
-            vocab_size=vocab_size,
-            symbols_depth=m_cfg.symbols_depth,
-            positions_depth=m_cfg.positions_depth,
-            depth=m_cfg.depth,
-            dim_modalities=dim_modalities,
-            dim_joint_attn=hidden_dim,
-            dim_conds=dim_conds,
-        )
-    elif m_cfg.name == "Transformer":
-        model = Transformer(
-            euclidean_dim=euclidean_dim,
-            vocab_size=vocab_size,
-            dim=hidden_dim,
-            depth=m_cfg.depth,
-            use_rope=m_cfg.use_rope,
-        )
-    else:
+    if m_cfg.name != "Transformer":
         raise ValueError(f"Unknown model: {m_cfg.name}")
-
+    model = Transformer(
+        euclidean_dim=euclidean_dim,
+        vocab_size=vocab_size,
+        dim=hidden_dim,
+        depth=m_cfg.depth,
+        use_rope=m_cfg.use_rope,
+    )
     return model.to(device)
 
 
@@ -159,38 +119,21 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
     int_cfg = cfg.interpolant
     max_length = dataset.max_length
 
-    if int_cfg.name == "multimodal":
-        return MultimodalInterpolant(
-            max_length=max_length,
-            vocab_size=tokenizer.vocab_size,
-            mask_token=tokenizer.mask_token_id,
-            pad_token=tokenizer.pad_token_id,
-            bos_token=tokenizer.bos_token_id,
-            euclidean_dim=euclidean_dim,
-            dsm_t_reweight=int_cfg.dsm_t_reweight,
-            cfg_dropout_prob=int_cfg.cfg_dropout_prob,
-            cat_cond_prob=int_cfg.cat_cond_prob,
-            size_cond_prob=int_cfg.size_cond_prob,
-            fixed_length=int_cfg.fixed_length,
-        )
-    elif int_cfg.name == "autoregressive":
-        return AutoregressiveInterpolant(
-            max_length=max_length,
-            vocab_size=tokenizer.vocab_size,
-            mask_token=tokenizer.mask_token_id,
-            pad_token=tokenizer.pad_token_id,
-            bos_token=tokenizer.bos_token_id,
-            euclidean_dim=euclidean_dim,
-            cat_cond_prob=int_cfg.cat_cond_prob,
-        )
-    elif int_cfg.name == "branching":
-        return BranchingFlowsInterpolant(
-            vocab_size=tokenizer.vocab_size,
-            mask_token=tokenizer.mask_token_id,
-            pad_token=tokenizer.pad_token_id,
-            euclidean_dim=euclidean_dim,
-        )
-    raise ValueError(f"Unknown interpolant: {int_cfg.name}")
+    if int_cfg.name != "multimodal":
+        raise ValueError(f"Unknown interpolant: {int_cfg.name}")
+    return MultimodalInterpolant(
+        max_length=max_length,
+        vocab_size=tokenizer.vocab_size,
+        mask_token=tokenizer.mask_token_id,
+        pad_token=tokenizer.pad_token_id,
+        bos_token=tokenizer.bos_token_id,
+        euclidean_dim=euclidean_dim,
+        dsm_t_reweight=int_cfg.dsm_t_reweight,
+        cfg_dropout_prob=int_cfg.cfg_dropout_prob,
+        cat_cond_prob=int_cfg.cat_cond_prob,
+        size_cond_prob=int_cfg.size_cond_prob,
+        fixed_length=int_cfg.fixed_length,
+    )
 
 
 def _build_evaluator(cfg: LayoutConfigSchema, tokenizer: VocabTokenizer, device: torch.device):
@@ -353,7 +296,6 @@ def main(cfg: LayoutConfigSchema) -> None:
     training_iter = start_iter
     num_iters = run_cfg.num_iters
     log_rate = run_cfg.log_rate
-    int_name = cfg.interpolant.name
 
     while training_iter < num_iters:
         pbar = tqdm(dataloader, total=len(dataloader), leave=False)
@@ -366,7 +308,7 @@ def main(cfg: LayoutConfigSchema) -> None:
 
             opt.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                if int_name in ("multimodal", "autoregressive") and run_cfg.aux_l1_weight > 0:
+                if run_cfg.aux_l1_weight > 0:
                     def aux_l1_loss_fn(prediction, sample, x1, y1):
                         mask_t_shaped = sample.mask_t.unsqueeze(-1)
                         masked_positions = (sample.yt == interpolant.mask_token)
@@ -379,23 +321,14 @@ def main(cfg: LayoutConfigSchema) -> None:
                 else:
                     losses = interpolant.compute_loss(model, data_)
 
-                if int_name in ("multimodal", "autoregressive"):
-                    loss = (
-                        losses["dsm_loss"]
-                        + losses["discrete_unmasking_loss"]
-                        + losses["euclidean_unmasking_loss"]
-                        + losses["insertion_loss"]
-                    )
-                    if "aux_l1_loss" in losses:
-                        loss = loss + run_cfg.aux_l1_weight * losses["aux_l1_loss"]
-                elif int_name == "branching":
-                    loss = (
-                        losses["dsm_loss"]
-                        + losses["discrete_unmasking_loss"]
-                        + losses["insertion_loss"]
-                    )
-                else:
-                    raise ValueError(f"Unknown interpolant: {int_name}")
+                loss = (
+                    losses["dsm_loss"]
+                    + losses["discrete_unmasking_loss"]
+                    + losses["euclidean_unmasking_loss"]
+                    + losses["insertion_loss"]
+                )
+                if "aux_l1_loss" in losses:
+                    loss = loss + run_cfg.aux_l1_weight * losses["aux_l1_loss"]
 
             loss.backward()
             update_ema(ema, model, decay=run_cfg.ema_beta)
@@ -410,19 +343,12 @@ def main(cfg: LayoutConfigSchema) -> None:
             training_iter += 1
             loss_val = loss.detach().item()
 
-            if int_name in ("multimodal", "autoregressive"):
-                pbar.set_description(
-                    f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
-                    f"Disc: {losses['discrete_unmasking_loss']:.4f}, "
-                    f"Euc: {losses['euclidean_unmasking_loss']:.4f}, "
-                    f"Ins: {losses['insertion_loss']:.4f}"
-                )
-            elif int_name == "branching":
-                pbar.set_description(
-                    f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
-                    f"Disc: {losses['discrete_unmasking_loss']:.4f}, "
-                    f"Ins: {losses['insertion_loss']:.4f}"
-                )
+            pbar.set_description(
+                f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
+                f"Disc: {losses['discrete_unmasking_loss']:.4f}, "
+                f"Euc: {losses['euclidean_unmasking_loss']:.4f}, "
+                f"Ins: {losses['insertion_loss']:.4f}"
+            )
 
             if run_cfg.enable_wandb:
                 log_dict = {"loss": loss_val, "step": training_iter, **{k: v.item() for k, v in losses.items()}}
@@ -435,9 +361,8 @@ def main(cfg: LayoutConfigSchema) -> None:
                 model.eval()
 
                 samples = interpolant.sampling(model, 50, 20, max_length + 1, device, return_trace=True)
-                if cfg.dataset.name in LAYOUT_REGISTRY:
-                    vis_dir = os.path.join(path, "layouts")
-                    os.makedirs(vis_dir, exist_ok=True)
+                vis_dir = os.path.join(path, "layouts")
+                os.makedirs(vis_dir, exist_ok=True)
 
                 if evaluator is not None:
                     metrics = _run_eval(
@@ -459,25 +384,16 @@ def main(cfg: LayoutConfigSchema) -> None:
                         wandb.log(eval_log)
 
                 for i, sample in enumerate(samples):
-                    if cfg.dataset.name in LAYOUT_REGISTRY:
-                        mask_t = sample.y_mask_t if hasattr(sample, "y_mask_t") else sample.mask_t
-                        plot_layout_sample(
-                            sample.xt.cpu(),
-                            sample.yt.cpu(),
-                            mask_t.cpu(),
-                            tokenizer,
-                            os.path.join(vis_dir, f"layout_{i}.png"),
-                            iter_num=training_iter,
-                            title=f"iter {training_iter} | sample {i}",
-                        )
-                    elif int_name == "multimodal":
-                        plot_sample(
-                            sample.xt.cpu(),
-                            sample.yt.cpu(),
-                            sample.mask_t.cpu(),
-                            os.path.join(path, f"sample_{i}.png"),
-                            tokenizer,
-                        )
+                    mask_t = sample.y_mask_t if hasattr(sample, "y_mask_t") else sample.mask_t
+                    plot_layout_sample(
+                        sample.xt.cpu(),
+                        sample.yt.cpu(),
+                        mask_t.cpu(),
+                        tokenizer,
+                        os.path.join(vis_dir, f"layout_{i}.png"),
+                        iter_num=training_iter,
+                        title=f"iter {training_iter} | sample {i}",
+                    )
 
                 model.train()
 

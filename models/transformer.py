@@ -30,10 +30,10 @@ The output is wired to ``MultimodalModelPrediction`` (see
     clean_data           <- loc_decoder
     label_logits         <- d_decoder
     insertion_rate       <- count_decoder
-    clean_data_unmasking <- extra FinalLayer head (matches MMDiTQM9)
+    clean_data_unmasking <- extra FinalLayer head
 
-The forward signature matches ``MMDiTQM9`` / ``MMDiTBothVar`` in
-``models/mmdit_qm9.py`` so this class can be used as a drop-in replacement.
+The forward signature matches other models built on ``multimodal_interpolant.py``
+so this class can be used as a drop-in replacement for them.
 """
 
 from __future__ import annotations
