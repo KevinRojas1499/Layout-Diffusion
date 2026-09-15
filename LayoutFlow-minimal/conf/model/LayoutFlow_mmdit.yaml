@@ -19,6 +19,7 @@ model:
     dim_head: 64
     heads: 8
     num_cat: ${dataset.dataset.num_cat}
+    max_len: ${data.max_len}
   sampler:
     _target_: src.sampler.GaussianSampler
     out_dim: 7   # see LayoutFlow.yaml's comment -- pass model.sampler.out_dim=9 for RICO

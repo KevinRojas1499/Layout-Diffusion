@@ -19,7 +19,7 @@ from src.mmdit import MMDiT, FinalLayer, TimestepEmbedder
 
 class MMDiTBackbone(nn.Module):
     def __init__(self, dim_modalities=(256, 256), dim_joint_attn=256, depth=4,
-                 dim_head=64, heads=8, num_cat=6, num_bits=None):
+                 dim_head=64, heads=8, num_cat=6, num_bits=None, max_len=20):
         super().__init__()
         self.geom_dim = 4
         num_bits = num_bits if num_bits is not None else int(math.ceil(math.log2(num_cat)))
@@ -32,6 +32,16 @@ class MMDiTBackbone(nn.Module):
         self.cond_enc_attr = nn.Embedding(2, dim_attr)
         self.geom_embed = nn.Linear(self.geom_dim, dim_geom)
         self.attr_embed = nn.Linear(num_bits, dim_attr)
+
+        # Unlike Backbone (which fuses geom+attr into one token per element before
+        # any attention, so "these belong to the same element" is automatic), the
+        # two token streams here only meet through joint attention with no signal
+        # telling the model which geom-token and attr-token are the same element.
+        # Adding the *same* per-position embedding to both streams gives it that
+        # signal directly. Requires dim_modalities to match so one table can be
+        # shared as-is (true for the current default config).
+        assert dim_geom == dim_attr, 'shared position embedding needs equal modality dims'
+        self.pos_embed = nn.Embedding(max_len, dim_geom)
 
         self.time_embed_geom = TimestepEmbedder(dim_geom)
         self.time_embed_attr = TimestepEmbedder(dim_attr)
@@ -48,8 +58,11 @@ class MMDiTBackbone(nn.Module):
         geom_cond = cond_flags[:, :, :self.geom_dim].sum(-1)
         attr_cond = cond_flags[:, :, -1]
 
-        geom_tok = self.geom_embed(geom) + self.cond_enc_geom(geom_cond)
-        attr_tok = self.attr_embed(attr) + self.cond_enc_attr(attr_cond)
+        pos_ids = torch.arange(geom.shape[1], device=geom.device)
+        pos = self.pos_embed(pos_ids)[None]  # (1, S, dim) -- broadcasts over batch
+
+        geom_tok = self.geom_embed(geom) + self.cond_enc_geom(geom_cond) + pos
+        attr_tok = self.attr_embed(attr) + self.cond_enc_attr(attr_cond) + pos
         t_geom = self.time_embed_geom(t)
         t_attr = self.time_embed_attr(t)
 
