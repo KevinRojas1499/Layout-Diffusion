@@ -13,13 +13,15 @@ runs a single-stream transformer over that.
 Since the two streams never get fused into one token the way Backbone's do,
 something has to tell the model which geom-token and attr-token are the same
 layout element. `pos_encoding` selects how:
-  - 'additive' (default): one learned per-position embedding, added identically
-    to both streams. Simple, requires dim_modalities to match.
-  - 'rotary': the mechanism MMDiTQM9 actually uses -- the same (parameter-free)
-    rotary phase applied to both streams' queries/keys at each sequence index,
-    via src/rotary.py. Doesn't require matching dims.
+  - 'rotary' (default): the mechanism MMDiTQM9 actually uses -- the same
+    (parameter-free) rotary phase applied to both streams' queries/keys at
+    each sequence index, via src/rotary.py. Doesn't require matching dims.
+  - 'additive': one learned per-position embedding, added identically to both
+    streams. Requires dim_modalities to match.
 Both were added after diagnosing a first MMDiT run (no binding signal at all)
-that plateaued far short of Backbone's FID -- see git log for the writeup.
+that plateaued far short of Backbone's FID. A head-to-head RICO run then
+picked rotary over additive: faster and lower long-term convergence, at the
+cost of a noisier FID curve early in training. See git log for both writeups.
 '''
 import math
 import torch
@@ -32,7 +34,7 @@ from src.rotary import Rotary
 class MMDiTBackbone(nn.Module):
     def __init__(self, dim_modalities=(256, 256), dim_joint_attn=256, depth=4,
                  dim_head=64, heads=8, num_cat=6, num_bits=None, max_len=20,
-                 pos_encoding='additive'):
+                 pos_encoding='rotary'):
         super().__init__()
         assert pos_encoding in ('additive', 'rotary')
         self.pos_encoding = pos_encoding

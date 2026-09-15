@@ -1,8 +1,10 @@
 # @package _global_
-# Identical to LayoutFlow_mmdit.yaml except backbone_model.pos_encoding=rotary
-# instead of the additive shared position embedding -- tests QM9's actual
-# cross-modality binding mechanism (matching rotary phase applied to both
-# streams' q/k at the same index) against the simpler additive embedding.
+# Alternative to LayoutFlow_mmdit.yaml: additive shared position embedding
+# instead of rotary. Kept for reference -- in a head-to-head RICO run this
+# converged more slowly and to a slightly higher loss than rotary long-term,
+# though its FID curve was noticeably less noisy early in training. Worth
+# revisiting if rotary's frequency schedule (tuned for much longer sequences
+# than our ~20-element layouts) turns out to need retuning.
 model:
   _target_: src.models.layout_flow.LayoutFlow
   optimizer:
@@ -19,7 +21,7 @@ model:
     heads: 8
     num_cat: ${dataset.dataset.num_cat}
     max_len: ${data.max_len}
-    pos_encoding: rotary
+    pos_encoding: additive
   sampler:
     _target_: src.sampler.GaussianSampler
     out_dim: 7   # see LayoutFlow.yaml's comment -- pass model.sampler.out_dim=9 for RICO
