@@ -4,13 +4,12 @@ models/mmdit.py (same architecture used by MMDiTQM9) so it can be dropped into
 LayoutFlow-minimal as an alternative to src/backbone.py's Backbone, for
 single-variable NN-swap comparisons.
 
-Trimmed relative to the source: dropped the rotary-position-embedding and
-per-layer attention-bias plumbing (both optional there, `None` by default) --
-LayoutFlow's own backbone doesn't use positional encoding either
-(`use_pos_enc: False`), so this keeps the comparison apples-to-apples and
-avoids pulling in the unrelated model/rotary.py dependency. Everything else
-(JointAttention, adaptive layernorm time-conditioning, MMDiTBlock, MMDiT) is
-architecturally the same.
+Trimmed relative to the source: dropped the per-layer attention-bias plumbing
+(optional there, `None` by default, used only for QM9's pairwise spatial bias,
+which has no equivalent for layouts). Rotary positional embedding support is
+kept (optional, `None` by default) since it's how MMDiTQM9 actually binds its
+two modality streams together at the same sequence index -- see
+src/backbone_mmdit.py's `use_rotary` option.
 '''
 import torch
 from torch import nn, Tensor
@@ -20,6 +19,8 @@ from einops import rearrange, pack, unpack
 from einops.layers.torch import Rearrange
 from x_transformers.attend import Attend
 from x_transformers import RMSNorm, FeedForward
+
+from src.rotary import apply_rotary_pos_emb
 
 
 def exists(v):
@@ -58,16 +59,26 @@ class JointAttention(Module):
             self.q_rmsnorms = ModuleList([MultiHeadRMSNorm(dim_head, heads=heads) for _ in range(num_inputs)])
             self.k_rmsnorms = ModuleList([MultiHeadRMSNorm(dim_head, heads=heads) for _ in range(num_inputs)])
 
-    def forward(self, inputs, masks=None):
+    def forward(self, inputs, masks=None, rotary_pos_emb=None):
         masks = masks or (None,) * self.num_inputs
+        rotary_pos_emb = rotary_pos_emb or (None,) * self.num_inputs
 
         all_qkvs, all_masks = [], []
-        for i, (x, mask, to_qkv) in enumerate(zip(inputs, masks, self.to_qkv)):
+        for i, (x, mask, to_qkv, rotary) in enumerate(zip(inputs, masks, self.to_qkv, rotary_pos_emb)):
             qkv = self.split_heads(to_qkv(x))
             q, k, v = qkv
             if self.qk_rmsnorm:
                 q = self.q_rmsnorms[i](q)
                 k = self.k_rmsnorms[i](k)
+
+            if exists(rotary):
+                cos, sin = rotary
+                qkv_stacked = torch.stack((q, k, v), dim=0)  # (3, b, h, n, d)
+                qkv_reshaped = rearrange(qkv_stacked, 'qkv b h n d -> b n qkv h d')
+                qkv_rotated = apply_rotary_pos_emb(qkv_reshaped, cos, sin)
+                qkv_rotated = rearrange(qkv_rotated, 'b n qkv h d -> qkv b h n d')
+                q, k, v = qkv_rotated
+
             all_qkvs.append(torch.stack((q, k, v)))
             if not exists(mask):
                 mask = torch.ones(x.shape[:2], device=x.device, dtype=torch.bool)
@@ -122,14 +133,14 @@ class MMDiTBlock(Module):
         self.ff_layernorms = ModuleList([AdaptiveLayerNorm(d, c) for d, c in zip(dim_modalities, dim_conds)])
         self.feedforwards = ModuleList([FeedForward(d) for d in dim_modalities])
 
-    def forward(self, *, modality_tokens, time_cond, modality_masks=None):
+    def forward(self, *, modality_tokens, time_cond, modality_masks=None, rotary_pos_emb=None):
         attn_gammas, ff_gammas = zip(*[
             gate_proj(cond).chunk(2, dim=-1) for gate_proj, cond in zip(self.post_branch_gates, time_cond)
         ])
 
         residual = list(modality_tokens)
         tokens = [ln(t, c) for t, c, ln in zip(modality_tokens, time_cond, self.attn_layernorms)]
-        tokens = self.joint_attn(tokens, masks=modality_masks)
+        tokens = self.joint_attn(tokens, masks=modality_masks, rotary_pos_emb=rotary_pos_emb)
         tokens = [t * g + r for t, g, r in zip(tokens, attn_gammas, residual)]
 
         residual = list(tokens)
@@ -149,9 +160,10 @@ class MMDiT(Module):
         ])
         self.norms = ModuleList([RMSNorm(d) for d in dim_modalities])
 
-    def forward(self, *, modality_tokens, time_cond, modality_masks=None):
+    def forward(self, *, modality_tokens, time_cond, modality_masks=None, rotary_pos_emb=None):
         for block in self.blocks:
-            modality_tokens = block(modality_tokens=modality_tokens, time_cond=time_cond, modality_masks=modality_masks)
+            modality_tokens = block(modality_tokens=modality_tokens, time_cond=time_cond,
+                                     modality_masks=modality_masks, rotary_pos_emb=rotary_pos_emb)
         return tuple(norm(t) for t, norm in zip(modality_tokens, self.norms))
 
 

@@ -9,18 +9,33 @@ own embedding, adaptive-layernorm time-conditioning, and output head) that
 exchange information only through the shared joint-attention layers -- as
 opposed to Backbone, which concatenates them into one token per element and
 runs a single-stream transformer over that.
+
+Since the two streams never get fused into one token the way Backbone's do,
+something has to tell the model which geom-token and attr-token are the same
+layout element. `pos_encoding` selects how:
+  - 'additive' (default): one learned per-position embedding, added identically
+    to both streams. Simple, requires dim_modalities to match.
+  - 'rotary': the mechanism MMDiTQM9 actually uses -- the same (parameter-free)
+    rotary phase applied to both streams' queries/keys at each sequence index,
+    via src/rotary.py. Doesn't require matching dims.
+Both were added after diagnosing a first MMDiT run (no binding signal at all)
+that plateaued far short of Backbone's FID -- see git log for the writeup.
 '''
 import math
 import torch
 from torch import nn, Tensor
 
 from src.mmdit import MMDiT, FinalLayer, TimestepEmbedder
+from src.rotary import Rotary
 
 
 class MMDiTBackbone(nn.Module):
     def __init__(self, dim_modalities=(256, 256), dim_joint_attn=256, depth=4,
-                 dim_head=64, heads=8, num_cat=6, num_bits=None, max_len=20):
+                 dim_head=64, heads=8, num_cat=6, num_bits=None, max_len=20,
+                 pos_encoding='additive'):
         super().__init__()
+        assert pos_encoding in ('additive', 'rotary')
+        self.pos_encoding = pos_encoding
         self.geom_dim = 4
         num_bits = num_bits if num_bits is not None else int(math.ceil(math.log2(num_cat)))
         dim_geom, dim_attr = dim_modalities
@@ -33,15 +48,14 @@ class MMDiTBackbone(nn.Module):
         self.geom_embed = nn.Linear(self.geom_dim, dim_geom)
         self.attr_embed = nn.Linear(num_bits, dim_attr)
 
-        # Unlike Backbone (which fuses geom+attr into one token per element before
-        # any attention, so "these belong to the same element" is automatic), the
-        # two token streams here only meet through joint attention with no signal
-        # telling the model which geom-token and attr-token are the same element.
-        # Adding the *same* per-position embedding to both streams gives it that
-        # signal directly. Requires dim_modalities to match so one table can be
-        # shared as-is (true for the current default config).
-        assert dim_geom == dim_attr, 'shared position embedding needs equal modality dims'
-        self.pos_embed = nn.Embedding(max_len, dim_geom)
+        if pos_encoding == 'additive':
+            assert dim_geom == dim_attr, 'additive shared position embedding needs equal modality dims'
+            self.pos_embed = nn.Embedding(max_len, dim_geom)
+        else:
+            # One shared instance reused for both streams: token i in geom and
+            # token i in attr get the identical rotation, applied to q/k inside
+            # JointAttention (dim_head-sized, independent of modality embedding dim).
+            self.rotary = Rotary(dim=dim_head)
 
         self.time_embed_geom = TimestepEmbedder(dim_geom)
         self.time_embed_attr = TimestepEmbedder(dim_attr)
@@ -58,16 +72,25 @@ class MMDiTBackbone(nn.Module):
         geom_cond = cond_flags[:, :, :self.geom_dim].sum(-1)
         attr_cond = cond_flags[:, :, -1]
 
-        pos_ids = torch.arange(geom.shape[1], device=geom.device)
-        pos = self.pos_embed(pos_ids)[None]  # (1, S, dim) -- broadcasts over batch
+        geom_tok = self.geom_embed(geom) + self.cond_enc_geom(geom_cond)
+        attr_tok = self.attr_embed(attr) + self.cond_enc_attr(attr_cond)
 
-        geom_tok = self.geom_embed(geom) + self.cond_enc_geom(geom_cond) + pos
-        attr_tok = self.attr_embed(attr) + self.cond_enc_attr(attr_cond) + pos
+        rotary_pos_emb = None
+        if self.pos_encoding == 'additive':
+            pos_ids = torch.arange(geom.shape[1], device=geom.device)
+            pos = self.pos_embed(pos_ids)[None]  # (1, S, dim) -- broadcasts over batch
+            geom_tok = geom_tok + pos
+            attr_tok = attr_tok + pos
+        else:
+            cos, sin = self.rotary(geom_tok, seq_dim=1)
+            rotary_pos_emb = ((cos, sin), (cos, sin))  # same phase for both streams
+
         t_geom = self.time_embed_geom(t)
         t_attr = self.time_embed_attr(t)
 
         geom_tok, attr_tok = self.mmdit(
             modality_tokens=(geom_tok, attr_tok), time_cond=(t_geom, t_attr),
+            rotary_pos_emb=rotary_pos_emb,
         )
 
         geom_pred = self.geom_out(geom_tok, t_geom)
