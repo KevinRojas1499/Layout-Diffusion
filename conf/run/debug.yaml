@@ -1,8 +1,0 @@
-# Debug run - fewer iters for quick testing
-defaults:
-  - base_run
-
-seed: 42
-num_iters: 100
-log_rate: 50
-batch_size: 32

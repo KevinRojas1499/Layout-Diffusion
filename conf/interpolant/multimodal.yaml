@@ -1,9 +1,0 @@
-defaults:
-  - base_interpolant
-
-name: multimodal
-dsm_t_reweight: false
-cfg_dropout_prob: 0.0
-cat_cond_prob: 0.0
-size_cond_prob: 0.0
-fixed_length: false

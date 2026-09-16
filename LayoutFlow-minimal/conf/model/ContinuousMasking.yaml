@@ -1,0 +1,26 @@
+# @package _global_
+# Masking-diffusion model: geometry + analog-bit category concatenated into
+# one continuous channel (src/continuous_masking_interpolant.py), single-
+# stream backbone (src/backbone_masking.py) -- no joint attention between
+# separate modalities, since there's only one channel here. Unmasking only,
+# no insertion (see continuous_masking_interpolant.py's module docstring).
+model:
+  _target_: src.models.continuous_masking.ContinuousMaskingModel
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: reduce_on_plateau
+  backbone_model:
+    _target_: src.backbone_masking.MaskingBackbone
+    x_dim: 9   # 4 (bbox) + ceil(log2(num_cat)) analog bits -- pass model.backbone_model.x_dim
+               # explicitly to match your dataset's num_cat (see README)
+    d_model: 512
+    nhead: 8
+    dim_feedforward: 2048
+    num_layers: 4
+    dropout: 0.1
+  pretrained_dir: ???
+  num_cat: ${dataset.dataset.num_cat}
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  inference_steps: 100
