@@ -148,10 +148,6 @@ def _build_evaluator(cfg: LayoutConfigSchema, tokenizer: VocabTokenizer, device:
     eval_cfg = getattr(cfg, "eval", None)
     if eval_cfg is None or not getattr(eval_cfg, "enabled", False):
         return None
-    if cfg.interpolant.name == "continuous_masking":
-        # No FID wiring yet for this interpolant -- see periodic-visualization
-        # branch in main() for what it does get (plain PNG samples).
-        return None
     if cfg.dataset.name not in LAYOUT_REGISTRY:
         return None
     return LayoutEvaluator.for_dataset(
@@ -346,12 +342,7 @@ def main(cfg: LayoutConfigSchema) -> None:
                 else:
                     losses = interpolant.compute_loss(model, data_)
 
-                loss = (
-                    losses["dsm_loss"]
-                    + losses["discrete_unmasking_loss"]
-                    + losses["euclidean_unmasking_loss"]
-                    + losses["insertion_loss"]
-                )
+                loss = sum(losses.values())
                 if "aux_l1_loss" in losses:
                     loss = loss + run_cfg.aux_l1_weight * losses["aux_l1_loss"]
 
@@ -368,12 +359,15 @@ def main(cfg: LayoutConfigSchema) -> None:
             training_iter += 1
             loss_val = loss.detach().item()
 
-            pbar.set_description(
-                f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
-                f"Disc: {losses['discrete_unmasking_loss']:.4f}, "
-                f"Euc: {losses['euclidean_unmasking_loss']:.4f}, "
-                f"Ins: {losses['insertion_loss']:.4f}"
-            )
+            if is_continuous_category:
+                pbar.set_description(f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}")
+            else:
+                pbar.set_description(
+                    f"Iter {training_iter} --- DSM: {losses['dsm_loss']:.4f}, "
+                    f"Disc: {losses['discrete_unmasking_loss']:.4f}, "
+                    f"Euc: {losses['euclidean_unmasking_loss']:.4f}, "
+                    f"Ins: {losses['insertion_loss']:.4f}"
+                )
 
             if run_cfg.enable_wandb:
                 log_dict = {"loss": loss_val, "step": training_iter, **{k: v.item() for k, v in losses.items()}}
@@ -403,6 +397,31 @@ def main(cfg: LayoutConfigSchema) -> None:
                             tokenizer, os.path.join(vis_dir, f"layout_{i}.png"),
                             iter_num=training_iter, title=f"iter {training_iter} | sample {i}",
                         )
+
+                    if evaluator is not None:
+                        eval_cfg = cfg.eval
+                        eval_idx = torch.randint(0, train_lengths.shape[0], (eval_cfg.num_samples,))
+                        eval_lens = train_lengths[eval_idx].to(device)
+                        eval_active = torch.arange(max_length, device=device).unsqueeze(0) < eval_lens.unsqueeze(1)
+                        eval_out = interpolant.sampling(ema, eval_cfg.num_steps, eval_active)
+                        eval_cat_ids = analog_bit.decode(eval_out[..., 4:]).clamp(0, tokenizer.vocab_size - 1).long()
+                        metrics = evaluator.evaluate_samples(
+                            eval_out[..., :4], eval_cat_ids, eval_active, batch_size=eval_cfg.batch_size,
+                        )
+                        metrics["iter"] = training_iter
+                        with open(metrics_log_path, "a") as f:
+                            f.write(json.dumps(metrics) + "\n")
+                        print(
+                            f"[eval @ iter {training_iter}] "
+                            f"FID={metrics['fid']:.3f} "
+                            f"Align={metrics['alignment-LayoutGAN++']:.4f} "
+                            f"Overlap={metrics['overlap-LayoutGAN++']:.4f}"
+                        )
+                        if run_cfg.enable_wandb:
+                            eval_log = {f"eval/{k}": v for k, v in metrics.items() if k != "iter"}
+                            eval_log["step"] = training_iter
+                            wandb.log(eval_log)
+
                     model.train()
                     continue
 

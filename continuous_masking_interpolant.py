@@ -109,13 +109,7 @@ class ContinuousMaskingInterpolant:
         loss = (sample.x1 - prediction.clean_data).pow(2).sum(dim=-1)[active]
         loss = loss.mean() / self.euclidean_dim
 
-        zero = torch.zeros((), device=x1.device, dtype=loss.dtype)
-        return {
-            'dsm_loss': loss,
-            'discrete_unmasking_loss': zero,
-            'euclidean_unmasking_loss': zero,
-            'insertion_loss': zero,
-        }
+        return {'dsm_loss': loss}
 
     @torch.no_grad()
     def sampling(self, model, num_steps: int, active: Tensor) -> Tensor:
