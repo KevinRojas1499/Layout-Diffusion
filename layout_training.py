@@ -13,6 +13,8 @@ import hydra
 from omegaconf import OmegaConf
 
 from multimodal_interpolant import MultimodalInterpolant
+from continuous_masking_interpolant import ContinuousMaskingInterpolant
+from analog_bit import AnalogBit
 from custom_datasets.layout_labels import DATASET_REGISTRY as LAYOUT_REGISTRY, build_tokenizer as build_layout_tokenizer
 from custom_datasets.layoutflow_h5 import LayoutFlowH5Dataset
 from eval.layout import LayoutEvaluator
@@ -119,6 +121,11 @@ def _get_interpolant(cfg: LayoutConfigSchema, dataset, tokenizer, euclidean_dim:
     int_cfg = cfg.interpolant
     max_length = dataset.max_length
 
+    if int_cfg.name == "continuous_masking":
+        # euclidean_dim already includes the analog-bit category width -- see
+        # main()'s widening of it before this is called for this interpolant.
+        return ContinuousMaskingInterpolant(euclidean_dim=euclidean_dim)
+
     if int_cfg.name != "multimodal":
         raise ValueError(f"Unknown interpolant: {int_cfg.name}")
     return MultimodalInterpolant(
@@ -140,6 +147,10 @@ def _build_evaluator(cfg: LayoutConfigSchema, tokenizer: VocabTokenizer, device:
     """Construct a LayoutEvaluator if eval is enabled and dataset is supported."""
     eval_cfg = getattr(cfg, "eval", None)
     if eval_cfg is None or not getattr(eval_cfg, "enabled", False):
+        return None
+    if cfg.interpolant.name == "continuous_masking":
+        # No FID wiring yet for this interpolant -- see periodic-visualization
+        # branch in main() for what it does get (plain PNG samples).
         return None
     if cfg.dataset.name not in LAYOUT_REGISTRY:
         return None
@@ -247,6 +258,16 @@ def main(cfg: LayoutConfigSchema) -> None:
 
     dataset, tokenizer, euclidean_dim, hidden_dim, max_length = _get_dataset_and_dims(cfg)
 
+    # continuous_masking has no discrete category channel: y gets analog-bit
+    # encoded and concatenated onto x, and the model's discrete cat_tokens
+    # pathway (vocab_size=2) is repurposed to carry the masked-state flag
+    # instead of a category id -- see continuous_masking_interpolant.py.
+    is_continuous_category = cfg.interpolant.name == "continuous_masking"
+    analog_bit = AnalogBit(num_cat=tokenizer.vocab_size) if is_continuous_category else None
+    model_vocab_size = 2 if is_continuous_category else tokenizer.vocab_size
+    if is_continuous_category:
+        euclidean_dim = euclidean_dim + analog_bit.num_bits
+
     collate_fn = getattr(dataset, "dynamic_collate", None)
     dataloader = DataLoader(
         dataset,
@@ -260,7 +281,7 @@ def main(cfg: LayoutConfigSchema) -> None:
     if run_cfg.enable_wandb:
         init_wandb(cfg)
 
-    model = _get_model(cfg, tokenizer.vocab_size, euclidean_dim, hidden_dim, device)
+    model = _get_model(cfg, model_vocab_size, euclidean_dim, hidden_dim, device)
     ema = deepcopy(model)
     opt = _get_optimizer(cfg, model)
     interpolant = _get_interpolant(cfg, dataset, tokenizer, euclidean_dim)
@@ -306,9 +327,13 @@ def main(cfg: LayoutConfigSchema) -> None:
             for key, value in data_.items():
                 data_[key] = value.to(device=device)
 
+            if is_continuous_category:
+                cat_bits = analog_bit.encode(data_["y"])  # [B, L, num_bits]
+                data_ = {"x": torch.cat([data_["x"], cat_bits], dim=-1), "mask": data_["mask"]}
+
             opt.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                if run_cfg.aux_l1_weight > 0:
+                if run_cfg.aux_l1_weight > 0 and not is_continuous_category:
                     def aux_l1_loss_fn(prediction, sample, x1, y1):
                         mask_t_shaped = sample.mask_t.unsqueeze(-1)
                         masked_positions = (sample.yt == interpolant.mask_token)
@@ -360,9 +385,28 @@ def main(cfg: LayoutConfigSchema) -> None:
                 save_ckpt(model, ema, opt, scheduler, os.path.join(path, "snapshot.pt"))
                 model.eval()
 
-                samples = interpolant.sampling(model, 50, 20, max_length + 1, device, return_trace=True)
                 vis_dir = os.path.join(path, "layouts")
                 os.makedirs(vis_dir, exist_ok=True)
+
+                if is_continuous_category:
+                    n_vis = 20
+                    idx = torch.randint(0, train_lengths.shape[0], (n_vis,))
+                    lens = train_lengths[idx].to(device)
+                    active = torch.arange(max_length, device=device).unsqueeze(0) < lens.unsqueeze(1)
+                    out = interpolant.sampling(ema, 50, active)
+                    geom, cat_bits = out[..., :4], out[..., 4:]
+                    cat_ids = analog_bit.decode(cat_bits).clamp(0, tokenizer.vocab_size - 1).long()
+                    for i in range(n_vis):
+                        L = int(lens[i])
+                        plot_layout_sample(
+                            geom[i, :L].cpu(), cat_ids[i, :L].cpu(), active[i, :L].cpu(),
+                            tokenizer, os.path.join(vis_dir, f"layout_{i}.png"),
+                            iter_num=training_iter, title=f"iter {training_iter} | sample {i}",
+                        )
+                    model.train()
+                    continue
+
+                samples = interpolant.sampling(model, 50, 20, max_length + 1, device, return_trace=True)
 
                 if evaluator is not None:
                     metrics = _run_eval(
