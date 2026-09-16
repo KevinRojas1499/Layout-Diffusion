@@ -20,6 +20,8 @@ model:
     dim_feedforward: 2048
     num_layers: 4
     dropout: 0.1
+    use_pos_embed: false   # see src/backbone_masking.py's docstring
+    max_len: ${data.max_len}
   pretrained_dir: ???
   num_cat: ${dataset.dataset.num_cat}
   fid_calc_every_n: ${trainer.check_val_every_n_epoch}
