@@ -69,7 +69,11 @@ def main(cfg: DictConfig):
         print(f'[sanity check, val vs test] FID: {calculate_frechet_distance(mu1, cov1, mu_val, cov_val):.4f}')
 
         print('Loading model...')
-        model = hydra.utils.get_class(cfg.model._target_).load_from_checkpoint(cfg.checkpoint, map_location=device)
+        # LayoutFlowDiscrete/VarLen keep the backbone and sampler out of the checkpoint's hparams,
+        # so rebuild them from the model config (its architecture knobs must match the training run)
+        model = hydra.utils.get_class(cfg.model._target_).load_from_checkpoint(
+            cfg.checkpoint, map_location=device, backbone_model=instantiate(cfg.model.backbone_model),
+            sampler=instantiate(cfg.model.sampler), pretrained_dir=cfg.pretrained_dir)
         model.inference_steps = cfg.inference_steps
         model = model.to(device).eval()
         model.cond = 'uncond'   # checkpoint hparams carry the *training* cond mix (random4)

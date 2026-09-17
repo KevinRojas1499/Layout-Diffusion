@@ -27,7 +27,7 @@ model:
   num_cat: ${dataset.dataset.num_cat}
   inference_steps: 100
   insertion: true
-  t_max: 1.0              # reveal schedule kappa(t) = min(t / t_max, 1)
+  t_max: 0.5              # reveal schedule kappa(t) = min(t / t_max, 1); 1.0 is much worse (see README)
   unmask_geom: gmm        # gmm: sample the clean box from the mixture | mean: point estimate
   add_loss: geom_l1_loss
   add_loss_weight: 0.2
