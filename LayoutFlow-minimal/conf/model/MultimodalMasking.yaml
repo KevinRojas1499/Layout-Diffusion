@@ -1,0 +1,30 @@
+# @package _global_
+# Masking-diffusion model: geometry (continuous, unmasking via zero+noise) and
+# category (discrete, real [MASK] id + cross-entropy) as separate channels --
+# see src/multimodal_masking_interpolant.py's docstring for why this beats
+# folding category into the continuous analog-bit vector. Unmasking only, no
+# insertion, same scope as ContinuousMasking.yaml.
+model:
+  _target_: src.models.multimodal_masking.MultimodalMaskingModel
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: null
+  scheduler_patience: 10
+  scheduler_factor: 0.1
+  backbone_model:
+    _target_: src.backbone_multimodal_masking.MultimodalMaskingBackbone
+    geom_dim: 4
+    num_cat: ${dataset.dataset.num_cat}
+    d_model: 512
+    nhead: 8
+    dim_feedforward: 2048
+    num_layers: 4
+    dropout: 0.1
+    use_pos_embed: true
+    max_len: ${data.max_len}
+  pretrained_dir: ???
+  num_cat: ${dataset.dataset.num_cat}
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  inference_steps: 100
