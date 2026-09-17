@@ -18,7 +18,7 @@ class MultimodalMaskingModel(pl.LightningModule):
 
     def __init__(
         self, backbone_model, optimizer, scheduler=None,
-        scheduler_patience=10, scheduler_factor=0.1,
+        scheduler_patience=10, scheduler_factor=0.1, cat_loss_weight=1.0,
         pretrained_dir='./pretrained', dataset='RICO', num_cat=6,
         fid_calc_every_n=20, format='xywh', inference_steps=100, vis_dir=None,
     ):
@@ -27,6 +27,7 @@ class MultimodalMaskingModel(pl.LightningModule):
         self.scheduler_setting = scheduler
         self.scheduler_patience = scheduler_patience
         self.scheduler_factor = scheduler_factor
+        self.cat_loss_weight = cat_loss_weight
         self.dataset = dataset
         self.format = format
         self.num_cat = num_cat
@@ -44,7 +45,7 @@ class MultimodalMaskingModel(pl.LightningModule):
         self.save_hyperparameters(ignore=['backbone_model'])
 
     def configure_optimizers(self):
-        optimizer = self.optimizer_partial(params=self.model.parameters())
+        optimizer = self.optimizer_partial(params=self.model.parameters(), betas=(0.9, 0.98))
         if self.scheduler_setting == 'reduce_on_plateau':
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, patience=self.scheduler_patience, factor=self.scheduler_factor)
@@ -62,7 +63,7 @@ class MultimodalMaskingModel(pl.LightningModule):
         y1 = batch['type'].long()
         active = batch['mask'].squeeze(-1)
         losses = self.interpolant.compute_loss(self.model, {'x': x1, 'y': y1, 'mask': active})
-        loss = sum(losses.values())
+        loss = losses['geom_loss'] + self.cat_loss_weight * losses['cat_loss']
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log('geom_loss', losses['geom_loss'], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log('cat_loss', losses['cat_loss'], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)

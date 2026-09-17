@@ -13,6 +13,7 @@ model:
   scheduler: null
   scheduler_patience: 10
   scheduler_factor: 0.1
+  cat_loss_weight: 1.0
   backbone_model:
     _target_: src.backbone_multimodal_masking.MultimodalMaskingBackbone
     geom_dim: 4
