@@ -34,6 +34,10 @@ def main(cfg: DictConfig):
     model = instantiate(cfg.model, dataset=cfg.dataset_name, format=cfg.data.format,
                          vis_dir=f'{cfg.run_dir}/vis' if cfg.visualize else None)
 
+    if cfg.init_weights_path is not None:
+        state_dict = torch.load(cfg.init_weights_path, map_location='cpu', weights_only=False)['state_dict']
+        model.load_state_dict(state_dict)
+
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader,
                 ckpt_path=cfg.ckpt_path)
 

@@ -11,6 +11,8 @@ model:
     _target_: torch.optim.AdamW
     lr: 0.0005
   scheduler: reduce_on_plateau
+  scheduler_patience: 10
+  scheduler_factor: 0.1
   backbone_model:
     _target_: src.backbone_masking.MaskingBackbone
     x_dim: 9   # 4 (bbox) + ceil(log2(num_cat)) analog bits -- pass model.backbone_model.x_dim

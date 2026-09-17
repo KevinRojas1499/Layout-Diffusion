@@ -21,12 +21,15 @@ class ContinuousMaskingModel(pl.LightningModule):
 
     def __init__(
         self, backbone_model, optimizer, scheduler=None,
+        scheduler_patience=10, scheduler_factor=0.1,
         pretrained_dir='./pretrained', dataset='RICO', num_cat=6,
         fid_calc_every_n=20, format='xywh', inference_steps=100, vis_dir=None,
     ):
         super().__init__()
         self.optimizer_partial = optimizer
         self.scheduler_setting = scheduler
+        self.scheduler_patience = scheduler_patience
+        self.scheduler_factor = scheduler_factor
         self.dataset = dataset
         self.format = format
         self.num_cat = num_cat
@@ -51,13 +54,19 @@ class ContinuousMaskingModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = self.optimizer_partial(params=self.model.parameters())
         if self.scheduler_setting == 'reduce_on_plateau':
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, patience=self.scheduler_patience, factor=self.scheduler_factor)
             return [optimizer], [{'scheduler': scheduler, 'monitor': 'FID_Layout',
                                    'frequency': self.fid_calc_every_n}]
         return optimizer
 
     def _make_x1(self, batch):
-        return torch.cat([batch['bbox'], self.analog_bit.encode(batch['type'])], dim=-1)
+        # Rescale to [-1, 1] to match the N(0, 1) corruption noise's scale --
+        # mirrors src/sampler.py's GaussianSampler.preprocess used by the
+        # flow-matching side; without it x1 lives in raw [0, 1]/{0, 1} while
+        # noise is unit-scale and centered at 0, a real train/prior mismatch.
+        x1 = torch.cat([batch['bbox'], self.analog_bit.encode(batch['type'])], dim=-1)
+        return 2 * x1 - 1
 
     def training_step(self, batch, batch_idx):
         x1 = self._make_x1(batch)
@@ -70,6 +79,7 @@ class ContinuousMaskingModel(pl.LightningModule):
     def inference(self, batch):
         active = batch['mask'].squeeze(-1)
         out = self.interpolant.sampling(self.model, self.inference_steps, active)
+        out = (out + 1) / 2   # undo _make_x1's [-1, 1] rescale
         geom = out[..., :4]
         cat = self.analog_bit.decode(out[..., 4:]).clamp(0, self.num_cat - 1).long()
         return geom, cat

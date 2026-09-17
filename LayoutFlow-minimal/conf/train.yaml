@@ -11,6 +11,7 @@ expname: ${dataset_name}_bs${dataset.batch_size}
 run_dir: ???        # e.g. $LAB/runs/layoutflow-minimal/<run-name> -- keep off home (13GB quota)
 wandb_dir: ${run_dir}/wandb
 ckpt_path: null
+init_weights_path: null   # load only model weights from this ckpt (fresh optimizer/scheduler/epoch) -- for warm-starting with a new LR schedule
 enable_wandb: true
 visualize: false
 
