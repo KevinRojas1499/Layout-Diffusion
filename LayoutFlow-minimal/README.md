@@ -94,3 +94,20 @@ before launching a real run.
   doesn't change what gets optimized.
 - No trajectory/wandb-image visualization; `save_example_layouts` writes plain PNGs
   to `{run_dir}/vis/` instead, gated behind `visualize=true`.
+
+## Discrete-category variant (`model=LayoutFlowDiscrete`)
+
+Geometry keeps LayoutFlow's Euclidean flow matching at every element; the category is
+modelled with masked discrete diffusion (masked w.p. `1-t`, cross-entropy on masked
+elements, unmasked at sampling with prob `dt/(1-t)`), both noised jointly at the same `t`.
+See `src/models/layout_flow_discrete.py`. RICO, truly unconditional val FID, 5 seeds:
+continuous LayoutFlow 2.32 +/- 0.12, LayoutFlowDiscrete (`cat_loss_weight=0.25`) 2.07 +/- 0.11.
+
+```bash
+python train.py dataset=RICO dataset_name=RICO model=LayoutFlowDiscrete \
+  dataset.dataset.data_path=... model.pretrained_dir=... run_dir=... trainer.max_epochs=2000 trainer.check_val_every_n_epoch=25
+```
+
+Note: validation/test now evaluate with `cond='uncond'` (as upstream does). Earlier
+in-training FIDs of random4-trained models (e.g. "1.53") were measured on the leaky
+random4 mix and read ~0.5 too low.

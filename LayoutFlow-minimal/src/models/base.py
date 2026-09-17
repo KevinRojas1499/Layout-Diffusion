@@ -96,7 +96,12 @@ class BaseGenModel(pl.LightningModule):
         return loss + self.add_loss_weight * add_loss
 
     def validation_step(self, batch, batch_idx):
+        # Upstream evaluates unconditionally when trained on a random cond mix;
+        # without this switch 3/4 of every val batch is handed ground truth and
+        # FID_Layout reads ~0.5 too low (1.7 vs 2.1-2.4 on the RICO SOTA ckpt).
+        train_cond, self.cond = self.cond, 'uncond'
         geom_pred, cat = self.inference(batch)
+        self.cond = train_cond
         loss = self.loss(geom_pred, batch['bbox'], batch['length'])
         self.log('val_loss', loss, sync_dist=True)
 

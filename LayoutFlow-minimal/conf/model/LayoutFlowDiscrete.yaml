@@ -1,0 +1,32 @@
+# @package _global_
+# LayoutFlow recipe with the category modelled by masked discrete diffusion
+# (geometry: unchanged Euclidean flow matching at every element; both noised
+# jointly at the same t). See src/models/layout_flow_discrete.py.
+model:
+  _target_: src.models.layout_flow_discrete.LayoutFlowDiscrete
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: reduce_on_plateau
+  backbone_model:
+    _target_: src.backbone_discrete.DiscreteBackbone
+    latent_dim: 128
+    d_model: 512
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    num_cat: ${dataset.dataset.num_cat}
+  sampler:
+    _target_: src.sampler.GaussianSampler
+    out_dim: 4
+  pretrained_dir: ???
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  num_cat: ${dataset.dataset.num_cat}
+  inference_steps: 100
+  cond: random4
+  add_loss: geom_l1_loss
+  add_loss_weight: 0.2
+  # CE (~1-2 nats) dwarfs the velocity MSE (~0.2); unweighted it slows convergence a lot
+  # (RICO uncond FID @2000 ep: 2.95 at 1.0 vs 2.07 at 0.25; 0.1 is worse again).
+  cat_loss_weight: 0.25
