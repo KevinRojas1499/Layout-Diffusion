@@ -1,0 +1,32 @@
+defaults:
+  - _self_
+  - dataset: null
+  - model: LayoutFlow
+
+# e.g. `dataset=RICO dataset_name=RICO` -- kept as an explicit string (rather than
+# upstream's parse-it-out-of-expname trick) so it's obvious this only controls
+# which pretrained FID net + reference stats get loaded.
+dataset_name: ???
+expname: ${dataset_name}_bs${dataset.batch_size}
+run_dir: ???        # e.g. $LAB/runs/layoutflow-minimal/<run-name> -- keep off home (13GB quota)
+wandb_dir: ${run_dir}/wandb
+ckpt_path: null
+enable_wandb: true
+visualize: false
+
+data:
+  max_len: 20
+  format: xywh
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  max_epochs: 1000
+  check_val_every_n_epoch: 10
+  accelerator: gpu
+  devices: auto
+  num_sanity_val_steps: 2
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

@@ -1,0 +1,18 @@
+_target_: torch.utils.data.DataLoader
+
+dataset:
+  _target_: src.data.PubLayNet
+  data_path: ???     # dir containing publaynet_{train,val,test}.h5
+  num_cat: 6
+
+batch_size: 512
+num_workers: 12
+pin_memory: True
+persistent_workers: True
+shuffle: True
+drop_last: False
+collate_fn:
+  _target_: src.data.collate_fn
+  _partial_: true
+  max_len: ${data.max_len}
+  format: ${data.format}

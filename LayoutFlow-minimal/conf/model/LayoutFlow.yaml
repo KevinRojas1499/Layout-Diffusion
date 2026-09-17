@@ -1,0 +1,34 @@
+# @package _global_
+model:
+  _target_: src.models.layout_flow.LayoutFlow
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: reduce_on_plateau
+  backbone_model:
+    _target_: src.backbone.Backbone
+    latent_dim: 128
+    d_model: 512
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    num_cat: ${dataset.dataset.num_cat}
+  sampler:
+    _target_: src.sampler.GaussianSampler
+    # 4 (bbox) + ceil(log2(num_cat)) analog bits. Default matches PubLayNet's 6
+    # categories (3 bits); RICO's 26 categories need 5 bits -- pass
+    # `model.sampler.out_dim=9` on the CLI for RICO (this is not derived
+    # automatically, matching how upstream's own RICO ground-truth run overrides it).
+    out_dim: 7
+  pretrained_dir: ???   # e.g. $LAB/repos/LayoutFlow/pretrained (fid_{dataset}.pth.tar + musig files)
+  sigma: 0.0
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  num_cat: ${dataset.dataset.num_cat}
+  time_sampling: uniform
+  inference_steps: 100
+  cond: random4
+  train_traj: linear
+  ode_solver: euler
+  add_loss: geom_l1_loss
+  add_loss_weight: 0.2

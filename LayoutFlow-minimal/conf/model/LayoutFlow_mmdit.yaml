@@ -1,0 +1,40 @@
+# @package _global_
+# Our own project's MMDiT joint-attention architecture (src/backbone_mmdit.py)
+# in place of LayoutFlow's single-stream Backbone (src/backbone.py), with
+# rotary position encoding -- the mechanism MMDiTQM9 actually uses to bind its
+# two modality streams together (matching phase applied to both streams' q/k
+# at the same index). Chosen as the default over the additive shared-embedding
+# alternative (conf/model/LayoutFlow_mmdit_additive.yaml) after a head-to-head
+# RICO run: rotary converged faster and lower long-term, despite a noisier
+# FID curve early on -- see git log for the full comparison.
+model:
+  _target_: src.models.layout_flow.LayoutFlow
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: reduce_on_plateau
+  backbone_model:
+    _target_: src.backbone_mmdit.MMDiTBackbone
+    dim_modalities: [256, 256]
+    dim_joint_attn: 256
+    depth: 4
+    dim_head: 64
+    heads: 8
+    num_cat: ${dataset.dataset.num_cat}
+    max_len: ${data.max_len}
+    pos_encoding: rotary
+  sampler:
+    _target_: src.sampler.GaussianSampler
+    out_dim: 7   # see LayoutFlow.yaml's comment -- pass model.sampler.out_dim=9 for RICO
+  pretrained_dir: ???
+  sigma: 0.0
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  num_cat: ${dataset.dataset.num_cat}
+  time_sampling: uniform
+  inference_steps: 100
+  cond: random4
+  train_traj: linear
+  ode_solver: euler
+  add_loss: geom_l1_loss
+  add_loss_weight: 0.2
