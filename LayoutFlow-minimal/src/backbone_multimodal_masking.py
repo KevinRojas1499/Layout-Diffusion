@@ -16,7 +16,7 @@ class MultimodalMaskingBackbone(nn.Module):
                  num_layers=4, dropout=0.1, use_pos_embed=False, max_len=20):
         super().__init__()
         self.geom_embed = nn.Linear(geom_dim, d_model)
-        self.cat_embed = nn.Embedding(num_cat + 1, d_model)  # +1: reserved [MASK] id
+        self.cat_embed = nn.Embedding(num_cat + 2, d_model)  # +2: reserved [MASK] and [PAD] ids
         self.mask_embed = nn.Embedding(2, d_model)
         self.use_pos_embed = use_pos_embed
         if use_pos_embed:

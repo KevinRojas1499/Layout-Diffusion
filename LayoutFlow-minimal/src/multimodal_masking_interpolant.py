@@ -32,7 +32,11 @@ class MultimodalMaskingInterpolant:
     def __init__(self, geom_dim: int, num_cat: int):
         self.geom_dim = geom_dim
         self.num_cat = num_cat
-        self.mask_token = num_cat   # one reserved id past the real category ids
+        self.mask_token = num_cat       # one reserved id past the real category ids
+        self.pad_token = num_cat + 1    # separate id for dataset-padding slots -- must NOT
+        # collide with a real category (was a bug: padding slots used to get category id 0,
+        # a genuine real class, leaking a false "there's a real element here" signal into
+        # every other position's attention context for every empty slot in every layout)
 
     def alpha(self, t):
         return t
@@ -53,7 +57,7 @@ class MultimodalMaskingInterpolant:
         xt = torch.where((active & ~is_masked).unsqueeze(-1), xt, torch.zeros_like(xt))
 
         yt = torch.where(is_masked, torch.full_like(y1, self.mask_token), y1)
-        yt = torch.where(active, yt, torch.zeros_like(y1))  # pad slots: arbitrary, never used in any loss/context that matters
+        yt = torch.where(active, yt, torch.full_like(y1, self.pad_token))
 
         return MultimodalMaskingResult(xt=xt, yt=yt, is_masked=is_masked, active=active, x1=x1, y1=y1, t=t)
 
@@ -80,7 +84,8 @@ class MultimodalMaskingInterpolant:
         B, L = active.shape
         device = active.device
         xt = torch.zeros((B, L, self.geom_dim), device=device)
-        yt = torch.full((B, L), self.mask_token, dtype=torch.long, device=device)
+        yt = torch.where(active, torch.full((B, L), self.mask_token, dtype=torch.long, device=device),
+                          torch.full((B, L), self.pad_token, dtype=torch.long, device=device))
         is_masked = active.clone()
         ts = torch.linspace(0, 1, num_steps + 1, device=device)[:-1]
         dt = 1.0 / num_steps
