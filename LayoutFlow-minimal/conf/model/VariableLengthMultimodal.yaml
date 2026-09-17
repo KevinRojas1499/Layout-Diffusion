@@ -1,0 +1,32 @@
+# @package _global_
+# Genuinely variable-length version of MultimodalMasking.yaml: elements are
+# inserted (born) over the course of generation, not all present from t=0 on
+# a fixed canvas. See src/variable_length_multimodal_interpolant.py's
+# docstring -- ported from the pre-LayoutFlow-minimal multimodal_interpolant.py
+# whose insertion+discrete-category design reached FID 5.7-9.9 on RICO,
+# vastly beating this project's fixed-length rebuild.
+model:
+  _target_: src.models.variable_length_multimodal.VariableLengthMultimodalModel
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: null
+  scheduler_patience: 10
+  scheduler_factor: 0.1
+  backbone_model:
+    _target_: src.backbone_variable_length_multimodal.VariableLengthMultimodalBackbone
+    geom_dim: 4
+    num_cat: ${dataset.dataset.num_cat}
+    d_model: 512
+    nhead: 8
+    dim_feedforward: 2048
+    num_layers: 4
+    dropout: 0.1
+    use_pos_embed: false
+    max_len: 21   # data.max_len (20) + 1 for the BOS slot
+  pretrained_dir: ???
+  num_cat: ${dataset.dataset.num_cat}
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  inference_steps: 100
+  max_len: ${data.max_len}
