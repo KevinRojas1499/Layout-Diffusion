@@ -81,12 +81,17 @@ def main(cfg: DictConfig):
             for batch in tqdm(test_loader):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 batch['length'] = torch.multinomial(length_dist, num_samples=len(batch['length']), replacement=True)
-                geom_pred, cat_pred = model.inference(batch)
+                geom_pred, cat_pred, *gen_mask = model.inference(batch)
+                if gen_mask:    # variable-length model: the length is generated, not sampled above
+                    m = gen_mask[0]
+                    keep = m.any(1)
+                    geom_pred, cat_pred, m = geom_pred[keep], cat_pred[keep], m[keep]
+                else:
+                    m = torch.zeros(geom_pred.shape[:2], device=device, dtype=bool)
+                    for i, L in enumerate(batch['length']):
+                        m[i, :L] = True
                 bbox.append(geom_pred)
                 label.append(cat_pred)
-                m = torch.zeros(geom_pred.shape[:2], device=device, dtype=bool)
-                for i, L in enumerate(batch['length']):
-                    m[i, :L] = True
                 pad_mask.append(m)
                 if cfg.small:
                     break
