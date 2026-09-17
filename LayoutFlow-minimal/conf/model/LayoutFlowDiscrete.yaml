@@ -27,4 +27,6 @@ model:
   cond: random4
   add_loss: geom_l1_loss
   add_loss_weight: 0.2
-  cat_loss_weight: 1.0
+  # CE (~1-2 nats) dwarfs the velocity MSE (~0.2); unweighted it slows convergence a lot
+  # (RICO uncond FID @2000 ep: 2.95 at 1.0 vs 2.07 at 0.25; 0.1 is worse again).
+  cat_loss_weight: 0.25
