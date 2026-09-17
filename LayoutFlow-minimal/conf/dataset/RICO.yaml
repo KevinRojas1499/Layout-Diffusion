@@ -4,6 +4,7 @@ dataset:
   _target_: src.data.RICO
   data_path: ???     # dir containing ldm_rico_{train,val,test}.h5
   num_cat: 26
+  in_memory: false   # true: cache the split in RAM (far less dataloader CPU)
 
 batch_size: 512
 num_workers: 12

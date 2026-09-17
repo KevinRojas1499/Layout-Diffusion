@@ -79,7 +79,7 @@ class LayoutFlowVarLen(BaseGenModel):
         active = batch['mask'].squeeze(-1)
         x1 = batch['mask'] * self.sampler.preprocess(batch['bbox'])
         y1 = batch['type'].long()
-        x0 = self.sampler.sample(batch)
+        x0 = batch['mask'] * torch.randn_like(x1)
 
         k = self.kappa(t).view(-1, 1)
         u1, u2 = torch.rand_like(x0[..., 0]), torch.rand_like(x0[..., 0])
