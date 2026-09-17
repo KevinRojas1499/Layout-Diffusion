@@ -72,6 +72,7 @@ def main(cfg: DictConfig):
         model = hydra.utils.get_class(cfg.model._target_).load_from_checkpoint(cfg.checkpoint, map_location=device)
         model.inference_steps = cfg.inference_steps
         model = model.to(device).eval()
+        model.cond = 'uncond'   # checkpoint hparams carry the *training* cond mix (random4)
 
         length_dist = torch.tensor(cfg.length_dist_by_dataset[cfg.dataset_name])
         fids, aligns, overlaps, mious = [], [], [], []
