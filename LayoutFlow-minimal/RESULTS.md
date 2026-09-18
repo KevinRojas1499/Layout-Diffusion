@@ -197,3 +197,45 @@ and coarse snapping (grid 32/64) are clearly harmful, i.e. the revealed box must
 training path and the real RICO test boxes are continuous; (4) untrained CFG lowers alignment and
 overlap (the layouts get "cleaner") but moves the distribution away from the data (FID 3.5-13);
 the trained version (`model.cat_drop=0.1`, then `+sampling.cfg_w`) is the open question.
+
+## Classifier-free guidance on the categories (RICO, paper protocol, 5 repeats)
+
+Retrained with `model.cat_drop=0.1` (every category of a layout hidden w.p. 0.1 during training), t_max=0.5, then
+`+sampling.cfg_w=w` at test time: `v = v_u + w (v_c - v_u)`, the null condition being the mask token on every category.
+
+| w | Unmasking (`rico-elemmask-gmm-t050-catdrop10`, ep 1924) | Variable length (`rico-varlen-gmm-t050-catdrop10`, ep 1099) |
+|---|---|---|
+| 0.75 | 5.97 +/- 0.24 | 5.42 +/- 0.35 |
+| **1.0 (off)** | **2.46 +/- 0.15** | **2.46 +/- 0.09** |
+| 1.25 | 2.39 +/- 0.04 | 2.52 +/- 0.12 |
+| 1.5 | 2.60 +/- 0.06 | 2.74 +/- 0.15 |
+| 2.0 | 3.41 +/- 0.17 | 3.52 +/- 0.16 |
+| 3.0 | 4.32 +/- 0.23 | 4.50 +/- 0.21 |
+
+Conclusions: category dropout costs nothing (w = 1 matches the no-dropout runs: 2.41 / 2.55 five-run means), but
+guidance does not help: w = 1.25 is within noise (-0.07 / +0.06) and anything stronger hurts monotonically.
+Overlap drifts up and alignment does not improve either. The category signal is already fully used by the
+conditional velocity; sharpening it moves the samples off the data distribution. Not worth keeping on.
+
+## Conditional tasks with `model.cond=random4` (RICO, paper protocol, full test set, max-IoU)
+
+LayoutFlow paper: C->S+P 1.48 / mIoU 0.322, C+S->P 1.03 / 0.470, completion 1.51 / 0.741 (unconditional 2.37).
+
+| Model | uncond (5 runs) | C->S+P (`cat_cond`) | C+S->P (`size_cond`) | completion (`elem_compl`) |
+|---|---|---|---|---|
+| Unmasking, uncond-only training (`rico-elemmask-gmm-t050`) | 2.41 +/- 0.08 | **1.26** / 0.348 | 2.92 / 0.389 | 3.77 / 0.586 |
+| Unmasking, random4 (`rico-elemmask-gmm-t050-random4`, ep 1699) | 2.63 +/- 0.09 | 1.59 / 0.344 | **1.45** / 0.434 | **2.50** / 0.604 |
+| Variable length, uncond-only (`rico-varlen-gmm-t050`) | 2.55 +/- 0.08 | 1.58 / 0.335 | 3.46 / 0.385 | 7.05 / 0.460 (length given) |
+| Variable length, random4 (`rico-varlen-gmm-t050-random4`, ep 1224) | 4.68 +/- 0.21 | 2.21 / 0.302 | 3.29 / 0.386 | 6.97 / 0.517 (length given); 5.86 / 0.488 (length generated) |
+
+Conclusions: (1) category conditioning is native, the uncond-only unmasking model already beats LayoutFlow on
+C->S+P (1.26 vs 1.48) with no conditional training; (2) the random4 mix makes size-conditioning and completion
+work for the fixed-length model (2.92 -> 1.45, 3.77 -> 2.50) at a 0.2 unconditional cost, but still short of
+LayoutFlow (1.03 / 1.51); (3) **the variable-length random4 run is broken**: its unconditional FID collapses to
+4.68 and its validation FID never went below 4.8. Diagnosis: the backbone never sees *which* elements are
+given. In the cat_cond / size_cond quarters every element is visible from t = 0 with nothing missing, in the
+unconditional quarter a state with the same number of visible elements has elements still to insert, and the
+insertion rate (and the unmask heads) cannot tell the two apart. LayoutFlow feeds its cond_mask to the network
+as an input embedding; we must do the same (a per-element given / per-coordinate held indicator) before
+random4 training can be trusted for the insertion model. The fixed-length model is less exposed because it has
+no insertion rate to confuse, which is why it degrades only mildly.

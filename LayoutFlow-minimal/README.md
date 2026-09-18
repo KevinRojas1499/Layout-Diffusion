@@ -186,7 +186,7 @@ Conditional tasks and guidance (both models):
   With insertion, `elem_compl` generates the number of extra elements unless `given_length=true`.
 - `model.cat_drop=0.1` hides every category of a layout w.p. 0.1 during training, so the
   category-unconditional velocity exists; `test.py +sampling.cfg_w=<w>` then applies
-  classifier-free guidance `v_u + w (v_c - v_u)` (w = 1 is off). Other `+sampling.*` knobs
+  classifier-free guidance `v_u + w (v_c - v_u)` (w = 1 is off; on RICO no w beats 1, see RESULTS.md). Other `+sampling.*` knobs
   (`gmm_temp`, `reveal_eps`, `solver=heun`, `snap_grid`) are documented in `RESULTS.md`; none of
   them beat the default sampler.
 
