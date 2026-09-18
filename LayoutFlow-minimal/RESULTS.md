@@ -227,6 +227,7 @@ LayoutFlow paper: C->S+P 1.48 / mIoU 0.322, C+S->P 1.03 / 0.470, completion 1.51
 | Unmasking, random4 (`rico-elemmask-gmm-t050-random4`, ep 1699) | 2.63 +/- 0.09 | 1.59 / 0.344 | **1.45** / 0.434 | **2.50** / 0.604 |
 | Variable length, uncond-only (`rico-varlen-gmm-t050`) | 2.55 +/- 0.08 | 1.58 / 0.335 | 3.46 / 0.385 | 7.05 / 0.460 (length given) |
 | Variable length, random4 (`rico-varlen-gmm-t050-random4`, ep 1224) | 4.68 +/- 0.21 | 2.21 / 0.302 | 3.29 / 0.386 | 6.97 / 0.517 (length given); 5.86 / 0.488 (length generated) |
+| Variable length, random4 + `cond_input` (`rico-varlen-gmm-t050-random4-condin`, ep 1449) | 3.10 +/- 0.27 | **1.37** / 0.337 | **1.15** / 0.442 | 3.73 / 0.540 (length given); 2.70 / 0.527 (length generated) |
 
 Conclusions: (1) category conditioning is native, the uncond-only unmasking model already beats LayoutFlow on
 C->S+P (1.26 vs 1.48) with no conditional training; (2) the random4 mix makes size-conditioning and completion
@@ -239,3 +240,9 @@ insertion rate (and the unmask heads) cannot tell the two apart. LayoutFlow feed
 as an input embedding; we must do the same (a per-element given / per-coordinate held indicator) before
 random4 training can be trusted for the insertion model. The fixed-length model is less exposed because it has
 no insertion rate to confuse, which is why it degrades only mildly.
+
+**Fix (commit 121340d, `model.backbone_model.cond_input=true`):** the given / held mask is embedded into the
+element tokens, as LayoutFlow does. Retrained: unconditional 4.68 -> 3.10, C->S+P 2.21 -> 1.37 (paper 1.48),
+C+S->P 3.29 -> 1.15 (paper 1.03), completion with its own length 5.86 -> 2.70 (paper 1.51, length given).
+One variable-length model now serves all tasks; the remaining unconditional cost of the mix (3.10 vs 2.55) is
+larger than the fixed-length model's (2.63 vs 2.41) and is the open item.
