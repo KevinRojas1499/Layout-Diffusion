@@ -108,6 +108,7 @@ class LayoutEditFlow(BaseGenModel):
         self.num_cat, self.max_len, self.inference_steps = num_cat, max_len, inference_steps
         self.tokenizer = LayoutDMTokenizer(num_cat, num_bins)
         self.max_tokens = 5 * max_len
+        self.loss_fcn = nn.MSELoss()        # only for base.validation_step's val_loss diagnostic
         self.model = EditFlowTransformer(self.tokenizer.vocab, self.max_tokens, d_model, nhead, num_layers, dim_feedforward, dropout)
         self.save_hyperparameters(ignore=['backbone_model'])
 
