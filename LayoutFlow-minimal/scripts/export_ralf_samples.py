@@ -22,6 +22,45 @@ TO_RALF = {i + 1: RALF_NAMES.index(n) for i, n in enumerate(CGL.LABELS)}
 TEMPLATE = glob.glob(f'{B}/datasets/ralf/cache/training_logs/ralf_uncond_cgl/generated_samples_*/test_0.pkl')[0]
 
 
+UNDERLAY = CGL.LABELS.index('underlay') + 1
+
+
+def postprocess(geom, label, keep, steps):
+    '''
+    Explicitly labelled post-processing (env POST="snap128,contain"), reported as separate rows, never silently:
+      snapN    round every box edge to the 1/N grid (RALF generates on a 128-bin grid)
+      contain  an underlay that loosely contains a non-underlay element (>= 80% of its area inside) is enlarged
+               minimally so that it contains it exactly (the strict underlay metric requires exact containment)
+    geom (B,S,4) cx,cy,w,h in [0,1]; label (B,S) our ids; keep (B,S) bool.
+    '''
+    if not steps:
+        return geom
+    l, t_, r, b = geom[..., 0] - geom[..., 2] / 2, geom[..., 1] - geom[..., 3] / 2, geom[..., 0] + geom[..., 2] / 2, geom[..., 1] + geom[..., 3] / 2
+    for step in steps.split(','):
+        if step.startswith('snap'):
+            n = int(step[4:])
+            l, t_, r, b = [(v * n).round() / n for v in (l, t_, r, b)]
+        elif step == 'contain':
+            B, S = label.shape
+            for i in range(B):
+                u = torch.nonzero(keep[i] & (label[i] == UNDERLAY)).flatten().tolist()
+                o = torch.nonzero(keep[i] & (label[i] != UNDERLAY)).flatten().tolist()
+                for ui in u:
+                    best, best_frac = None, 0.8
+                    for oi in o:
+                        iw = (torch.minimum(r[i, ui], r[i, oi]) - torch.maximum(l[i, ui], l[i, oi])).clamp(min=0)
+                        ih = (torch.minimum(b[i, ui], b[i, oi]) - torch.maximum(t_[i, ui], t_[i, oi])).clamp(min=0)
+                        frac = (iw * ih) / ((r[i, oi] - l[i, oi]) * (b[i, oi] - t_[i, oi])).clamp(min=1e-8)
+                        if frac >= best_frac:
+                            best, best_frac = oi, float(frac)
+                    if best is not None:
+                        l[i, ui], t_[i, ui] = torch.minimum(l[i, ui], l[i, best]), torch.minimum(t_[i, ui], t_[i, best])
+                        r[i, ui], b[i, ui] = torch.maximum(r[i, ui], r[i, best]), torch.maximum(b[i, ui], b[i, best])
+        else:
+            raise ValueError(step)
+    return torch.stack([(l + r) / 2, (t_ + b) / 2, r - l, b - t_], -1).clamp(0, 1)
+
+
 @torch.no_grad()
 def main(ckpt, out_dir, model_name, overrides, seed=0, split='test'):
     with initialize_config_dir(config_dir=f'{SRC}/conf', version_base=None):
@@ -36,12 +75,24 @@ def main(ckpt, out_dir, model_name, overrides, seed=0, split='test'):
     empty_id = cfg.dataset.dataset.num_cat - 1 if cfg.dataset.dataset.get('pad_empty', False) else None
     loader = instantiate(cfg.dataset, dataset={'split': split}, shuffle=False, batch_size=512)
 
+    # optional sampler variants (env): SAMPLING="gmm_temp=0.5,solver=heun" ; STEPS=200 ; SELF_REFINE=0.97 (t_start of a
+    # refinement pass of our own refinement mode on the generated layout, categories fixed, boxes re-integrated)
+    for kv in filter(None, os.environ.get('SAMPLING', '').split(',')):
+        k, v = kv.split('='); model.sampling[k] = type(model.sampling[k])(v) if not isinstance(model.sampling[k], bool) else v == 'true'
+    if os.environ.get('STEPS'):
+        model.inference_steps = int(os.environ['STEPS'])
+    self_refine = float(os.environ.get('SELF_REFINE', 0) or 0)
+    print('sampling:', model.sampling, '| steps', model.inference_steps, '| self_refine', self_refine)
     torch.manual_seed(seed)
     results, ours = [], []
     for batch in loader:
         ids = batch.pop('id')
         batch = {k: v.cuda() for k, v in batch.items()}
         geom, label, keep = model.inference(batch)
+        if self_refine:
+            b2 = dict(batch); b2['bbox'], b2['type'], b2['mask'], b2['length'] = geom, label, keep.unsqueeze(-1), keep.sum(1)
+            geom, label, keep = model.inference(b2, task='refinement', t_start=self_refine)
+        geom = postprocess(geom, label, keep, os.environ.get('POST', ''))
         if empty_id is not None:
             keep = keep & (label != empty_id)
         for i in range(len(ids)):
