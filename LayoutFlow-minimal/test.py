@@ -79,6 +79,9 @@ def main(cfg: DictConfig):
         model.inference_steps = cfg.inference_steps
         model = model.to(device).eval()
         model.cond = 'uncond'   # checkpoint hparams carry the *training* cond mix (random4)
+        if 'sampling' in cfg:   # sampler knobs of LayoutFlowVarLen, e.g. +sampling.gmm_temp=0.5
+            model.sampling.update(cfg.sampling)
+            print('sampling:', model.sampling)
 
         length_dist = torch.tensor(cfg.length_dist_by_dataset[cfg.dataset_name])
         fids, aligns, overlaps, mious = [], [], [], []

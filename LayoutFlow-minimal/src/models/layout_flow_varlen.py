@@ -43,7 +43,7 @@ class LayoutFlowVarLen(BaseGenModel):
         pretrained_dir='./pretrained', format='xywh', fid_calc_every_n=20,
         dataset='RICO', num_cat=6, inference_steps=100, insertion=False, t_max=1.0,
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
-        geom_unmask_weight=0.05, ins_loss_weight=0.1, vis_dir=None,
+        geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, vis_dir=None,
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
@@ -66,7 +66,9 @@ class LayoutFlowVarLen(BaseGenModel):
         self.cat_loss_weight = cat_loss_weight
         self.geom_unmask_weight = geom_unmask_weight
         self.ins_loss_weight = ins_loss_weight
+        self.cat_drop = cat_drop
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
+        self.sampling = dict(self.DEFAULT_SAMPLING)
 
     def forward(self, xt, yt, exists, t):
         return self.model(xt, yt, exists, t)
@@ -100,6 +102,11 @@ class LayoutFlowVarLen(BaseGenModel):
         t = torch.rand(batch['bbox'].shape[0], device=self.device)
         xt, yt, exists, visible, x0, x1, y1 = self.sample_state(batch, t)
         masked = exists & ~visible
+        if self.cat_drop > 0:
+            # classifier-free guidance training: hide every category of a layout w.p. cat_drop, so the
+            # model also learns the category-unconditional velocity (the boxes stay visible)
+            drop = (torch.rand(xt.shape[0], device=self.device) < self.cat_drop).unsqueeze(1)
+            yt = torch.where(drop & visible, torch.full_like(yt, self.mask_id), yt)
         vt, logits, h, ins_rate = self(xt, yt, exists, t)
 
         vis = visible.unsqueeze(-1)
@@ -137,6 +144,25 @@ class LayoutFlowVarLen(BaseGenModel):
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return loss
 
+    # Sampler knobs, not hyperparameters: the defaults reproduce the sampler the reported numbers
+    # were produced with; test.py overrides them with `+sampling.<key>=<value>`.
+    DEFAULT_SAMPLING = dict(
+        gmm_temp=1.0,      # scale on the mixture component's sigma when drawing the clean box at reveal
+        reveal_eps=1.0,    # scale on the fresh noise mixed into the revealed box, t x_1 + (1-t) eps
+        solver='euler',    # 'heun': second-order steps once everything is revealed (kappa = 1)
+        cfg_w=1.0,         # classifier-free guidance on the categories: v_u + w (v_c - v_u); 1 = off
+        snap_grid=0,       # > 0: round the final ltrb edges to multiples of 1/snap_grid
+    )
+
+    def velocity(self, x, y, exists, t):
+        v = self(x, y, exists, t)[0]
+        w = self.sampling['cfg_w']
+        if w != 1.0:
+            # "unconditional" = same boxes, every category hidden behind the mask token
+            v_u = self(x, torch.where(exists, torch.full_like(y, self.mask_id), y), exists, t)[0]
+            v = v_u + w * (v - v_u)
+        return v
+
     @torch.no_grad()
     def inference(self, batch):
         '''Returns (bbox, label, pad_mask). With insertion the length is generated, not read from the batch.'''
@@ -145,6 +171,7 @@ class LayoutFlowVarLen(BaseGenModel):
         exists = torch.zeros(B, S, dtype=torch.bool, device=dev) if self.insertion else batch['mask'].squeeze(-1).clone()
         x = torch.zeros(B, S, self.geom_dim, device=dev)
         y = torch.full((B, S), self.mask_id, dtype=torch.long, device=dev)
+        s = self.sampling
 
         N = self.inference_steps
         dt = 1.0 / N
@@ -158,9 +185,17 @@ class LayoutFlowVarLen(BaseGenModel):
             v, logits, h, ins_rate = self(x, y, exists, t)
             masked = exists & (y == self.mask_id)
             visible = exists & ~masked
+            vis = visible.unsqueeze(-1)
+            if s['cfg_w'] != 1.0:
+                v = self.velocity(x, y, exists, t)
 
-            # denoise
-            x = torch.where(visible.unsqueeze(-1), x + v * dt, x)
+            # denoise (Euler; Heun once the layout is complete and nothing can change discontinuously)
+            if s['solver'] == 'heun' and k >= 1.0 and i < N - 1:
+                x_e = torch.where(vis, x + v * dt, x)
+                v2 = self.velocity(x_e, y, exists, t + dt)
+                x = torch.where(vis, x + 0.5 * (v + v2) * dt, x)
+            else:
+                x = torch.where(vis, x + v * dt, x)
 
             # unmask: class from the categorical, clean box from the mixture, noised to t_next
             reveal = masked & (torch.rand(B, S, device=dev) < p)
@@ -169,8 +204,8 @@ class LayoutFlowVarLen(BaseGenModel):
                 logits[:, 0] = float('-inf')              # id 0 is the dataset's pad label, never a class
                 cls = torch.distributions.Categorical(logits=logits).sample()
                 log_pi, mu, sigma = self.model.unmask_geom(h[reveal], cls)
-                g1 = gmm_sample(log_pi, mu, sigma) if self.unmask_geom == 'gmm' else gmm_mean(log_pi, mu)
-                x[reveal] = t_next * g1 + (1 - t_next) * torch.randn_like(g1)
+                g1 = gmm_sample(log_pi, mu, sigma * s['gmm_temp']) if self.unmask_geom == 'gmm' else gmm_mean(log_pi, mu)
+                x[reveal] = t_next * g1 + (1 - t_next) * s['reveal_eps'] * torch.randn_like(g1)
                 y[reveal] = cls
 
             # insert: Poisson number of new masked elements into free slots
@@ -183,5 +218,10 @@ class LayoutFlowVarLen(BaseGenModel):
         order = exists.int().argsort(dim=1, descending=True, stable=True)
         x, y, exists = x.gather(1, order.unsqueeze(-1).expand_as(x)), y.gather(1, order), exists.gather(1, order)
         geom = exists.unsqueeze(-1) * self.sampler.preprocess(x, reverse=True)
+        if s['snap_grid']:
+            g = s['snap_grid']
+            ltrb = torch.cat([geom[..., :2] - geom[..., 2:] / 2, geom[..., :2] + geom[..., 2:] / 2], -1)
+            ltrb = (ltrb * g).round() / g
+            geom = torch.cat([(ltrb[..., :2] + ltrb[..., 2:]) / 2, ltrb[..., 2:] - ltrb[..., :2]], -1)
         label = torch.where(exists, y, torch.zeros_like(y)).clamp(0, self.num_cat - 1)
         return geom, label, exists
