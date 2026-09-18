@@ -27,7 +27,7 @@ class VarLenBackbone(nn.Module):
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
                  num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64,
-                 cond_input=False):
+                 cond_input=False, elem_rates=False):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -56,6 +56,10 @@ class VarLenBackbone(nn.Module):
         self.geom_head = nn.Linear(d_model, self.geom_dim)
         self.cat_head = nn.Linear(d_model, num_cat)
         self.ins_head = nn.Linear(d_model, 1)
+        # Edit-Flow-style baseline: an insertion rate per existing element (the global one covers the empty layout)
+        self.elem_rates = elem_rates
+        if elem_rates:
+            self.elem_ins_head = nn.Linear(d_model, 1)
         self.cls_cond = nn.Embedding(num_cat, d_model)
         self.gmm_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
                                       nn.Linear(d_model, self.K * (1 + 2 * self.geom_dim)))
@@ -64,7 +68,7 @@ class VarLenBackbone(nn.Module):
         '''
         geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None,
         cmask (B,S,5) conditioning mask over [x,y,w,h,cat] (1 = free, 0 = given) or None
-        -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,)
+        -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,), extra {h_glob (B,d_model), elem_rate (B,S) or None}
         '''
         x = self.elem_embed(torch.cat([self.geom_embed(geom), self.type_embed(cat)], dim=-1))
         if self.cond_input:
@@ -79,7 +83,8 @@ class VarLenBackbone(nn.Module):
         h = self.transformer(x, timestep=t, key_padding_mask=hidden)
         h_glob, h = h[:, 0], h[:, n_pre:]
         ins_rate = F.softplus(self.ins_head(h_glob)).squeeze(-1)
-        return self.geom_head(h), self.cat_head(h), h, ins_rate
+        extra = {'h_glob': h_glob, 'elem_rate': F.softplus(self.elem_ins_head(h)).squeeze(-1) if self.elem_rates else None}
+        return self.geom_head(h), self.cat_head(h), h, ins_rate, extra
 
     def unmask_geom(self, h: Tensor, cls: Tensor):
         '''h (N,d_model), cls (N,) -> mixture (log_pi (N,K), mu (N,K,4), sigma (N,K,4)) over the clean box.'''

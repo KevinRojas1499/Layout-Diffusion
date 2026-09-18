@@ -37,7 +37,7 @@ def traced_inference(m, batch, snap_steps):
         t_next = (i + 1) * dt
         k, k_next = min(i * dt / m.t_max, 1.0), min(t_next / m.t_max, 1.0)
         p = 1.0 if (k_next >= 1.0 or i == N - 1) else (k_next - k) / (1 - k)
-        v, logits, h, ins_rate = m(x, y, exists, t)
+        v, logits, h, ins_rate, _ = m(x, y, exists, t)
         masked = exists & (y == m.mask_id)
         visible = exists & ~masked
         x = torch.where(visible.unsqueeze(-1), x + v * dt, x)
