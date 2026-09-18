@@ -64,6 +64,7 @@ class Block(nn.Module):
             self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
             self.norm_c = nn.LayerNorm(d_model, eps=1e-5)
             self.dropout_c = nn.Dropout(dropout)
+            self.cross_gate = nn.Parameter(torch.zeros(1))     # tanh-gated, zero-initialised: starts as the context-free model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -77,7 +78,7 @@ class Block(nn.Module):
         x = x + self.dropout1(self.self_attn(x, x, x, key_padding_mask=key_padding_mask, need_weights=False)[0])
         if self.cross and ctx is not None:
             q = self.norm_c(x)
-            x = x + self.dropout_c(self.cross_attn(q, ctx, ctx, key_padding_mask=ctx_padding_mask, need_weights=False)[0])
+            x = x + torch.tanh(self.cross_gate) * self.dropout_c(self.cross_attn(q, ctx, ctx, key_padding_mask=ctx_padding_mask, need_weights=False)[0])
         x = x + self.dropout2(self.linear2(self.dropout(F.gelu(self.linear1(self.norm2(x))))))
         return x
 
