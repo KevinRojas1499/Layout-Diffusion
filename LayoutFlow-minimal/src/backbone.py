@@ -55,9 +55,15 @@ class AdaLayerNorm(nn.Module):
 class Block(nn.Module):
     '''Pre-norm transformer block (self-attn + MLP) with AdaLayerNorm on the first norm.'''
 
-    def __init__(self, d_model=256, nhead=8, dim_feedforward=2048, dropout=0.1):
+    def __init__(self, d_model=256, nhead=8, dim_feedforward=2048, dropout=0.1, cross=False):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        # optional cross-attention to a context sequence (canvas tokens), kept out of the self-attention
+        self.cross = cross
+        if cross:
+            self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+            self.norm_c = nn.LayerNorm(d_model, eps=1e-5)
+            self.dropout_c = nn.Dropout(dropout)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -66,9 +72,12 @@ class Block(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, timestep, key_padding_mask=None):
+    def forward(self, x, timestep, key_padding_mask=None, ctx=None, ctx_padding_mask=None):
         x = self.norm1(x, timestep)
         x = x + self.dropout1(self.self_attn(x, x, x, key_padding_mask=key_padding_mask, need_weights=False)[0])
+        if self.cross and ctx is not None:
+            q = self.norm_c(x)
+            x = x + self.dropout_c(self.cross_attn(q, ctx, ctx, key_padding_mask=ctx_padding_mask, need_weights=False)[0])
         x = x + self.dropout2(self.linear2(self.dropout(F.gelu(self.linear1(self.norm2(x))))))
         return x
 
@@ -79,9 +88,9 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
         self.norm = norm
 
-    def forward(self, x, timestep, key_padding_mask=None):
+    def forward(self, x, timestep, key_padding_mask=None, ctx=None, ctx_padding_mask=None):
         for layer in self.layers:
-            x = layer(x, timestep, key_padding_mask=key_padding_mask)
+            x = layer(x, timestep, key_padding_mask=key_padding_mask, ctx=ctx, ctx_padding_mask=ctx_padding_mask)
         return self.norm(x)
 
 

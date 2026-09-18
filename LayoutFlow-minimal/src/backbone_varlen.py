@@ -27,7 +27,7 @@ class VarLenBackbone(nn.Module):
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
                  num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64,
-                 cond_input=False, elem_rates=False):
+                 cond_input=False, elem_rates=False, ctx_mode='prepend'):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -45,12 +45,12 @@ class VarLenBackbone(nn.Module):
             self.cond_embed = nn.Linear(5, d_model)
         # content-aware: canvas feature tokens (precomputed, frozen) prepended as always-visible context;
         # they carry a learned position embedding because, unlike the elements, the grid cells are ordered
-        self.ctx_dim = ctx_dim
+        self.ctx_dim, self.ctx_mode = ctx_dim, ctx_mode      # 'prepend': canvas tokens join the self-attention; 'cross': separate cross-attention
         if ctx_dim:
             self.ctx_embed = nn.Linear(ctx_dim, d_model)
             self.ctx_pos = nn.Parameter(torch.randn(1, ctx_len, d_model) * 0.02)
 
-        layer = Block(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
+        layer = Block(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, cross=bool(ctx_dim) and ctx_mode == 'cross')
         self.transformer = TransformerEncoder(layer, num_layers=num_layers, norm=nn.LayerNorm(d_model))
 
         self.geom_head = nn.Linear(d_model, self.geom_dim)
@@ -78,16 +78,22 @@ class VarLenBackbone(nn.Module):
             given = torch.zeros(*cat.shape, 5, device=x.device) if cmask is None else 1 - cmask
             x = x + self.cond_embed(given)
         pre = [self.global_token.expand(x.shape[0], -1, -1)]
-        if self.ctx_dim:
-            pre.append(self.ctx_embed(ctx) + self.ctx_pos)
+        ctx_tok = self.ctx_embed(ctx) + self.ctx_pos if self.ctx_dim else None
+        if self.ctx_dim and self.ctx_mode == 'prepend':
+            pre.append(ctx_tok)
         n_pre = sum(p.shape[1] for p in pre)
         x = torch.cat(pre + [x], dim=1)
         hidden = torch.cat([torch.zeros(x.shape[0], n_pre, dtype=torch.bool, device=x.device), ~exists], dim=1)
-        if ctx_hide is not None:
+        cross_ctx = cross_hide = None
+        if ctx_hide is not None and self.ctx_mode == 'prepend':
             hidden[:, 1:1 + ctx_hide.shape[1]] = ctx_hide
+        if self.ctx_dim and self.ctx_mode == 'cross':
+            cross_ctx, cross_hide = ctx_tok, ctx_hide
+            if cross_hide is not None and cross_hide.all(1).any():        # a fully hidden canvas: keep one key so attention is defined
+                cross_hide = cross_hide.clone(); cross_hide[cross_hide.all(1), 0] = False
         if t_elem is not None:
             t = torch.cat([t.unsqueeze(1).expand(-1, n_pre), t_elem], dim=1)
-        h = self.transformer(x, timestep=t, key_padding_mask=hidden)
+        h = self.transformer(x, timestep=t, key_padding_mask=hidden, ctx=cross_ctx, ctx_padding_mask=cross_hide)
         h_glob, h = h[:, 0], h[:, n_pre:]
         ins_rate = F.softplus(self.ins_head(h_glob)).squeeze(-1)
         extra = {'h_glob': h_glob, 'elem_rate': F.softplus(self.elem_ins_head(h)).squeeze(-1) if self.elem_rates else None}
