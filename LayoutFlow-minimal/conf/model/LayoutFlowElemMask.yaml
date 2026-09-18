@@ -36,7 +36,7 @@ model:
   cat_loss_weight: 0.25
   geom_unmask_weight: 0.05
   ins_loss_weight: 0.1
-  cond: uncond            # random4: LayoutFlow's training mix (uncond / elem_compl / cat_cond / size_cond by batch quarter)
+  cond: uncond            # random4: LayoutFlow's training mix (uncond / elem_compl / cat_cond / size_cond by batch quarter); random5 adds a refinement fifth (t in [0.9,1])
   ralf_cache: null        # content-aware datasets: RALF cache dir -> validation FID with their FIDNetV3 (src/fid_ralf.py)
   fid_empty_id: null      # padding baseline: category id to drop before the FID
   cat_drop: 0.0           # > 0 trains the category-unconditional velocity too (for +sampling.cfg_w at test time)

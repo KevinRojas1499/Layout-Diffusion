@@ -48,7 +48,7 @@ class LayoutFlowVarLen(BaseGenModel):
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
-        assert cond in ('uncond', 'random4')
+        assert cond in ('uncond', 'random4', 'random5')   # random5 = random4 + a refinement fifth (t in [0.9, 1])
         self.cond = cond            # training mix; validation always generates unconditionally
         if not fid_calc_every_n:
             fid_model = None
@@ -96,10 +96,16 @@ class LayoutFlowVarLen(BaseGenModel):
         m = torch.ones(B, S, 5, device=self.device)
         if task == 'uncond':
             return m
-        sl = {'elem_compl': slice(0, B // 4), 'cat_cond': slice(B // 4, B // 2), 'size_cond': slice(B // 2, 3 * B // 4)} \
-            if task == 'random4' else {task: slice(0, B)}
-        if 'cat_cond' in sl or 'refinement' in sl:
-            m[sl.get('cat_cond', sl.get('refinement')), :, 4] = 0
+        if task == 'random4':
+            sl = {'elem_compl': slice(0, B // 4), 'cat_cond': slice(B // 4, B // 2), 'size_cond': slice(B // 2, 3 * B // 4)}
+        elif task == 'random5':
+            q = B // 5
+            sl = {'elem_compl': slice(0, q), 'cat_cond': slice(q, 2 * q), 'size_cond': slice(2 * q, 3 * q), 'refinement': slice(3 * q, 4 * q)}
+        else:
+            sl = {task: slice(0, B)}
+        for k in ('cat_cond', 'refinement'):      # categories given, boxes free
+            if k in sl:
+                m[sl[k], :, 4] = 0
         if 'size_cond' in sl:
             m[sl['size_cond'], :, 2:] = 0
         if 'elem_compl' in sl:
@@ -144,6 +150,9 @@ class LayoutFlowVarLen(BaseGenModel):
     def training_step(self, batch, batch_idx):
         t = torch.rand(batch['bbox'].shape[0], device=self.device)
         cmask = self.cond_mask(batch, self.cond) if self.cond != 'uncond' else None
+        if self.cond == 'random5':      # refinement fifth: nearly clean layouts, the state the refinement task starts from
+            q = t.shape[0] // 5
+            t[3 * q:4 * q] = 0.9 + 0.1 * t[3 * q:4 * q]
         xt, yt, exists, visible, x0, x1, y1, free = self.sample_state(batch, t, cmask)
         masked = exists & ~visible
         if self.cat_drop > 0:
