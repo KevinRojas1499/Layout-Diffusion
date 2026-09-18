@@ -7,6 +7,8 @@ import torch
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
+from src.ema import EMA
+
 torch.set_float32_matmul_precision('medium')
 rootutils.setup_root(__file__, indicator='.git', pythonpath=True)
 
@@ -20,6 +22,7 @@ def main(cfg: DictConfig):
     trainer = instantiate(
         cfg.trainer,
         callbacks=[c for c in [
+            EMA(decay=cfg.ema_decay) if cfg.ema_decay else None,
             ModelCheckpoint(dirpath=ckpt_dir, filename='ckpt-{epoch:02d}-{' + cfg.ckpt_monitor + ':.3f}',
                              save_top_k=3, monitor=cfg.ckpt_monitor, mode='min', save_last=True),
             ModelCheckpoint(dirpath=ckpt_dir, filename='periodic-{epoch:04d}', every_n_epochs=cfg.ckpt_every_n_epochs,

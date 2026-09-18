@@ -96,7 +96,7 @@ def main(cfg: DictConfig):
                 else:   # conditional tasks read the given values from the test layouts (LayoutFlowVarLen only)
                     if cfg.task == 'refinement':   # upstream: perturb the ground truth with N(0, 0.01) in [0,1] box space
                         batch['bbox'] = batch['bbox'] + 0.01 * torch.randn_like(batch['bbox']) * batch['mask']
-                    geom_pred, cat_pred, *gen_mask = model.inference(batch, task=cfg.task, given_length=cfg.given_length, t_start=cfg.get('t_start', 0.0))
+                    geom_pred, cat_pred, *gen_mask = model.inference(batch, task=cfg.task, given_length=cfg.given_length, t_start=cfg.get('t_start', 0.0), renoise=cfg.get('renoise', False))
                 if gen_mask:    # variable-length model: the length is generated, not sampled above
                     m = gen_mask[0]
                     keep = m.any(1)

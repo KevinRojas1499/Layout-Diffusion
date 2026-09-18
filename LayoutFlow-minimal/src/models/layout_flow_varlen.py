@@ -208,13 +208,15 @@ class LayoutFlowVarLen(BaseGenModel):
         return v
 
     @torch.no_grad()
-    def inference(self, batch, task='uncond', given_length=False, t_start=0.0):
+    def inference(self, batch, task='uncond', given_length=False, t_start=0.0, renoise=False):
         '''
         Returns (bbox, label, pad_mask). task: uncond | cat_cond | size_cond | elem_compl | refinement,
         with the given values read from the batch. With insertion the number of elements is generated
         unless given_length (LayoutFlow's protocol: the remaining slots start as masked elements).
         refinement: every element is given with its (noisy) box and integrated from t_start (upstream
         uses 0.97) to 1, i.e. the flow is used as a denoiser of the batch's layout.
+        renoise: put the batch's boxes on the path first, x = t_start x + (1 - t_start) eps (SDEdit-style),
+        so that starting at e.g. t_max is on-distribution.
         '''
         B, S = batch['type'].shape
         dev = batch['bbox'].device
@@ -231,6 +233,8 @@ class LayoutFlowVarLen(BaseGenModel):
         x = torch.zeros(B, S, self.geom_dim, device=dev)
         if task == 'refinement':
             x = given.unsqueeze(-1) * x1                                 # start from the batch's (noisy) boxes
+            if renoise:
+                x = given.unsqueeze(-1) * (t_start * x1 + (1 - t_start) * torch.randn_like(x))
         elif given.any():
             x = given.unsqueeze(-1) * (held * x1 + (1 - held) * torch.randn_like(x))
         y = torch.where(given, batch['type'].long(), torch.full((B, S), self.mask_id, dtype=torch.long, device=dev))
