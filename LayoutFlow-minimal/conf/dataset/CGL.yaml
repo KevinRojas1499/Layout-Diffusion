@@ -1,0 +1,21 @@
+_target_: torch.utils.data.DataLoader
+
+# RALF's preprocessed CGL release + frozen canvas features (scripts/precompute_canvas_feats.py).
+# 4 categories (logo, text, underlay, embellishment) -> ids 1..4, 0 = pad; max 10 elements.
+dataset:
+  _target_: src.data.CGL
+  data_path: ???      # dir with {train,val,test,with_no_annotations_test}-*.parquet
+  feats_path: ???     # dir with {train,val,test,with_no_annotations_test}.pt
+  num_cat: 5
+
+batch_size: 512
+num_workers: 2
+pin_memory: True
+persistent_workers: True
+shuffle: True
+drop_last: False
+collate_fn:
+  _target_: src.data.collate_fn
+  _partial_: true
+  max_len: ${data.max_len}
+  format: ${data.format}

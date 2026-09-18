@@ -39,7 +39,13 @@ def collate_fn(batch, max_len=None, format='xywh'):
                 dummy_array[:total_elems[i]] = batch[i][key][:max_len]
             batch[i][key] = dummy_array
 
-    return default_collate(batch)
+    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id') if k in batch[0]}
+    out = default_collate(batch)
+    if 'ctx' in extra:
+        out['ctx'] = torch.stack(extra['ctx'])
+    if 'id' in extra:
+        out['id'] = extra['id']
+    return out
 
 
 class H5LayoutDataset(Dataset):
@@ -86,3 +92,49 @@ class RICO(H5LayoutDataset):
 class PubLayNet(H5LayoutDataset):
     def __init__(self, split='train', data_path='./publaynet', num_cat=6, in_memory=False):
         super().__init__(PUBLAYNET_FILES, split=split, data_path=data_path, num_cat=num_cat, in_memory=in_memory)
+
+
+class CGL(Dataset):
+    '''
+    RALF's preprocessed CGL release (parquet: id, image, saliency, label (strings), center_x/y,
+    width/height in [0, 1]; max 10 elements) plus frozen canvas features from
+    scripts/precompute_canvas_feats.py. Elements come out in the same (cx, cy, w, h) / 1-indexed
+    category convention as RICO and PubLayNet; category 0 is the pad id.
+    '''
+    LABELS = ['logo', 'text', 'underlay', 'embellishment']
+    SPLITS = {'train': 'train', 'validation': 'val', 'test': 'test', 'unannotated': 'with_no_annotations_test'}
+
+    def __init__(self, split='train', data_path='./cgl', feats_path='./canvas_feats/cgl', num_cat=5, in_memory=True,
+                 pad_empty=False, max_len=10):
+        import glob
+        import pyarrow.parquet as pq
+        super().__init__()
+        self.num_cat = num_cat
+        name = self.SPLITS[split]
+        tab = pq.ParquetDataset(sorted(glob.glob(f'{data_path}/{name}-*.parquet'))).read(
+            columns=['id', 'label', 'center_x', 'center_y', 'width', 'height'])
+        cols = {c: tab.column(c).to_pylist() for c in tab.column_names}
+        feats = torch.load(f'{feats_path}/{name}.pt')
+        order = {i: n for n, i in enumerate(feats['id'])}
+        self.ctx = feats['feats']
+        # padding baseline: every layout has max_len elements, the missing ones of an 'empty' class (id num_cat-1)
+        self.pad_empty, self.max_len = pad_empty, max_len
+        self.samples = []
+        for n, i in enumerate(cols['id']):
+            lab = torch.tensor([self.LABELS.index(l) + 1 for l in cols['label'][n]], dtype=torch.long)
+            box = torch.tensor([cols[k][n] for k in ('center_x', 'center_y', 'width', 'height')], dtype=torch.float32).T.reshape(-1, 4)
+            if pad_empty:
+                k = max_len - len(lab)
+                lab = torch.cat([lab, torch.full((k,), num_cat - 1, dtype=torch.long)])
+                box = torch.cat([box, torch.zeros(k, 4)])
+            self.samples.append({'id': i, 'type': lab, 'bbox': box, 'length': torch.tensor(len(lab)), 'ctx_idx': order[i]})
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        s = dict(self.samples[index])
+        s['ctx'] = self.ctx[s.pop('ctx_idx')].float()
+        # collate_fn builds xywh from an (x, y, w, h) corner box; CGL boxes are already centred
+        s['bbox'] = s['bbox'].clone(); s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
+        return s

@@ -19,6 +19,7 @@ model:
     num_cat: ${dataset.dataset.num_cat}
     gmm_components: 16
     sigma_min: 0.01
+    ctx_dim: 0              # content-aware: canvas feature dim (385 for scripts/precompute_canvas_feats.py), 0 = none
   sampler:
     _target_: src.sampler.GaussianSampler
     out_dim: 4

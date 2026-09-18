@@ -20,8 +20,8 @@ def main(cfg: DictConfig):
     trainer = instantiate(
         cfg.trainer,
         callbacks=[
-            ModelCheckpoint(dirpath=ckpt_dir, filename='ckpt-{epoch:02d}-{FID_Layout:.2f}',
-                             save_top_k=3, monitor='FID_Layout', mode='min'),
+            ModelCheckpoint(dirpath=ckpt_dir, filename='ckpt-{epoch:02d}-{' + cfg.ckpt_monitor + ':.3f}',
+                             save_top_k=3, monitor=cfg.ckpt_monitor, mode='min'),
             LearningRateMonitor(logging_interval='step'),
         ],
         logger=logger,

@@ -176,6 +176,20 @@ Known issues:
   "Image", is geometrically the top toolbar), so RICO class names are unknown; PubLayNet's
   (1 text, 2 title, 3 list, 4 table, 5 figure) fit the box shapes.
 
+Conditional tasks and guidance (both models):
+
+- `model.cond=random4` trains LayoutFlow's mix: per batch quarter, element completion (a random
+  ~20% of the elements given entirely), category-conditioned, category+size-conditioned, and
+  unconditional. A given element is one that is visible from t = 0 with its given coordinates held
+  clean; given coordinates get no velocity target. `test.py task=cat_cond|size_cond|elem_compl
+  calc_miou=true` evaluates on the full test set as upstream (given values from the test layouts).
+  With insertion, `elem_compl` generates the number of extra elements unless `given_length=true`.
+- `model.cat_drop=0.1` hides every category of a layout w.p. 0.1 during training, so the
+  category-unconditional velocity exists; `test.py +sampling.cfg_w=<w>` then applies
+  classifier-free guidance `v_u + w (v_c - v_u)` (w = 1 is off). Other `+sampling.*` knobs
+  (`gmm_temp`, `reveal_eps`, `solver=heun`, `snap_grid`) are documented in `RESULTS.md`; none of
+  them beat the default sampler.
+
 ```bash
 scripts/launch_varlen_grid.sh RICO          # or PubLayNet; 7 detached runs over 4 GPUs
 python test.py dataset=RICO dataset_name=RICO model=LayoutFlowVarLen checkpoint=... \

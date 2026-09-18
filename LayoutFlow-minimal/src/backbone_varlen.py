@@ -26,7 +26,7 @@ class VarLenBackbone(nn.Module):
     '''
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
-                 num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01):
+                 num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -37,6 +37,12 @@ class VarLenBackbone(nn.Module):
         self.type_embed = nn.Embedding(num_cat + 1, latent_dim)      # num_cat = [MASK]
         self.elem_embed = nn.Linear(2 * latent_dim, d_model)
         self.global_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # content-aware: canvas feature tokens (precomputed, frozen) prepended as always-visible context;
+        # they carry a learned position embedding because, unlike the elements, the grid cells are ordered
+        self.ctx_dim = ctx_dim
+        if ctx_dim:
+            self.ctx_embed = nn.Linear(ctx_dim, d_model)
+            self.ctx_pos = nn.Parameter(torch.randn(1, ctx_len, d_model) * 0.02)
 
         layer = Block(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
         self.transformer = TransformerEncoder(layer, num_layers=num_layers, norm=nn.LayerNorm(d_model))
@@ -48,16 +54,20 @@ class VarLenBackbone(nn.Module):
         self.gmm_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
                                       nn.Linear(d_model, self.K * (1 + 2 * self.geom_dim)))
 
-    def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor):
+    def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None):
         '''
-        geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,)
+        geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None
         -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,)
         '''
         x = self.elem_embed(torch.cat([self.geom_embed(geom), self.type_embed(cat)], dim=-1))
-        x = torch.cat([self.global_token.expand(x.shape[0], -1, -1), x], dim=1)
-        hidden = torch.cat([torch.zeros_like(exists[:, :1]), ~exists], dim=1)
+        pre = [self.global_token.expand(x.shape[0], -1, -1)]
+        if self.ctx_dim:
+            pre.append(self.ctx_embed(ctx) + self.ctx_pos)
+        n_pre = sum(p.shape[1] for p in pre)
+        x = torch.cat(pre + [x], dim=1)
+        hidden = torch.cat([torch.zeros(x.shape[0], n_pre, dtype=torch.bool, device=x.device), ~exists], dim=1)
         h = self.transformer(x, timestep=t, key_padding_mask=hidden)
-        h_glob, h = h[:, 0], h[:, 1:]
+        h_glob, h = h[:, 0], h[:, n_pre:]
         ins_rate = F.softplus(self.ins_head(h_glob)).squeeze(-1)
         return self.geom_head(h), self.cat_head(h), h, ins_rate
 

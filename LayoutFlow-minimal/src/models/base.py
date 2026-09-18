@@ -36,9 +36,10 @@ class BaseGenModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = self.optimizer_partial(params=self.model.parameters(), betas=(0.9, 0.98))
         if self.scheduler_setting == 'reduce_on_plateau':
+            # steps once per validation; datasets without a FID net (e.g. CGL) plateau on val_loss instead
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
-            return [optimizer], [{'scheduler': scheduler, 'monitor': 'FID_Layout',
-                                   'frequency': self.fid_model.calc_every_n}]
+            return [optimizer], [{'scheduler': scheduler, 'monitor': 'FID_Layout' if self.fid_model else 'val_loss',
+                                   'frequency': self.trainer.check_val_every_n_epoch}]
         return optimizer
 
     def forward(self, xt, mask_cond, t):
@@ -112,6 +113,8 @@ class BaseGenModel(pl.LightningModule):
             self.log('gen_len_mean', pad_mask.sum(1).float().mean(), sync_dist=True)
             self.log('gen_len_abs_err', (pad_mask.sum(1).float().mean() - batch['length'].float().mean()).abs(),
                      sync_dist=True)
+            if 'ctx' in batch:   # canvas-conditioned: the per-image count is meaningful
+                self.log('count_mae', (pad_mask.sum(1).float() - batch['length'].float()).abs().mean(), sync_dist=True)
             keep = pad_mask.any(1)
             geom_pred, cat, pad_mask = geom_pred[keep], cat[keep], pad_mask[keep]
         else:
