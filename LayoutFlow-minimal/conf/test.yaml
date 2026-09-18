@@ -8,7 +8,7 @@ checkpoint: ???
 pretrained_dir: ???
 device: cuda:0
 inference_steps: 100
-task: uncond           # uncond | cat_cond | size_cond | elem_compl (the last three: LayoutFlowVarLen only)
+task: uncond           # uncond | cat_cond | size_cond | elem_compl | refinement (all but uncond: LayoutFlowVarLen only)
 given_length: false    # elem_compl with a variable-length model: true = number of elements given (LayoutFlow's protocol)
 calc_miou: false
 multirun_n: 1

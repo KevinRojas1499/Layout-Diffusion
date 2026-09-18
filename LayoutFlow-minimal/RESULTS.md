@@ -246,3 +246,22 @@ element tokens, as LayoutFlow does. Retrained: unconditional 4.68 -> 3.10, C->S+
 C+S->P 3.29 -> 1.15 (paper 1.03), completion with its own length 5.86 -> 2.70 (paper 1.51, length given).
 One variable-length model now serves all tasks; the remaining unconditional cost of the mix (3.10 vs 2.55) is
 larger than the fixed-length model's (2.63 vs 2.41) and is the open item.
+
+### Refinement (inference only, no training): `test.py task=refinement`
+
+Upstream's protocol: perturb the test layouts with N(0, 0.01) in [0,1] box space, keep the categories, integrate
+the flow from t = 0.97 to 1. In our model that start state is an ordinary point of the unconditional training
+path (everything is visible after t_max), so any checkpoint does it. The noisy input itself scores FID ~64
+against the test split (the FID net is extremely sensitive to sub-grid jitter).
+
+| Checkpoint | FID | mIoU |
+|---|---|---|
+| LayoutFlow paper | **0.77** | **0.700** |
+| Unmasking, uncond-only (`rico-elemmask-gmm-t050`) | 1.10 | 0.679 |
+| Variable length, uncond-only (`rico-varlen-gmm-t050`) | 1.15 | 0.679 |
+| Unmasking, random4 | 1.38 | 0.676 |
+| Variable length, random4 + cond_input | 1.30 | 0.665 |
+
+Start-time sweep on the unmasking checkpoint (test split, so *not* used for selection): t_start 0.90 -> 1.25 / 0.546,
+0.95 -> 0.98 / 0.632, 0.97 -> 1.10 / 0.679, 0.985 -> 2.47 / 0.708, 0.995 -> 27.3 / 0.703. FID and fidelity trade
+off; no setting dominates LayoutFlow's point.

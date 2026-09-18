@@ -98,8 +98,8 @@ class LayoutFlowVarLen(BaseGenModel):
             return m
         sl = {'elem_compl': slice(0, B // 4), 'cat_cond': slice(B // 4, B // 2), 'size_cond': slice(B // 2, 3 * B // 4)} \
             if task == 'random4' else {task: slice(0, B)}
-        if 'cat_cond' in sl:
-            m[sl['cat_cond'], :, 4] = 0
+        if 'cat_cond' in sl or 'refinement' in sl:
+            m[sl.get('cat_cond', sl.get('refinement')), :, 4] = 0
         if 'size_cond' in sl:
             m[sl['size_cond'], :, 2:] = 0
         if 'elem_compl' in sl:
@@ -208,16 +208,20 @@ class LayoutFlowVarLen(BaseGenModel):
         return v
 
     @torch.no_grad()
-    def inference(self, batch, task='uncond', given_length=False):
+    def inference(self, batch, task='uncond', given_length=False, t_start=0.0):
         '''
-        Returns (bbox, label, pad_mask). task: uncond | cat_cond | size_cond | elem_compl, with the
-        given values read from the batch. With insertion the number of elements is generated unless
-        given_length (LayoutFlow's protocol: the remaining slots start as masked elements).
+        Returns (bbox, label, pad_mask). task: uncond | cat_cond | size_cond | elem_compl | refinement,
+        with the given values read from the batch. With insertion the number of elements is generated
+        unless given_length (LayoutFlow's protocol: the remaining slots start as masked elements).
+        refinement: every element is given with its (noisy) box and integrated from t_start (upstream
+        uses 0.97) to 1, i.e. the flow is used as a denoiser of the batch's layout.
         '''
         B, S = batch['type'].shape
         dev = batch['bbox'].device
         active = batch['mask'].squeeze(-1)
-        given_length = given_length or task in ('cat_cond', 'size_cond')   # the whole element set is given
+        given_length = given_length or task in ('cat_cond', 'size_cond', 'refinement')   # the whole element set is given
+        if task == 'refinement':
+            t_start = t_start or 0.97
         cmask = self.cond_mask(batch, task)
         given = active & (cmask[..., 4] == 0)
         held = (1 - cmask[..., :4]) * given.unsqueeze(-1)              # coordinates pinned to the batch values
@@ -225,18 +229,21 @@ class LayoutFlowVarLen(BaseGenModel):
         exists = active.clone() if (not self.insertion or given_length) else given.clone()
         # a given element is visible from t = 0: given coordinates clean, the rest at pure noise
         x = torch.zeros(B, S, self.geom_dim, device=dev)
-        if given.any():
+        if task == 'refinement':
+            x = given.unsqueeze(-1) * x1                                 # start from the batch's (noisy) boxes
+        elif given.any():
             x = given.unsqueeze(-1) * (held * x1 + (1 - held) * torch.randn_like(x))
         y = torch.where(given, batch['type'].long(), torch.full((B, S), self.mask_id, dtype=torch.long, device=dev))
         s = self.sampling
         ctx = batch.get('ctx')
 
         N = self.inference_steps
-        dt = 1.0 / N
+        dt = (1.0 - t_start) / N
         for i in range(N):
-            t = torch.full((B,), i * dt, device=dev)
-            t_next = (i + 1) * dt
-            k, k_next = min(i * dt / self.t_max, 1.0), min(t_next / self.t_max, 1.0)
+            t_i = t_start + i * dt
+            t = torch.full((B,), t_i, device=dev)
+            t_next = t_start + (i + 1) * dt
+            k, k_next = min(t_i / self.t_max, 1.0), min(t_next / self.t_max, 1.0)
             # exact per-step jump probability of the hazard kappa'/(1-kappa)
             p = 1.0 if (k_next >= 1.0 or i == N - 1) else (k_next - k) / (1 - k)
 
