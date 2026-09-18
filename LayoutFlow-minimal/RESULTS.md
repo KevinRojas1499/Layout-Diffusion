@@ -265,3 +265,31 @@ against the test split (the FID net is extremely sensitive to sub-grid jitter).
 Start-time sweep on the unmasking checkpoint (test split, so *not* used for selection): t_start 0.90 -> 1.25 / 0.546,
 0.95 -> 0.98 / 0.632, 0.97 -> 1.10 / 0.679, 0.985 -> 2.47 / 0.708, 0.995 -> 27.3 / 0.703. FID and fidelity trade
 off; no setting dominates LayoutFlow's point.
+
+## Content-aware generation on CGL (RALF release, RALF's evaluator, test split)
+
+Setup: `src.data.CGL` + frozen DINOv2-small canvas tokens (8x8 grid + saliency, `scripts/precompute_canvas_feats.py`)
+prepended to the element set; scored by exporting samples in RALF's format (`scripts/export_ralf_samples.py`) and
+running their untouched `eval.py` (reproduces their published scores to 4 decimals). LayoutGD (ICMR 2026) Table 1
+reports exactly these five columns. References on CGL: LayoutGD 0.120 / 0.0140 / 0.999 / 0.994 / 0.0004,
+LayoutDiT 0.124 / 0.0157 / 0.995 / 0.988 / 0.0016, RALF 0.126 / 0.0180 / 0.992 / 0.978 / 0.0042 (Occ / Rea / Und_l /
+Und_s / Ove); RALF FID 1.32 (real val vs test floor 0.80); count MAE from RALF's released outputs: RALF 1.08,
+autoregressive 1.27, canvas-blind histogram 2.13.
+
+### v2 runs (1000 epochs, val FID = ported FIDNetV3 vs RALF's val features, EMA on; the v1 runs had no FID signal)
+
+| checkpoint | FID | Occ | Rea | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|
+| variable length, canvas-blind, ep 649 | **1.63** | 0.318 | 0.041 | **0.877** | **0.006** | 2.13 |
+| variable length + canvas, ep 199 / 419 / 999 | 5.55 / 4.45 / 5.08 | 0.136 | 0.021 | 0.57 / 0.71 / 0.72 | 0.021 / 0.013 / 0.011 | 1.42 / 1.34 / 1.33 |
+| padding baseline + canvas, ep 489 / 999 | 4.61 / 5.20 | 0.136 | 0.021 | 0.74 / 0.76 | 0.011 / 0.012 | 1.29 / 1.28 |
+
+**Diagnosis: the canvas pathway memorises the training canvases.** Generated on 6,000 *training* canvases the canvas
+model scores FID 1.15 (vs train features) / 1.53 (vs test), better than the blind model (1.58 / 1.89); on unseen test
+canvases it collapses to 4.45 while occlusion and count stay good. The blind model learns an excellent layout prior
+(FID 1.6, underlay 0.88, overlap 0.006) but ignores the canvas (occlusion 0.32, chance-level count). The padding
+baseline shows the same collapse, so it is the conditioning, not insertion. EMA is not the cause (v1 without EMA:
+3.5-4.3). The validation FID was right all along; the v1 "blind 3.99" was an epoch-129 checkpoint.
+
+v3 (launched 2026-09-18 16:40, EMA off): `model.ctx_token_drop=0.5 model.ctx_drop=0.1` (hide half the canvas tokens per
+sample, the whole canvas for 10%), `dataset.dataset.hflip=true` (mirror canvas grid + layout), and both.
