@@ -2,7 +2,7 @@
 
 Raw material for the paper. Everything here was measured on 2026-09-17 from the runs under
 `$LAB/runs/layoutflow-minimal/` (wandb project `kevinrojas1499/LayoutFlow-minimal`, same run names).
-Code: branch `varlen-element-masking`, commit `fd11590`.
+Code: branch `varlen-element-masking` (results up to commit `fd11590`; sampler sweep at `4ee600e`).
 
 ## Evaluation protocol
 
@@ -21,7 +21,7 @@ Two different FIDs appear below; do not mix them.
   **validation split**, all validation layouts generated. Much lower on PubLayNet (val and test differ)
   and optimistic everywhere when quoted as the best of many validations. Only for model selection.
 
-Noise: repeating generation gives about +/-0.05 FID on RICO and +/-0.2 on PubLayNet (3 repeats).
+Noise: repeating generation gives a std of about 0.08-0.2 FID on RICO (3-5 repeats, see the sampler sweep) and ~0.2 on PubLayNet (3 repeats). Single-run numbers, ours and the paper's, carry that uncertainty.
 
 Published numbers (LayoutFlow, ECCV 2024, Table 1, unconditional): LayoutFlow RICO **2.37**,
 PubLayNet **8.87**; LayoutDiffusion 2.49 / 8.63; LayoutDM (retrained) 4.43 / 36.85. The baselines are
@@ -137,7 +137,7 @@ section appended below as they are run.
 
 ### Sampler sweep on the RICO t_max=0.5 checkpoints (paper protocol, mean +/- std over repeats)
 
-Inference-only knobs of  ( in ; defaults
+Inference-only knobs of `LayoutFlowVarLen.inference` (`+sampling.<key>=<value>` in `test.py`; defaults
 reproduce the committed sampler bit-for-bit). Insertion stays Poisson. gmm_temp scales the mixture
 component's sigma at reveal (0 = component mean); reveal_eps scales the fresh noise mixed into the
 revealed box; heun = second-order steps once everything is revealed; cfg_w = classifier-free
@@ -196,4 +196,4 @@ looked like -0.15 at 3 repeats and vanished at 5; (3) shrinking the reveal noise
 and coarse snapping (grid 32/64) are clearly harmful, i.e. the revealed box must sit on the
 training path and the real RICO test boxes are continuous; (4) untrained CFG lowers alignment and
 overlap (the layouts get "cleaner") but moves the distribution away from the data (FID 3.5-13);
-the trained version (, then ) is the open question.
+the trained version (`model.cat_drop=0.1`, then `+sampling.cfg_w`) is the open question.
