@@ -4,6 +4,7 @@
 #   varlen-blind      LayoutFlowVarLen, no canvas         (canvas-blind reference: N from the data prior)
 #   padding-canvas    LayoutFlowElemMask, 10 slots + 'empty' class, canvas tokens (the padding baseline)
 #   oracle-canvas     LayoutFlowElemMask with the true N given, canvas tokens (length-oracle upper bound)
+#   varlen-canvas-wide (WIDE=1) the headline model with d_model 768 / 6 layers (~40M)
 # Validation FID = RALF's FIDNetV3 vs their val-split features (src/fid_ralf.py), which drives the plateau
 # LR schedule and checkpoint selection; paper numbers come from RALF's eval.py (scripts/export_ralf_samples.py).
 #   usage: scripts/launch_cgl.sh [extra hydra overrides for every run...]
@@ -33,3 +34,6 @@ launch 0 varlen-canvas  LayoutFlowVarLen   model.backbone_model.ctx_dim=385
 launch 1 varlen-blind   LayoutFlowVarLen   model.backbone_model.ctx_dim=0
 launch 2 padding-canvas LayoutFlowElemMask model.backbone_model.ctx_dim=385 +dataset.dataset.pad_empty=true dataset.dataset.num_cat=6 model.num_cat=6 model.fid_empty_id=5
 launch 3 oracle-canvas  LayoutFlowElemMask model.backbone_model.ctx_dim=385
+# wider layout transformer (d_model 768, 6 layers, ~40M) on the headline configuration; pass WIDE=1 to include it
+[ -n "$WIDE" ] && launch ${WIDE_GPU:-3} varlen-canvas-wide LayoutFlowVarLen model.backbone_model.ctx_dim=385 \
+    model.backbone_model.d_model=768 model.backbone_model.num_layers=6 model.backbone_model.dim_feedforward=3072
