@@ -11,7 +11,7 @@ expname: ${dataset_name}_bs${dataset.batch_size}
 run_dir: ???        # e.g. $LAB/runs/layoutflow-minimal/<run-name> -- keep off home (13GB quota)
 wandb_dir: ${run_dir}/wandb
 ckpt_path: null
-ema_decay: 0.999           # EMA of the backbone weights (src/ema.py): validation + checkpoints use it; 0 = off
+ema_decay: 0               # EMA of the backbone weights (src/ema.py): validation + checkpoints use it; 0 = off
 ckpt_every_n_epochs: 0     # > 0 additionally keeps a checkpoint every n epochs (plus last.ckpt is always written)
 ckpt_monitor: FID_Layout   # validation metric that selects the top-3 checkpoints (val_loss / count_mae for datasets without a FID net)
 enable_wandb: true
