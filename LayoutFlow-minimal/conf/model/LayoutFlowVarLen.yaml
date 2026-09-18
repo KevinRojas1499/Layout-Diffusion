@@ -40,4 +40,6 @@ model:
   cond: uncond            # random4: LayoutFlow's training mix (uncond / elem_compl / cat_cond / size_cond by batch quarter); random5 adds a refinement fifth (t in [0.9,1])
   ralf_cache: null        # content-aware datasets: RALF cache dir -> validation FID with their FIDNetV3 (src/fid_ralf.py)
   fid_empty_id: null      # padding baseline: category id to drop before the FID
+  ctx_token_drop: 0.0     # content-aware: hide this fraction of canvas tokens per sample during training
+  ctx_drop: 0.0           # content-aware: hide the whole canvas for this fraction of samples during training
   cat_drop: 0.0           # > 0 trains the category-unconditional velocity too (for +sampling.cfg_w at test time)

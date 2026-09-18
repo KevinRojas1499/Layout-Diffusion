@@ -44,7 +44,7 @@ class LayoutFlowVarLen(BaseGenModel):
         dataset='RICO', num_cat=6, inference_steps=100, insertion=False, t_max=1.0,
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
         geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', ralf_cache=None, fid_empty_id=None,
-        vis_dir=None,
+        ctx_token_drop=0.0, ctx_drop=0.0, vis_dir=None,
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
@@ -79,11 +79,12 @@ class LayoutFlowVarLen(BaseGenModel):
         self.geom_unmask_weight = geom_unmask_weight
         self.ins_loss_weight = ins_loss_weight
         self.cat_drop = cat_drop
+        self.ctx_token_drop, self.ctx_drop = ctx_token_drop, ctx_drop   # canvas regularisation (training only)
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
         self.sampling = dict(self.DEFAULT_SAMPLING)
 
-    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None):
-        return self.model(xt, yt, exists, t, ctx, cmask, t_elem)
+    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None, ctx_hide=None):
+        return self.model(xt, yt, exists, t, ctx, cmask, t_elem, ctx_hide)
 
     def kappa(self, t):
         return (t / self.t_max).clamp(max=1.0)
@@ -172,7 +173,14 @@ class LayoutFlowVarLen(BaseGenModel):
             # model also learns the category-unconditional velocity (the boxes stay visible)
             drop = (torch.rand(xt.shape[0], device=self.device) < self.cat_drop).unsqueeze(1)
             yt = torch.where(drop & visible, torch.full_like(yt, self.mask_id), yt)
-        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None)
+        ctx_hide = None
+        if batch.get('ctx') is not None and (self.ctx_token_drop > 0 or self.ctx_drop > 0):
+            # hide a random subset of canvas tokens, and the whole canvas for some samples: the layout must not be
+            # keyed on the exact canvas (the un-regularised model memorises the 48k training canvases)
+            B_, L_ = batch['ctx'].shape[:2]
+            ctx_hide = torch.rand(B_, L_, device=self.device) < self.ctx_token_drop
+            ctx_hide |= (torch.rand(B_, 1, device=self.device) < self.ctx_drop)
+        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None, ctx_hide)
 
         vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
         ut = x1 - x0

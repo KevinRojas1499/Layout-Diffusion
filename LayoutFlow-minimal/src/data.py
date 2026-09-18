@@ -105,7 +105,7 @@ class CGL(Dataset):
     SPLITS = {'train': 'train', 'validation': 'val', 'test': 'test', 'unannotated': 'with_no_annotations_test'}
 
     def __init__(self, split='train', data_path='./cgl', feats_path='./canvas_feats/cgl', num_cat=5, in_memory=True,
-                 pad_empty=False, max_len=10):
+                 pad_empty=False, max_len=10, hflip=False, grid=8):
         import glob
         import pyarrow.parquet as pq
         super().__init__()
@@ -119,6 +119,7 @@ class CGL(Dataset):
         self.ctx = feats['feats']
         # padding baseline: every layout has max_len elements, the missing ones of an 'empty' class (id num_cat-1)
         self.pad_empty, self.max_len = pad_empty, max_len
+        self.hflip, self.grid = hflip and split == 'train', grid       # mirror canvas + layout w.p. 0.5 (training only)
         self.samples = []
         for n, i in enumerate(cols['id']):
             lab = torch.tensor([self.LABELS.index(l) + 1 for l in cols['label'][n]], dtype=torch.long)
@@ -135,6 +136,10 @@ class CGL(Dataset):
     def __getitem__(self, index):
         s = dict(self.samples[index])
         s['ctx'] = self.ctx[s.pop('ctx_idx')].float()
+        s['bbox'] = s['bbox'].clone()
+        if self.hflip and torch.rand(()) < 0.5:
+            s['bbox'][:, 0] = 1 - s['bbox'][:, 0]                                   # mirror centres
+            s['ctx'] = s['ctx'].view(self.grid, self.grid, -1).flip(1).reshape(self.grid * self.grid, -1)   # mirror the feature grid
         # collate_fn builds xywh from an (x, y, w, h) corner box; CGL boxes are already centred
-        s['bbox'] = s['bbox'].clone(); s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
+        s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
         return s
