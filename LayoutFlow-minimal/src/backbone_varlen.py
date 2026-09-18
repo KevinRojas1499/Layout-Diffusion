@@ -26,7 +26,8 @@ class VarLenBackbone(nn.Module):
     '''
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
-                 num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64):
+                 num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64,
+                 cond_input=False):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -37,6 +38,11 @@ class VarLenBackbone(nn.Module):
         self.type_embed = nn.Embedding(num_cat + 1, latent_dim)      # num_cat = [MASK]
         self.elem_embed = nn.Linear(2 * latent_dim, d_model)
         self.global_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # conditional training (cond=random4): the network must see which elements / coordinates are given,
+        # otherwise "all visible because given" and "all visible because insertion is done" are indistinguishable
+        self.cond_input = cond_input
+        if cond_input:
+            self.cond_embed = nn.Linear(5, d_model)
         # content-aware: canvas feature tokens (precomputed, frozen) prepended as always-visible context;
         # they carry a learned position embedding because, unlike the elements, the grid cells are ordered
         self.ctx_dim = ctx_dim
@@ -54,12 +60,16 @@ class VarLenBackbone(nn.Module):
         self.gmm_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
                                       nn.Linear(d_model, self.K * (1 + 2 * self.geom_dim)))
 
-    def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None):
+    def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None):
         '''
-        geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None
+        geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None,
+        cmask (B,S,5) conditioning mask over [x,y,w,h,cat] (1 = free, 0 = given) or None
         -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,)
         '''
         x = self.elem_embed(torch.cat([self.geom_embed(geom), self.type_embed(cat)], dim=-1))
+        if self.cond_input:
+            given = torch.zeros(*cat.shape, 5, device=x.device) if cmask is None else 1 - cmask
+            x = x + self.cond_embed(given)
         pre = [self.global_token.expand(x.shape[0], -1, -1)]
         if self.ctx_dim:
             pre.append(self.ctx_embed(ctx) + self.ctx_pos)

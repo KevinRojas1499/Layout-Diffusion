@@ -71,8 +71,8 @@ class LayoutFlowVarLen(BaseGenModel):
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
         self.sampling = dict(self.DEFAULT_SAMPLING)
 
-    def forward(self, xt, yt, exists, t, ctx=None):
-        return self.model(xt, yt, exists, t, ctx)
+    def forward(self, xt, yt, exists, t, ctx=None, cmask=None):
+        return self.model(xt, yt, exists, t, ctx, cmask)
 
     def kappa(self, t):
         return (t / self.t_max).clamp(max=1.0)
@@ -144,7 +144,7 @@ class LayoutFlowVarLen(BaseGenModel):
             # model also learns the category-unconditional velocity (the boxes stay visible)
             drop = (torch.rand(xt.shape[0], device=self.device) < self.cat_drop).unsqueeze(1)
             yt = torch.where(drop & visible, torch.full_like(yt, self.mask_id), yt)
-        vt, logits, h, ins_rate = self(xt, yt, exists, t, batch.get('ctx'))
+        vt, logits, h, ins_rate = self(xt, yt, exists, t, batch.get('ctx'), cmask)
 
         vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
         ut = x1 - x0
@@ -191,12 +191,12 @@ class LayoutFlowVarLen(BaseGenModel):
         snap_grid=0,       # > 0: round the final ltrb edges to multiples of 1/snap_grid
     )
 
-    def velocity(self, x, y, exists, t, ctx=None):
-        v = self(x, y, exists, t, ctx)[0]
+    def velocity(self, x, y, exists, t, ctx=None, cmask=None):
+        v = self(x, y, exists, t, ctx, cmask)[0]
         w = self.sampling['cfg_w']
         if w != 1.0:
             # "unconditional" = same boxes, every category hidden behind the mask token
-            v_u = self(x, torch.where(exists, torch.full_like(y, self.mask_id), y), exists, t, ctx)[0]
+            v_u = self(x, torch.where(exists, torch.full_like(y, self.mask_id), y), exists, t, ctx, cmask)[0]
             v = v_u + w * (v - v_u)
         return v
 
@@ -233,17 +233,17 @@ class LayoutFlowVarLen(BaseGenModel):
             # exact per-step jump probability of the hazard kappa'/(1-kappa)
             p = 1.0 if (k_next >= 1.0 or i == N - 1) else (k_next - k) / (1 - k)
 
-            v, logits, h, ins_rate = self(x, y, exists, t, ctx)
+            v, logits, h, ins_rate = self(x, y, exists, t, ctx, cmask)
             masked = exists & (y == self.mask_id)
             visible = exists & ~masked
             vis = visible.unsqueeze(-1)
             if s['cfg_w'] != 1.0:
-                v = self.velocity(x, y, exists, t, ctx)
+                v = self.velocity(x, y, exists, t, ctx, cmask)
 
             # denoise (Euler; Heun once the layout is complete and nothing can change discontinuously)
             if s['solver'] == 'heun' and k >= 1.0 and i < N - 1:
                 x_e = torch.where(vis, x + v * dt, x)
-                v2 = self.velocity(x_e, y, exists, t + dt, ctx)
+                v2 = self.velocity(x_e, y, exists, t + dt, ctx, cmask)
                 x = torch.where(vis, x + 0.5 * (v + v2) * dt, x)
             else:
                 x = torch.where(vis, x + v * dt, x)
