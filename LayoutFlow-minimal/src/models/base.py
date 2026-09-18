@@ -134,7 +134,7 @@ class BaseGenModel(pl.LightningModule):
         bbox = torch.cat(self.gen_data['bbox'])
         label = torch.cat(self.gen_data['label'])
         pad_mask = torch.cat(self.gen_data['pad_mask'])
-        if len(bbox) == 0:          # nothing generated (e.g. an untrained variable-length model): no metrics this round
+        if len(bbox) < 8:           # (almost) nothing generated, e.g. an untrained variable-length model: no metrics this round
             self.fid_score = 1e3
             self.log_dict({'FID_Layout': self.fid_score})
             for key in self.gen_data:
