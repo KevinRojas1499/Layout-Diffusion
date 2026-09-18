@@ -69,7 +69,13 @@ def main(cfg: DictConfig):
         print(f'[sanity check, val vs test] FID: {calculate_frechet_distance(mu1, cov1, mu_val, cov_val):.4f}')
 
         print('Loading model...')
-        model = hydra.utils.get_class(cfg.model._target_).load_from_checkpoint(cfg.checkpoint, map_location=device)
+        # LayoutFlowDiscrete/VarLen keep the backbone and sampler out of the checkpoint's hparams;
+        # rebuild those from the model config (its architecture knobs must match the training run)
+        hparams = torch.load(cfg.checkpoint, map_location='cpu', weights_only=False)['hyper_parameters']
+        rebuilt = {} if 'backbone_model' in hparams else \
+            {'backbone_model': instantiate(cfg.model.backbone_model), 'sampler': instantiate(cfg.model.sampler)}
+        model = hydra.utils.get_class(cfg.model._target_).load_from_checkpoint(
+            cfg.checkpoint, map_location=device, pretrained_dir=cfg.pretrained_dir, **rebuilt)
         model.inference_steps = cfg.inference_steps
         model = model.to(device).eval()
         model.cond = 'uncond'   # checkpoint hparams carry the *training* cond mix (random4)
@@ -81,12 +87,17 @@ def main(cfg: DictConfig):
             for batch in tqdm(test_loader):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 batch['length'] = torch.multinomial(length_dist, num_samples=len(batch['length']), replacement=True)
-                geom_pred, cat_pred = model.inference(batch)
+                geom_pred, cat_pred, *gen_mask = model.inference(batch)
+                if gen_mask:    # variable-length model: the length is generated, not sampled above
+                    m = gen_mask[0]
+                    keep = m.any(1)
+                    geom_pred, cat_pred, m = geom_pred[keep], cat_pred[keep], m[keep]
+                else:
+                    m = torch.zeros(geom_pred.shape[:2], device=device, dtype=bool)
+                    for i, L in enumerate(batch['length']):
+                        m[i, :L] = True
                 bbox.append(geom_pred)
                 label.append(cat_pred)
-                m = torch.zeros(geom_pred.shape[:2], device=device, dtype=bool)
-                for i, L in enumerate(batch['length']):
-                    m[i, :L] = True
                 pad_mask.append(m)
                 if cfg.small:
                     break

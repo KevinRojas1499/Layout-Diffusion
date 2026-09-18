@@ -100,21 +100,31 @@ class BaseGenModel(pl.LightningModule):
         # without this switch 3/4 of every val batch is handed ground truth and
         # FID_Layout reads ~0.5 too low (1.7 vs 2.1-2.4 on the RICO SOTA ckpt).
         train_cond, self.cond = self.cond, 'uncond'
-        geom_pred, cat = self.inference(batch)
+        geom_pred, cat, *gen_mask = self.inference(batch)
         self.cond = train_cond
         loss = self.loss(geom_pred, batch['bbox'], batch['length'])
         self.log('val_loss', loss, sync_dist=True)
 
+        if gen_mask:
+            # variable-length models generate their own length (front-packed mask);
+            # drop the (rare) empty layouts, which the FID net cannot embed
+            pad_mask = gen_mask[0]
+            self.log('gen_len_mean', pad_mask.sum(1).float().mean(), sync_dist=True)
+            self.log('gen_len_abs_err', (pad_mask.sum(1).float().mean() - batch['length'].float().mean()).abs(),
+                     sync_dist=True)
+            keep = pad_mask.any(1)
+            geom_pred, cat, pad_mask = geom_pred[keep], cat[keep], pad_mask[keep]
+        else:
+            pad_mask = torch.zeros(geom_pred.shape[:2], device=self.device, dtype=bool)
+            for i, L in enumerate(batch['length']):
+                pad_mask[i, :L] = True
         self.gen_data['bbox'].append(geom_pred)
         self.gen_data['label'].append(cat)
-        pad_mask = torch.zeros(geom_pred.shape[:2], device=self.device, dtype=bool)
-        for i, L in enumerate(batch['length']):
-            pad_mask[i, :L] = True
         self.gen_data['pad_mask'].append(pad_mask)
 
         if batch_idx == 0:
             self.log('FID_Layout', self.fid_score, on_epoch=True, sync_dist=True)
-            if self.vis_dir:
+            if self.vis_dir and not gen_mask:
                 self.save_example_layouts(batch, geom_pred, cat)
 
     def on_validation_epoch_end(self):

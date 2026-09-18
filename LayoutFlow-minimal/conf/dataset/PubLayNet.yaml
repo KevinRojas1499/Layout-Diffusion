@@ -4,6 +4,7 @@ dataset:
   _target_: src.data.PubLayNet
   data_path: ???     # dir containing publaynet_{train,val,test}.h5
   num_cat: 6
+  in_memory: false   # true: cache the split in RAM (far less dataloader CPU)
 
 batch_size: 512
 num_workers: 12

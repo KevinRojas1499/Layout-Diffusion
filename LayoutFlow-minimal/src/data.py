@@ -49,16 +49,23 @@ class H5LayoutDataset(Dataset):
     the file names and category count differ.
     '''
 
-    def __init__(self, files_by_split, split='train', data_path='.', num_cat=6):
+    def __init__(self, files_by_split, split='train', data_path='.', num_cat=6, in_memory=False):
         super().__init__()
         self.num_cat = num_cat
         self.data = h5py.File(f'{data_path}/{files_by_split[split]}')
         self.keys = list(self.data.keys())
+        # The h5 group reads dominate an epoch's CPU time; the whole split is a few MB.
+        self.cache = [self._load(i) for i in range(len(self.keys))] if in_memory else None
 
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, index):
+        if self.cache is not None:
+            return dict(self.cache[index])     # shallow copy: collate_fn overwrites entries in place
+        return self._load(index)
+
+    def _load(self, index):
         key = self.keys[index]
         sample = self.data[key]
         sample_dict = {feature: torch.from_numpy(np.array(sample[feature])) for feature in sample.keys()}
@@ -72,10 +79,10 @@ PUBLAYNET_FILES = {'train': 'publaynet_train.h5', 'validation': 'publaynet_val.h
 
 
 class RICO(H5LayoutDataset):
-    def __init__(self, split='train', data_path='./rico', num_cat=26):
-        super().__init__(RICO_FILES, split=split, data_path=data_path, num_cat=num_cat)
+    def __init__(self, split='train', data_path='./rico', num_cat=26, in_memory=False):
+        super().__init__(RICO_FILES, split=split, data_path=data_path, num_cat=num_cat, in_memory=in_memory)
 
 
 class PubLayNet(H5LayoutDataset):
-    def __init__(self, split='train', data_path='./publaynet', num_cat=6):
-        super().__init__(PUBLAYNET_FILES, split=split, data_path=data_path, num_cat=num_cat)
+    def __init__(self, split='train', data_path='./publaynet', num_cat=6, in_memory=False):
+        super().__init__(PUBLAYNET_FILES, split=split, data_path=data_path, num_cat=num_cat, in_memory=in_memory)

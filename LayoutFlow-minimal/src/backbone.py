@@ -63,9 +63,9 @@ class Block(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, timestep):
+    def forward(self, x, timestep, key_padding_mask=None):
         x = self.norm1(x, timestep)
-        x = x + self.dropout1(self.self_attn(x, x, x, need_weights=False)[0])
+        x = x + self.dropout1(self.self_attn(x, x, x, key_padding_mask=key_padding_mask, need_weights=False)[0])
         x = x + self.dropout2(self.linear2(self.dropout(F.gelu(self.linear1(self.norm2(x))))))
         return x
 
@@ -76,9 +76,9 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
         self.norm = norm
 
-    def forward(self, x, timestep):
+    def forward(self, x, timestep, key_padding_mask=None):
         for layer in self.layers:
-            x = layer(x, timestep)
+            x = layer(x, timestep, key_padding_mask=key_padding_mask)
         return self.norm(x)
 
 
