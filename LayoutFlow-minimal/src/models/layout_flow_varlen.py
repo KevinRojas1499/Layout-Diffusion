@@ -43,13 +43,20 @@ class LayoutFlowVarLen(BaseGenModel):
         pretrained_dir='./pretrained', format='xywh', fid_calc_every_n=20,
         dataset='RICO', num_cat=6, inference_steps=100, insertion=False, t_max=1.0,
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
-        geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', vis_dir=None,
+        geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', ralf_cache=None, fid_empty_id=None,
+        vis_dir=None,
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
         assert cond in ('uncond', 'random4')
         self.cond = cond            # training mix; validation always generates unconditionally
-        fid_model = FID_score(dataset, pretrained_dir, calc_every_n=fid_calc_every_n) if fid_calc_every_n else None
+        if not fid_calc_every_n:
+            fid_model = None
+        elif ralf_cache:      # content-aware datasets: RALF's FIDNetV3 against their precomputed val features
+            from src.fid_ralf import RalfFID
+            fid_model = RalfFID(dataset, ralf_cache, calc_every_n=fid_calc_every_n, empty_id=fid_empty_id)
+        else:
+            fid_model = FID_score(dataset, pretrained_dir, calc_every_n=fid_calc_every_n)
         super().__init__(optimizer=optimizer, scheduler=scheduler, dataset=dataset, fid_model=fid_model,
                           vis_dir=vis_dir)
         assert unmask_geom in ('gmm', 'mean')

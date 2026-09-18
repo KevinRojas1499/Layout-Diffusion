@@ -19,11 +19,13 @@ def main(cfg: DictConfig):
     ckpt_dir = f'{cfg.run_dir}/checkpoints'
     trainer = instantiate(
         cfg.trainer,
-        callbacks=[
+        callbacks=[c for c in [
             ModelCheckpoint(dirpath=ckpt_dir, filename='ckpt-{epoch:02d}-{' + cfg.ckpt_monitor + ':.3f}',
-                             save_top_k=3, monitor=cfg.ckpt_monitor, mode='min'),
+                             save_top_k=3, monitor=cfg.ckpt_monitor, mode='min', save_last=True),
+            ModelCheckpoint(dirpath=ckpt_dir, filename='periodic-{epoch:04d}', every_n_epochs=cfg.ckpt_every_n_epochs,
+                            save_top_k=-1, save_on_train_epoch_end=True) if cfg.ckpt_every_n_epochs else None,
             LearningRateMonitor(logging_interval='step'),
-        ],
+        ] if c is not None],
         logger=logger,
     )
     if logger is not None and trainer.global_rank == 0:
