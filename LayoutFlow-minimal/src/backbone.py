@@ -44,7 +44,10 @@ class AdaLayerNorm(nn.Module):
         self.layernorm = nn.LayerNorm(n_embd, elementwise_affine=False)
 
     def forward(self, x, timestep):
-        emb = self.linear(self.silu(self.emb(timestep.unsqueeze(-1)))).unsqueeze(1)
+        # timestep (B,) = one time per layout, or (B, L) = one per token (decoupled per-element clocks)
+        emb = self.linear(self.silu(self.emb(timestep.unsqueeze(-1))))
+        if emb.dim() == 2:
+            emb = emb.unsqueeze(1)
         scale, shift = torch.chunk(emb, 2, dim=2)
         return self.layernorm(x) * (1 + scale) + shift
 

@@ -67,7 +67,8 @@ class LayoutFlowVarLen(BaseGenModel):
         self.inference_steps = inference_steps
         # insertion: False (fixed length) | True (insert as mask, reveal later) | 'editflow' (Edit-Flow-style
         # baseline: per-element rates, the new element arrives with its class and a box at the current noise level)
-        self.editflow = insertion == 'editflow'
+        self.editflow = insertion in ('editflow', 'oneflow')
+        self.oneflow = insertion == 'oneflow'      # + per-element clocks: an inserted box starts from pure noise at its own t = 0
         self.insertion = bool(insertion)
         self.t_max = t_max
         self.unmask_geom = unmask_geom
@@ -81,8 +82,8 @@ class LayoutFlowVarLen(BaseGenModel):
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
         self.sampling = dict(self.DEFAULT_SAMPLING)
 
-    def forward(self, xt, yt, exists, t, ctx=None, cmask=None):
-        return self.model(xt, yt, exists, t, ctx, cmask)
+    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None):
+        return self.model(xt, yt, exists, t, ctx, cmask, t_elem)
 
     def kappa(self, t):
         return (t / self.t_max).clamp(max=1.0)
@@ -145,6 +146,12 @@ class LayoutFlowVarLen(BaseGenModel):
         exists, visible = exists | given, visible | given
 
         tpad = t.view(-1, 1, 1)
+        if self.oneflow:
+            # insertion time tau_i = t_max (1 - u1) <= t for existing elements; own clock s_i = (t - tau_i) / (1 - tau_i)
+            tau = (self.t_max * (1 - u1)).clamp(max=t.view(-1, 1)) * (~given) # given elements: tau = 0
+            s = ((t.view(-1, 1) - tau) / (1 - tau)).clamp(0, 1) * visible
+            self._t_elem = s
+            tpad = s.unsqueeze(-1)
         vis = visible.unsqueeze(-1)
         xt = vis * (tpad * x1 + (1 - tpad) * x0)
         free = cmask[..., :4] if cmask is not None else torch.ones_like(xt)
@@ -165,7 +172,7 @@ class LayoutFlowVarLen(BaseGenModel):
             # model also learns the category-unconditional velocity (the boxes stay visible)
             drop = (torch.rand(xt.shape[0], device=self.device) < self.cat_drop).unsqueeze(1)
             yt = torch.where(drop & visible, torch.full_like(yt, self.mask_id), yt)
-        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask)
+        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None)
 
         vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
         ut = x1 - x0
@@ -242,9 +249,11 @@ class LayoutFlowVarLen(BaseGenModel):
         b_idx = torch.arange(B, device=self.device).unsqueeze(1).expand(B, S)[missing]
         hpar = hp[b_idx, parent[missing]]
         cat_loss = F.cross_entropy(self.model.cat_head(hpar), y1[missing])
+        self.log('cat_loss', cat_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        if self.oneflow:                  # the child's box starts from pure noise: nothing to predict at insertion
+            return ins_loss, self.cat_loss_weight * cat_loss
         log_pi, mu, sigma = self.model.unmask_geom(hpar, y1[missing])
         geom_loss = gmm_nll(log_pi, mu, sigma, x1[missing]).mean() if self.unmask_geom == 'gmm' else F.mse_loss(gmm_mean(log_pi, mu), x1[missing])
-        self.log('cat_loss', cat_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log('geom_unmask_loss', geom_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return ins_loss, self.cat_loss_weight * cat_loss + self.geom_unmask_weight * geom_loss
 
@@ -259,7 +268,7 @@ class LayoutFlowVarLen(BaseGenModel):
     )
 
     @torch.no_grad()
-    def editflow_insert(self, x, y, exists, h, extra, ins_rate, p, t_next, s):
+    def editflow_insert(self, x, y, exists, h, extra, ins_rate, p, t_next, s, tau):
         '''
         Edit-Flow-style insertion step: each existing element (and the global token) inserts
         Poisson(rate * p) new elements, each arriving with a class sampled from the parent's category
@@ -279,16 +288,19 @@ class LayoutFlowVarLen(BaseGenModel):
                     if over == 0:
                         break
         if n.sum() == 0:
-            return x, y, exists
+            return x, y, exists, tau
         b_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(B, S + 1)
         parent = torch.arange(S + 1, device=x.device).unsqueeze(0).expand(B, S + 1)
         b_new, p_new = b_idx.repeat_interleave(n.flatten()), parent.repeat_interleave(n.flatten())   # one row per child
         hp = torch.cat([h, extra['h_glob'].unsqueeze(1)], 1)[b_new, p_new]
         logits = self.model.cat_head(hp); logits[:, 0] = float('-inf')
         cls = torch.distributions.Categorical(logits=logits).sample()
-        log_pi, mu, sigma = self.model.unmask_geom(hp, cls)
-        g1 = gmm_sample(log_pi, mu, sigma * s['gmm_temp']) if self.unmask_geom == 'gmm' else gmm_mean(log_pi, mu)
-        xn = t_next * g1 + (1 - t_next) * s['reveal_eps'] * torch.randn_like(g1)
+        if self.oneflow:                                                    # box from pure noise, own clock starts now
+            xn = torch.randn(len(cls), self.geom_dim, device=x.device)
+        else:
+            log_pi, mu, sigma = self.model.unmask_geom(hp, cls)
+            g1 = gmm_sample(log_pi, mu, sigma * s['gmm_temp']) if self.unmask_geom == 'gmm' else gmm_mean(log_pi, mu)
+            xn = t_next * g1 + (1 - t_next) * s['reveal_eps'] * torch.randn_like(g1)
         # k-th child of layout b goes to the k-th free slot of b
         first = torch.zeros(B, dtype=torch.long, device=x.device).scatter_add_(0, b_new, torch.ones_like(b_new)).cumsum(0) - torch.bincount(b_new, minlength=B)
         rank = torch.arange(len(b_new), device=x.device) - first[b_new]
@@ -296,7 +308,9 @@ class LayoutFlowVarLen(BaseGenModel):
         free_first = torch.zeros(B, dtype=torch.long, device=x.device).scatter_add_(0, free_slots[:, 0], torch.ones_like(free_slots[:, 0])).cumsum(0) - torch.bincount(free_slots[:, 0], minlength=B)
         slot = free_slots[free_first[b_new] + rank, 1]
         x[b_new, slot] = xn; y[b_new, slot] = cls; exists[b_new, slot] = True
-        return x, y, exists
+        if self.oneflow:
+            tau[b_new, slot] = t_next
+        return x, y, exists, tau
 
     def velocity(self, x, y, exists, t, ctx=None, cmask=None):
         v = self(x, y, exists, t, ctx, cmask)[0]
@@ -340,6 +354,7 @@ class LayoutFlowVarLen(BaseGenModel):
         y = torch.where(given, batch['type'].long(), torch.full((B, S), self.mask_id, dtype=torch.long, device=dev))
         s = self.sampling
         ctx = batch.get('ctx')
+        tau = torch.zeros(B, S, device=dev)                                  # oneflow: insertion time per slot
 
         N = self.inference_steps
         dt = (1.0 - t_start) / N
@@ -351,10 +366,12 @@ class LayoutFlowVarLen(BaseGenModel):
             # exact per-step jump probability of the hazard kappa'/(1-kappa)
             p = 1.0 if (k_next >= 1.0 or i == N - 1) else (k_next - k) / (1 - k)
 
-            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask)
+            t_elem = (((t_i - tau) / (1 - tau)).clamp(0, 1) * exists) if self.oneflow else None
+            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem)
             masked = exists & (y == self.mask_id)
             visible = exists & ~masked
             vis = visible.unsqueeze(-1)
+            dt_elem = (dt / (1 - tau)).unsqueeze(-1) if self.oneflow else dt          # own clock runs faster
             if s['cfg_w'] != 1.0:
                 v = self.velocity(x, y, exists, t, ctx, cmask)
 
@@ -364,7 +381,7 @@ class LayoutFlowVarLen(BaseGenModel):
                 v2 = self.velocity(x_e, y, exists, t + dt, ctx, cmask)
                 x = torch.where(vis, x + 0.5 * (v + v2) * dt, x)
             else:
-                x = torch.where(vis, x + v * dt, x)
+                x = torch.where(vis, x + v * dt_elem, x)
             if task != 'uncond':
                 x = held * x1 + (1 - held) * x
 
@@ -381,7 +398,7 @@ class LayoutFlowVarLen(BaseGenModel):
 
             # insert: Poisson number of new masked elements into free slots
             if self.editflow and not given_length and p < 1.0:
-                x, y, exists = self.editflow_insert(x, y, exists, h, extra, ins_rate, p, t_next, s)
+                x, y, exists, tau = self.editflow_insert(x, y, exists, h, extra, ins_rate, p, t_next, s, tau)
             elif self.insertion and not given_length and p < 1.0:
                 n_new = torch.poisson(ins_rate * p)
                 free_rank = (~exists).cumsum(1)

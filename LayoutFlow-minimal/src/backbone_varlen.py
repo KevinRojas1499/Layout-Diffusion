@@ -64,10 +64,12 @@ class VarLenBackbone(nn.Module):
         self.gmm_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
                                       nn.Linear(d_model, self.K * (1 + 2 * self.geom_dim)))
 
-    def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None):
+    def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None,
+                t_elem: Tensor = None):
         '''
         geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None,
         cmask (B,S,5) conditioning mask over [x,y,w,h,cat] (1 = free, 0 = given) or None
+        t_elem (B,S) per-element clock (OneFlow-style baseline) or None: the global/canvas tokens then use t
         -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,), extra {h_glob (B,d_model), elem_rate (B,S) or None}
         '''
         x = self.elem_embed(torch.cat([self.geom_embed(geom), self.type_embed(cat)], dim=-1))
@@ -80,6 +82,8 @@ class VarLenBackbone(nn.Module):
         n_pre = sum(p.shape[1] for p in pre)
         x = torch.cat(pre + [x], dim=1)
         hidden = torch.cat([torch.zeros(x.shape[0], n_pre, dtype=torch.bool, device=x.device), ~exists], dim=1)
+        if t_elem is not None:
+            t = torch.cat([t.unsqueeze(1).expand(-1, n_pre), t_elem], dim=1)
         h = self.transformer(x, timestep=t, key_padding_mask=hidden)
         h_glob, h = h[:, 0], h[:, n_pre:]
         ins_rate = F.softplus(self.ins_head(h_glob)).squeeze(-1)
