@@ -14,11 +14,14 @@ model:
     latent_dim: 128
     d_model: 512
     nhead: 8
+    dim_feedforward: 2048
     num_layers: 4
     dropout: 0.1
     num_cat: ${dataset.dataset.num_cat}
     gmm_components: 16
     sigma_min: 0.01
+    cond_input: false       # true with cond=random4: feed the given/held mask to the network (needed by the insertion model)
+    ctx_dim: 0              # content-aware: canvas feature dim (385 for scripts/precompute_canvas_feats.py), 0 = none
   sampler:
     _target_: src.sampler.GaussianSampler
     out_dim: 4
@@ -34,3 +37,7 @@ model:
   cat_loss_weight: 0.25
   geom_unmask_weight: 0.05
   ins_loss_weight: 0.1
+  cond: uncond            # random4: LayoutFlow's training mix (uncond / elem_compl / cat_cond / size_cond by batch quarter); random5 adds a refinement fifth (t in [0.9,1])
+  ralf_cache: null        # content-aware datasets: RALF cache dir -> validation FID with their FIDNetV3 (src/fid_ralf.py)
+  fid_empty_id: null      # padding baseline: category id to drop before the FID
+  cat_drop: 0.0           # > 0 trains the category-unconditional velocity too (for +sampling.cfg_w at test time)

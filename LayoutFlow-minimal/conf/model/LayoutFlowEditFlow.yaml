@@ -1,7 +1,7 @@
 # @package _global_
-# Fixed-length whole-element masking: every element (box + category) starts as a
-# mask token, is unmasked to a noisy value at a random time and denoised from then
-# on. Stage one of insert -> unmask -> denoise; see src/models/layout_flow_varlen.py.
+# Edit-Flow-style variable-length baseline (Havasi et al. 2025 / OneFlow): per-element insertion rates,
+# and an inserted element arrives with its class and a box at the current noise level (no masked stage).
+# Same backbone, schedule and losses otherwise. See LayoutFlowVarLen.editflow_* in src/models/layout_flow_varlen.py.
 model:
   _target_: src.models.layout_flow_varlen.LayoutFlowVarLen
   optimizer:
@@ -20,6 +20,7 @@ model:
     num_cat: ${dataset.dataset.num_cat}
     gmm_components: 16
     sigma_min: 0.01
+    elem_rates: true
     cond_input: false       # true with cond=random4: feed the given/held mask to the network (needed by the insertion model)
     ctx_dim: 0              # content-aware: canvas feature dim (385 for scripts/precompute_canvas_feats.py), 0 = none
   sampler:
@@ -29,7 +30,7 @@ model:
   fid_calc_every_n: ${trainer.check_val_every_n_epoch}
   num_cat: ${dataset.dataset.num_cat}
   inference_steps: 100
-  insertion: false
+  insertion: editflow
   t_max: 0.5              # reveal schedule kappa(t) = min(t / t_max, 1); 1.0 is much worse (see README)
   unmask_geom: gmm        # gmm: sample the clean box from the mixture | mean: point estimate
   add_loss: geom_l1_loss
