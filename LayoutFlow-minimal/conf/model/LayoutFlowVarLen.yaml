@@ -34,4 +34,5 @@ model:
   cat_loss_weight: 0.25
   geom_unmask_weight: 0.05
   ins_loss_weight: 0.1
+  cond: uncond            # random4: LayoutFlow's training mix (uncond / elem_compl / cat_cond / size_cond by batch quarter)
   cat_drop: 0.0           # > 0 trains the category-unconditional velocity too (for +sampling.cfg_w at test time)

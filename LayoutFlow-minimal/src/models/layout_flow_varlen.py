@@ -43,11 +43,12 @@ class LayoutFlowVarLen(BaseGenModel):
         pretrained_dir='./pretrained', format='xywh', fid_calc_every_n=20,
         dataset='RICO', num_cat=6, inference_steps=100, insertion=False, t_max=1.0,
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
-        geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, vis_dir=None,
+        geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', vis_dir=None,
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
-        self.cond = 'uncond'
+        assert cond in ('uncond', 'random4')
+        self.cond = cond            # training mix; validation always generates unconditionally
         fid_model = FID_score(dataset, pretrained_dir, calc_every_n=fid_calc_every_n) if fid_calc_every_n else None
         super().__init__(optimizer=optimizer, scheduler=scheduler, dataset=dataset, fid_model=fid_model,
                           vis_dir=vis_dir)
@@ -76,12 +77,44 @@ class LayoutFlowVarLen(BaseGenModel):
     def kappa(self, t):
         return (t / self.t_max).clamp(max=1.0)
 
-    def sample_state(self, batch, t):
-        '''Draw (x_t, y_t, exists, visible) from the conditional path at time t (B,).'''
+    def cond_mask(self, batch, task):
+        '''
+        (B,S,5) float mask over [x, y, w, h, cat]; 1 = free, 0 = given. Same conventions as
+        LayoutFlow: cat_cond gives the categories, size_cond categories + sizes, elem_compl a
+        random ~20% of the elements entirely, random4 mixes those three with uncond by batch
+        quarter (training). Pad slots are never "given".
+        '''
+        B, S = batch['type'].shape
+        active = batch['mask'].squeeze(-1)
+        m = torch.ones(B, S, 5, device=self.device)
+        if task == 'uncond':
+            return m
+        sl = {'elem_compl': slice(0, B // 4), 'cat_cond': slice(B // 4, B // 2), 'size_cond': slice(B // 2, 3 * B // 4)} \
+            if task == 'random4' else {task: slice(0, B)}
+        if 'cat_cond' in sl:
+            m[sl['cat_cond'], :, 4] = 0
+        if 'size_cond' in sl:
+            m[sl['size_cond'], :, 2:] = 0
+        if 'elem_compl' in sl:
+            s = sl['elem_compl']
+            L = batch['length'][s].view(-1, 1).float()
+            n_given = (L * 0.2 * torch.rand_like(L)).floor() + 1           # 1 + U(0, 0.2 L) elements, if L > 1
+            rank = torch.rand(L.shape[0], S, device=self.device).masked_fill(~active[s], 2).argsort(1).argsort(1)
+            given = (rank < n_given) & (L > 1)
+            m[s] = torch.where(given.unsqueeze(-1), torch.zeros_like(m[s]), m[s])
+        return m * active.unsqueeze(-1).float() + (1 - active.unsqueeze(-1).float())
+
+    def sample_state(self, batch, t, cmask=None):
+        '''
+        Draw (x_t, y_t, exists, visible) from the conditional path at time t (B,). A conditioned
+        element (its category given, cmask[..., 4] == 0) is visible from t = 0; its given
+        coordinates are held at their clean values. Returns the free-coordinate mask too.
+        '''
         active = batch['mask'].squeeze(-1)
         x1 = batch['mask'] * self.sampler.preprocess(batch['bbox'])
         y1 = batch['type'].long()
         x0 = batch['mask'] * torch.randn_like(x1)
+        given = active & (cmask[..., 4] == 0) if cmask is not None else torch.zeros_like(active)
 
         k = self.kappa(t).view(-1, 1)
         u1, u2 = torch.rand_like(x0[..., 0]), torch.rand_like(x0[..., 0])
@@ -91,16 +124,20 @@ class LayoutFlowVarLen(BaseGenModel):
         else:
             exists = active
             visible = active & (k >= u2)
+        exists, visible = exists | given, visible | given
 
         tpad = t.view(-1, 1, 1)
         vis = visible.unsqueeze(-1)
         xt = vis * (tpad * x1 + (1 - tpad) * x0)
+        free = cmask[..., :4] if cmask is not None else torch.ones_like(xt)
+        xt = free * xt + (1 - free) * x1
         yt = torch.where(visible, y1, torch.full_like(y1, self.mask_id))
-        return xt, yt, exists, visible, x0, x1, y1
+        return xt, yt, exists, visible, x0, x1, y1, free
 
     def training_step(self, batch, batch_idx):
         t = torch.rand(batch['bbox'].shape[0], device=self.device)
-        xt, yt, exists, visible, x0, x1, y1 = self.sample_state(batch, t)
+        cmask = self.cond_mask(batch, self.cond) if self.cond != 'uncond' else None
+        xt, yt, exists, visible, x0, x1, y1, free = self.sample_state(batch, t, cmask)
         masked = exists & ~visible
         if self.cat_drop > 0:
             # classifier-free guidance training: hide every category of a layout w.p. cat_drop, so the
@@ -109,7 +146,7 @@ class LayoutFlowVarLen(BaseGenModel):
             yt = torch.where(drop & visible, torch.full_like(yt, self.mask_id), yt)
         vt, logits, h, ins_rate = self(xt, yt, exists, t)
 
-        vis = visible.unsqueeze(-1)
+        vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
         ut = x1 - x0
         flow_loss = self.loss_fcn(vis * vt, vis * ut)
         loss = flow_loss
@@ -164,13 +201,26 @@ class LayoutFlowVarLen(BaseGenModel):
         return v
 
     @torch.no_grad()
-    def inference(self, batch):
-        '''Returns (bbox, label, pad_mask). With insertion the length is generated, not read from the batch.'''
+    def inference(self, batch, task='uncond', given_length=False):
+        '''
+        Returns (bbox, label, pad_mask). task: uncond | cat_cond | size_cond | elem_compl, with the
+        given values read from the batch. With insertion the number of elements is generated unless
+        given_length (LayoutFlow's protocol: the remaining slots start as masked elements).
+        '''
         B, S = batch['type'].shape
         dev = batch['bbox'].device
-        exists = torch.zeros(B, S, dtype=torch.bool, device=dev) if self.insertion else batch['mask'].squeeze(-1).clone()
+        active = batch['mask'].squeeze(-1)
+        given_length = given_length or task in ('cat_cond', 'size_cond')   # the whole element set is given
+        cmask = self.cond_mask(batch, task)
+        given = active & (cmask[..., 4] == 0)
+        held = (1 - cmask[..., :4]) * given.unsqueeze(-1)              # coordinates pinned to the batch values
+        x1 = self.sampler.preprocess(batch['bbox'])
+        exists = active.clone() if (not self.insertion or given_length) else given.clone()
+        # a given element is visible from t = 0: given coordinates clean, the rest at pure noise
         x = torch.zeros(B, S, self.geom_dim, device=dev)
-        y = torch.full((B, S), self.mask_id, dtype=torch.long, device=dev)
+        if given.any():
+            x = given.unsqueeze(-1) * (held * x1 + (1 - held) * torch.randn_like(x))
+        y = torch.where(given, batch['type'].long(), torch.full((B, S), self.mask_id, dtype=torch.long, device=dev))
         s = self.sampling
 
         N = self.inference_steps
@@ -196,6 +246,8 @@ class LayoutFlowVarLen(BaseGenModel):
                 x = torch.where(vis, x + 0.5 * (v + v2) * dt, x)
             else:
                 x = torch.where(vis, x + v * dt, x)
+            if task != 'uncond':
+                x = held * x1 + (1 - held) * x
 
             # unmask: class from the categorical, clean box from the mixture, noised to t_next
             reveal = masked & (torch.rand(B, S, device=dev) < p)
@@ -209,7 +261,7 @@ class LayoutFlowVarLen(BaseGenModel):
                 y[reveal] = cls
 
             # insert: Poisson number of new masked elements into free slots
-            if self.insertion and p < 1.0:
+            if self.insertion and not given_length and p < 1.0:
                 n_new = torch.poisson(ins_rate * p)
                 free_rank = (~exists).cumsum(1)
                 exists = exists | (~exists & (free_rank <= n_new.view(-1, 1)))

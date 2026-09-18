@@ -1,7 +1,8 @@
 '''
-Unconditional-generation eval: FID / alignment / overlap (+ optional mIoU), matching
-upstream's `task=uncond` path. Trimmed from upstream test.py: dropped the other four
-conditioning tasks (cat_cond/size_cond/elem_compl/refinement) and the
+Generation eval: FID / alignment / overlap (+ optional mIoU), matching upstream's protocol.
+`task=uncond` works for every model; cat_cond / size_cond / elem_compl are wired for
+LayoutFlowVarLen (given values come from the test layouts, full test set, as upstream).
+Trimmed from upstream test.py: dropped refinement and the
 load-generated-bboxes-from-file shortcut -- this always generates fresh samples from
 a checkpoint. Keeps the RICO continuous-bbox substitution (`rico_test.pt`) since
 that's what upstream's own reported numbers were computed against.
@@ -89,8 +90,11 @@ def main(cfg: DictConfig):
             bbox, label, pad_mask, for_miou = [], [], [], []
             for batch in tqdm(test_loader):
                 batch = {k: v.to(device) for k, v in batch.items()}
-                batch['length'] = torch.multinomial(length_dist, num_samples=len(batch['length']), replacement=True)
-                geom_pred, cat_pred, *gen_mask = model.inference(batch)
+                if cfg.task == 'uncond':
+                    batch['length'] = torch.multinomial(length_dist, num_samples=len(batch['length']), replacement=True)
+                    geom_pred, cat_pred, *gen_mask = model.inference(batch)
+                else:   # conditional tasks read the given values from the test layouts (LayoutFlowVarLen only)
+                    geom_pred, cat_pred, *gen_mask = model.inference(batch, task=cfg.task, given_length=cfg.given_length)
                 if gen_mask:    # variable-length model: the length is generated, not sampled above
                     m = gen_mask[0]
                     keep = m.any(1)
@@ -110,9 +114,10 @@ def main(cfg: DictConfig):
                 L = mask.sum()
                 for_miou.append([bb[:L].cpu(), cat[:L].cpu()])
 
-            # 2000 samples is the convention other layout-generation papers use
-            bbox, ltrb_bbox, label, pad_mask = bbox[:2000], ltrb_bbox[:2000], label[:2000], pad_mask[:2000]
-            for_miou = for_miou[:2000]
+            if cfg.task == 'uncond':    # 2000 samples is the convention other layout-generation papers use
+                bbox, ltrb_bbox, label, pad_mask = bbox[:2000], ltrb_bbox[:2000], label[:2000], pad_mask[:2000]
+                for_miou = for_miou[:2000]
+            print(f'task {cfg.task}: {len(label)} generated vs {len(label_test)} test layouts')
 
             feats_fake = fid_model.extract_features(ltrb_bbox, label, ~pad_mask)
             mu2, cov2 = feats_fake.cpu().numpy().mean(0), np.cov(feats_fake.cpu().numpy(), rowvar=False)
