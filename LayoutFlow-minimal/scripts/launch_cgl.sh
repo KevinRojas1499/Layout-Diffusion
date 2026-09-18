@@ -7,7 +7,7 @@
 #   varlen-canvas-wide (WIDE=1) the headline model with d_model 768 / 6 layers (~40M)
 # Validation FID = RALF's FIDNetV3 vs their val-split features (src/fid_ralf.py), which drives the plateau
 # LR schedule and checkpoint selection; paper numbers come from RALF's eval.py (scripts/export_ralf_samples.py).
-#   usage: scripts/launch_cgl.sh [extra hydra overrides for every run...]
+#   usage: [SKIP="oracle-canvas ..."] [WIDE=1 WIDE_GPU=3] scripts/launch_cgl.sh [extra hydra overrides for every run...]
 LAB=${LAB:-/network/rit/lab/Yelab/kevin-back/kevin_rojas}
 RUNS=${RUNS:-$LAB/runs/layoutflow-minimal}
 PY=${PY:-$LAB/repos/LayoutFlow/.venv/bin/python}
@@ -18,6 +18,7 @@ COMMON=("$@")
 
 launch() {  # launch <gpu> <name> <model> <overrides...>
     local gpu=$1 name=cgl-$2 model=$3; shift 3
+    [[ " $SKIP " == *" $2 "* ]] && { echo "skip $2 (SKIP)" >&2; return; }
     if [ -e "$RUNS/$name" ]; then echo "skip $name: $RUNS/$name exists" >&2; return; fi
     cd "$SRC" || exit 1
     OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=$gpu setsid nohup "$PY" train.py \
