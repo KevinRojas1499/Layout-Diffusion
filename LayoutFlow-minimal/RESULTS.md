@@ -293,3 +293,40 @@ baseline shows the same collapse, so it is the conditioning, not insertion. EMA 
 
 v3 (launched 2026-09-18 16:40, EMA off): `model.ctx_token_drop=0.5 model.ctx_drop=0.1` (hide half the canvas tokens per
 sample, the whole canvas for 10%), `dataset.dataset.hflip=true` (mirror canvas grid + layout), and both.
+
+### v3: canvas regularisation (test split, RALF's evaluator; ceilings = real test layouts scored the same way)
+
+| | FID | Occ | Rea | Und_l | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|---|
+| **Real test layouts (ceiling)** | 0 (0.80 vs val) | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
+| LayoutGD (paper) | - | 0.120 | 0.014 | 0.999 | 0.994 | 0.0004 | - |
+| RALF (released outputs) | 1.32 | 0.125 | 0.018 | 0.991 | 0.976 | 0.004 | 1.08 |
+| RALF's autoregressive model without retrieval (released) | 2.89 | 0.125 | 0.019 | 0.967 | 0.917 | 0.011 | 1.27 |
+| Ours, canvas-blind prior (v2, ep 649) | 1.63 | 0.318 | 0.041 | 0.960 | 0.877 | 0.006 | 2.13 |
+| Ours + canvas, no regularisation (v2, ep 419) | 4.45 | 0.135 | 0.021 | 0.900 | 0.710 | 0.013 | 1.34 |
+| Ours + canvas, token dropout 0.5 + canvas dropout 0.1 (ep 499) | 3.51 | 0.148 | 0.022 | 0.914 | 0.705 | 0.024 | 1.51 |
+| **Ours + canvas, dropout + hflip** (`cgl-varlen-canvas-regflip`, ep 329) | **3.32** | 0.144 | 0.022 | 0.917 | 0.734 | 0.020 | 1.49 |
+| ... + self-refinement pass (our refinement mode, t 0.97 -> 1, no heuristics) | 3.48 | 0.138 | 0.021 | 0.934 | 0.821 | 0.0145 | 1.49 |
+| ... + post-processing: snap edges to the 1/128 grid (RALF's resolution) | 3.44 | 0.145 | 0.022 | 0.917 | 0.793 | 0.020 | |
+| ... + post-processing: enlarge loosely-containing underlays to exact containment | 3.30 | 0.144 | 0.022 | 0.927 | 0.859 | 0.020 | |
+| ... + both post-processing steps | 3.41 | 0.144 | 0.022 | 0.927 | 0.869 | 0.020 | |
+
+Sampler-side knobs that did nothing or hurt on the same checkpoint: mixture temperature 0.5 / 0 (3.36 / 3.29, other
+metrics unchanged), Heun + 200 steps (3.91, underlay 0.69). Validation FID (ported FIDNetV3 vs val features)
+overstates canvas models by ~1.0 (2.36 val -> 3.32 test; the blind model 1.22 -> 1.63): use it for selection only.
+
+Reading: regularisation removes most of the memorisation (FID 4.45 -> 3.32) at a small cost in canvas use
+(occlusion 0.135 -> 0.144, count 1.34 -> 1.49): it moves along a canvas-use / layout-quality trade-off. What remains
+is geometric precision: underlays sit around the right elements (loose 0.92) but do not contain them exactly, and
+small overlaps persist (0.02 vs 0.0003 real). Self-refinement is the honest model-side gain (underlay 0.82,
+overlay 0.0145); snapping and containment post-processing reach 0.87 and must be reported as such.
+
+What RALF and LayoutGD have that we do not (checked in RALF's released config / code and LayoutGD's text):
+RALF discretises coordinates to 128 uniform bins (outputs are grid-exact) and, decisively, conditions on the 16
+DreamSim-nearest *training layouts* by cross-attention (their own no-retrieval model: FID 2.89, underlay 0.917 ->
+with retrieval 1.32, 0.976; the indices are shipped in `cache/.../retrieval_indexes`); it also decodes with top-k=5
+sampling. LayoutGD is a continuous DDPM but puts an explicit element-element graph (GNN with alignment features)
+in the architecture and feeds LayoutDiT's saliency bounding box as a fixed element. Neither reaches the ceiling
+with a plain transformer over raw boxes. Cheap next steps for us, in order: a "+retrieval" row (indices provided),
+a de-overlap counterpart to `contain`, and a pairwise-geometry term; a cross-attention canvas variant was tried and
+failed to train (flat flow loss; `cgl-varlen-canvas-cross-regflip-failed`).
