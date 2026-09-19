@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,7 +45,7 @@ class LayoutFlowVarLen(BaseGenModel):
         dataset='RICO', num_cat=6, inference_steps=100, insertion=False, t_max=1.0,
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
         geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', ralf_cache=None, fid_empty_id=None,
-        ctx_token_drop=0.0, ctx_drop=0.0, vis_dir=None,
+        ctx_token_drop=0.0, ctx_drop=0.0, vis_dir=None, clock='coupled',
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
@@ -69,6 +70,11 @@ class LayoutFlowVarLen(BaseGenModel):
         # baseline: per-element rates, the new element arrives with its class and a box at the current noise level)
         self.editflow = insertion in ('editflow', 'oneflow')
         self.oneflow = insertion == 'oneflow'      # + per-element clocks: an inserted box starts from pure noise at its own t = 0
+        # oneflow clocks at training time: 'coupled' = s_i is a function of t and the insertion time (the synchronised
+        # sampling path); 'decoupled' = s_i ~ U(0,1) independently of t (Diffuse-Everything-style product of times:
+        # every monotone clock policy at sampling time is then on-distribution, see DEFAULT_SAMPLING['clock'])
+        assert clock in ('coupled', 'decoupled')
+        self.clock = clock
         self.insertion = bool(insertion)
         self.t_max = t_max
         self.unmask_geom = unmask_geom
@@ -122,11 +128,12 @@ class LayoutFlowVarLen(BaseGenModel):
             m[s] = torch.where(given.unsqueeze(-1), torch.zeros_like(m[s]), m[s])
         return m * active.unsqueeze(-1).float() + (1 - active.unsqueeze(-1).float())
 
-    def sample_state(self, batch, t, cmask=None):
+    def sample_state(self, batch, t, cmask=None, s_lo=None):
         '''
         Draw (x_t, y_t, exists, visible) from the conditional path at time t (B,). A conditioned
         element (its category given, cmask[..., 4] == 0) is visible from t = 0; its given
         coordinates are held at their clean values. Returns the free-coordinate mask too.
+        s_lo (B,): lower bound of the decoupled per-element clocks (the refinement fifth of random5).
         '''
         active = batch['mask'].squeeze(-1)
         x1 = batch['mask'] * self.sampler.preprocess(batch['bbox'])
@@ -147,7 +154,13 @@ class LayoutFlowVarLen(BaseGenModel):
         exists, visible = exists | given, visible | given
 
         tpad = t.view(-1, 1, 1)
-        if self.oneflow:
+        if self.oneflow and self.clock == 'decoupled':
+            # every element's clock is its own time variable, independent of t and of when it was inserted
+            lo = s_lo.view(-1, 1) if s_lo is not None else torch.zeros_like(t).view(-1, 1)
+            s = (lo + (1 - lo) * torch.rand_like(u1)) * visible
+            self._t_elem = s
+            tpad = s.unsqueeze(-1)
+        elif self.oneflow:
             # insertion time tau_i = t_max (1 - u1) <= t for existing elements; own clock s_i = (t - tau_i) / (1 - tau_i)
             tau = (self.t_max * (1 - u1)).clamp(max=t.view(-1, 1)) * (~given) # given elements: tau = 0
             s = ((t.view(-1, 1) - tau) / (1 - tau)).clamp(0, 1) * visible
@@ -163,10 +176,12 @@ class LayoutFlowVarLen(BaseGenModel):
     def training_step(self, batch, batch_idx):
         t = torch.rand(batch['bbox'].shape[0], device=self.device)
         cmask = self.cond_mask(batch, self.cond) if self.cond != 'uncond' else None
+        s_lo = None
         if self.cond == 'random5':      # refinement fifth: nearly clean layouts, the state the refinement task starts from
             q = t.shape[0] // 5
             t[3 * q:4 * q] = 0.9 + 0.1 * t[3 * q:4 * q]
-        xt, yt, exists, visible, x0, x1, y1, free = self.sample_state(batch, t, cmask)
+            s_lo = torch.zeros_like(t); s_lo[3 * q:4 * q] = 0.9
+        xt, yt, exists, visible, x0, x1, y1, free = self.sample_state(batch, t, cmask, s_lo)
         masked = exists & ~visible
         if self.cat_drop > 0:
             # classifier-free guidance training: hide every category of a layout w.p. cat_drop, so the
@@ -273,6 +288,9 @@ class LayoutFlowVarLen(BaseGenModel):
         solver='euler',    # 'heun': second-order steps once everything is revealed (kappa = 1)
         cfg_w=1.0,         # classifier-free guidance on the categories: v_u + w (v_c - v_u); 1 = off
         snap_grid=0,       # > 0: round the final ltrb edges to multiples of 1/snap_grid
+        clock='sync',      # oneflow clock policy: 'sync' (all boxes clean at t = 1, ds = dt / (1 - tau)) | 'unit'
+                           # (ds = dt, the run continues past t = 1 until every box is clean, OneFlow-style) |
+                           # 'insert_first' (clocks frozen until kappa = 1, then everything is denoised together)
     )
 
     @torch.no_grad()
@@ -363,23 +381,41 @@ class LayoutFlowVarLen(BaseGenModel):
         s = self.sampling
         ctx = batch.get('ctx')
         tau = torch.zeros(B, S, device=dev)                                  # oneflow: insertion time per slot
+        clock = s['clock'] if self.oneflow else None
+        # per-element clocks (oneflow): given elements start at t_start on their own clock
+        sc = torch.zeros(B, S, device=dev)
+        if clock == 'unit':
+            sc = t_start * given.float()
+        elif clock == 'insert_first':
+            sc = max(0.0, (t_start - self.t_max) / (1 - self.t_max)) * given.float()
 
         N = self.inference_steps
         dt = (1.0 - t_start) / N
-        for i in range(N):
+        # unit-rate clocks: a box inserted at tau needs 1/dt more steps, so the run goes on past t = 1
+        N_tot = N + (math.ceil(self.t_max / dt) if clock == 'unit' and not given_length else 0)
+        for i in range(N_tot):
             t_i = t_start + i * dt
-            t = torch.full((B,), t_i, device=dev)
+            t = torch.full((B,), min(t_i, 1.0), device=dev)
             t_next = t_start + (i + 1) * dt
             k, k_next = min(t_i / self.t_max, 1.0), min(t_next / self.t_max, 1.0)
             # exact per-step jump probability of the hazard kappa'/(1-kappa)
             p = 1.0 if (k_next >= 1.0 or i == N - 1) else (k_next - k) / (1 - k)
+            if i >= N:
+                p = 0.0                                                      # tail: no more insertions
 
-            t_elem = (((t_i - tau) / (1 - tau)).clamp(0, 1) * exists) if self.oneflow else None
+            if clock == 'sync':
+                sc = ((t_i - tau) / (1 - tau)).clamp(0, 1) * exists
+                ds = (dt / (1 - tau)) * exists
+            elif clock == 'unit':
+                ds = (1 - sc).clamp(max=dt) * exists
+            elif clock == 'insert_first':
+                ds = (1 - sc).clamp(max=(0.0 if t_next <= self.t_max else dt / (1 - self.t_max))) * exists
+            t_elem = sc * exists if self.oneflow else None
             v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem)
             masked = exists & (y == self.mask_id)
             visible = exists & ~masked
             vis = visible.unsqueeze(-1)
-            dt_elem = (dt / (1 - tau)).unsqueeze(-1) if self.oneflow else dt          # own clock runs faster
+            dt_elem = ds.unsqueeze(-1) if self.oneflow else dt              # own clock
             if s['cfg_w'] != 1.0:
                 v = self.velocity(x, y, exists, t, ctx, cmask)
 
@@ -390,6 +426,8 @@ class LayoutFlowVarLen(BaseGenModel):
                 x = torch.where(vis, x + 0.5 * (v + v2) * dt, x)
             else:
                 x = torch.where(vis, x + v * dt_elem, x)
+            if self.oneflow:
+                sc = ((sc + ds).clamp(max=1.0)) * exists
             if task != 'uncond':
                 x = held * x1 + (1 - held) * x
 
@@ -405,7 +443,7 @@ class LayoutFlowVarLen(BaseGenModel):
                 y[reveal] = cls
 
             # insert: Poisson number of new masked elements into free slots
-            if self.editflow and not given_length and p < 1.0:
+            if self.editflow and not given_length and 0.0 < p < 1.0:
                 x, y, exists, tau = self.editflow_insert(x, y, exists, h, extra, ins_rate, p, t_next, s, tau)
             elif self.insertion and not given_length and p < 1.0:
                 n_new = torch.poisson(ins_rate * p)

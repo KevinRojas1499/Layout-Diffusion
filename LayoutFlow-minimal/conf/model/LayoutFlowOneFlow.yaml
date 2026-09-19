@@ -31,6 +31,7 @@ model:
   num_cat: ${dataset.dataset.num_cat}
   inference_steps: 100
   insertion: oneflow
+  clock: coupled          # coupled: s_i = (t - tau_i) / (1 - tau_i) | decoupled: s_i ~ U(0,1) independent of t (any sampling clock policy is then on-distribution)
   t_max: 0.5              # reveal schedule kappa(t) = min(t / t_max, 1); 1.0 is much worse (see README)
   unmask_geom: gmm        # gmm: sample the clean box from the mixture | mean: point estimate
   add_loss: geom_l1_loss
