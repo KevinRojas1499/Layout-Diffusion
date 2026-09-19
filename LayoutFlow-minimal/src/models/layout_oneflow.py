@@ -30,9 +30,11 @@ from src.fid import FID_score
 class OneFlowTransformer(nn.Module):
     '''Class token + box latent + learned position (+ BOS); per-token box time only (the insertion heads see no time).'''
 
-    def __init__(self, num_cls, max_len, d_model=512, nhead=8, num_layers=4, dim_feedforward=2048, dropout=0.1, geom_dim=4):
+    def __init__(self, num_cls, max_len, d_model=512, nhead=8, num_layers=4, dim_feedforward=2048, dropout=0.1, geom_dim=4, time_input=False):
         super().__init__()
         self.BOS = num_cls
+        # time_input: also feed the sequence time t_text (Edit Flows' original); the paper omits it (Sec. 2.1.1)
+        self.time_text = nn.Sequential(nn.Linear(1, d_model), nn.SiLU(), nn.Linear(d_model, d_model)) if time_input else None
         self.tok = nn.Embedding(num_cls + 1, d_model)
         self.box = nn.Linear(geom_dim, d_model)
         self.pos = nn.Embedding(max_len + 1, d_model)
@@ -45,10 +47,12 @@ class OneFlowTransformer(nn.Module):
         self.Q = nn.Linear(d_model, num_cls)        # bag of tokens
         self.v = nn.Linear(d_model, geom_dim)       # box velocity
 
-    def forward(self, cls, box, t_box, pad_mask):
-        '''cls (B,L) incl. BOS at 0, box (B,L,4), t_box (B,L), pad_mask True = pad -> pi (B,L), lam (B,L), logQ (B,L,C), v (B,L,4)'''
+    def forward(self, cls, box, t_box, pad_mask, t_text=None):
+        '''cls (B,L) incl. BOS at 0, box (B,L,4), t_box (B,L), pad_mask True = pad, t_text (B,) -> pi (B,L), lam (B,L), logQ (B,L,C), v (B,L,4)'''
         B, L = cls.shape
         x = self.tok(cls) + self.box(box) + self.pos(torch.arange(L, device=cls.device)).unsqueeze(0) + self.time(t_box.unsqueeze(-1))
+        if self.time_text is not None:
+            x = x + self.time_text(t_text.view(-1, 1)).unsqueeze(1)
         h = self.norm(self.layers(x, src_key_padding_mask=pad_mask))
         return torch.sigmoid(self.pi(h)).squeeze(-1), F.softplus(self.lam(h)).squeeze(-1), F.log_softmax(self.Q(h), -1), self.v(h)
 
@@ -57,7 +61,7 @@ class LayoutOneFlow(BaseGenModel):
     def __init__(self, backbone_model=None, sampler=None, optimizer=None, scheduler=None, pretrained_dir='./pretrained',
                  format='xywh', fid_calc_every_n=20, dataset='RICO', num_cat=6, max_len=20, inference_steps=50,
                  d_model=512, nhead=8, num_layers=4, dim_feedforward=2048, dropout=0.1, box_loss_weight=1.0,
-                 ralf_cache=None, vis_dir=None):
+                 time_input=False, ralf_cache=None, vis_dir=None):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
         self.cond = 'uncond'
@@ -74,7 +78,7 @@ class LayoutOneFlow(BaseGenModel):
         self.sampler = sampler                      # the same [0,1] -> [-1,1] box preprocessing as LayoutFlowVarLen
         self.box_loss_weight = box_loss_weight
         self.loss_fcn = nn.MSELoss()                # only for base.validation_step's val_loss diagnostic
-        self.model = OneFlowTransformer(self.C, max_len, d_model, nhead, num_layers, dim_feedforward, dropout)
+        self.model = OneFlowTransformer(self.C, max_len, d_model, nhead, num_layers, dim_feedforward, dropout, time_input=time_input)
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
 
     # linear kappa: kappa(t) = t, kappa^{-1}(u) = u, hazard kappa'/(1-kappa) = 1/(1-t)
@@ -105,7 +109,7 @@ class LayoutOneFlow(BaseGenModel):
         g = lambda a: torch.gather(a, 1, order if a.dim() == 2 else order.unsqueeze(-1).expand_as(a))
         cls_t, box_t, tb_t = g(cls1) * live, g(xt) * live.unsqueeze(-1), g(t_box) * live
         cls_b, box_b, tb_b, mask_b = self._with_bos(cls_t, box_t, tb_t, live)
-        pi, lam, logQ, v = self.model(cls_b, box_b, tb_b, ~mask_b)
+        pi, lam, logQ, v = self.model(cls_b, box_b, tb_b, ~mask_b, tau_text.clamp(max=1.0))
         # insertion targets: a missing element j is pending in the gap after the number of present elements before j
         missing = m1 & ~present
         pos = present.int().cumsum(1) - present.int()
@@ -141,7 +145,7 @@ class LayoutOneFlow(BaseGenModel):
         while t < 1.0 - 1e-9 or bool(((tb < 1) & (torch.arange(S, device=dev).unsqueeze(0) < n.unsqueeze(1))).any()):
             live = torch.arange(S, device=dev).unsqueeze(0) < n.unsqueeze(1)
             cls_b, box_b, tb_b, mask_b = self._with_bos(cls, box, tb, live)
-            pi, lam, logQ, v = self.model(cls_b, box_b, tb_b, ~mask_b)
+            pi, lam, logQ, v = self.model(cls_b, box_b, tb_b, ~mask_b, torch.full((B,), min(t, 1.0), device=dev))
             # boxes: one Euler step on their own clocks
             d = (1 - tb).clamp(min=0, max=dt) * live
             box = box + d.unsqueeze(-1) * v[:, 1:]

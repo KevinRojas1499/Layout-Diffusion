@@ -25,4 +25,5 @@ model:
   dim_feedforward: 2048
   dropout: 0.1
   box_loss_weight: 1.0
+  time_input: false       # true: also feed t_text to the network (Edit Flows' original; the paper omits it)
   ralf_cache: null
