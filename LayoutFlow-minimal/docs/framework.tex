@@ -1,5 +1,6 @@
-% Variable-length multimodal denoising Markov models: an auxiliary structure state with an insertion process,
-% and per-coordinate generators with their own clocks. Self-contained; compile with pdflatex.
+% Variable-length multimodal generation as a stochastic interpolant with random insertion times:
+% an auxiliary process of inserted indices, one interpolant clock per coordinate, and a marginalised generator.
+% Self-contained; compile with pdflatex.
 \documentclass[11pt]{article}
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb,amsthm}
@@ -16,17 +17,19 @@
 \newcommand{\X}{\mathcal{X}}
 \newcommand{\Sa}{\mathcal{S}}
 \newcommand{\C}{\mathcal{C}}
+\newcommand{\A}{A}
 \newcommand{\gen}{\mathcal{L}}
-\newcommand{\rgen}{\overline{\mathcal{L}}}
 \newcommand{\E}{\mathbb{E}}
 \newcommand{\N}{\mathbb{N}}
 \newcommand{\R}{\mathbb{R}}
 \newcommand{\dd}{\,\mathrm{d}}
 \newcommand{\bu}{\bm{u}}
 \newcommand{\bx}{\bm{x}}
-\newcommand{\brho}{\bm{\rho}}
+\newcommand{\beps}{\bm{\varepsilon}}
+\newcommand{\btau}{\bm{\tau}}
+\newcommand{\Iu}{\mathrm{I}}
 
-\title{Denoising Markov models for variable-length multimodal data:\\ an insertion process on an auxiliary state, and one clock per coordinate}
+\title{Variable-length multimodal generation as a stochastic interpolant\\ with random insertion times}
 \author{}
 \date{}
 
@@ -34,119 +37,94 @@
 \maketitle
 
 \begin{abstract}
-We consider data $\bx\in\X^{D}$ of variable length $D$, where the coordinate space $\X$ may itself be multimodal. The length and, more generally, the \emph{shape} of the data is carried by an auxiliary state $s$ in a discrete space $\Sa$; conditioned on $s$, the data is a tuple of $D(s)$ coordinates. Generation is a Markov process with two kinds of generators: an \emph{insertion process} on $\Sa$, driven by a global clock $t$, whose jumps create (or remove) coordinates; and, conditioned on the current $s$, one denoising generator per coordinate, each driven by its own clock $u_d$. A coordinate is created at clock zero, i.e.\ from the reference measure of its own process, so the only learned objects are the reverse rates on $\Sa$ and the reverse generators of the coordinates. The clocks may be synchronised into a single time variable, but nothing requires it: training on the product law of the clocks licenses every monotone clock policy at sampling time. Ordinary multimodal diffusion, masked diffusion, Edit Flows and OneFlow are instances.
+We consider data $\bx_1\in\X^{D}$ of variable length $D$, where the coordinate space $\X$ may itself be multimodal. Generation is built from a stochastic interpolant with one extra source of randomness: every coordinate $i$ has an \emph{insertion time} $\tau_i$. Before $\tau_i$ the coordinate is not part of the state; at $\tau_i$ it is created from the reference measure of its own interpolant; from $\tau_i$ on it follows that interpolant on its own clock. The auxiliary process is the set of inserted indices. Conditioned on the datum and the noise, this is a jump--drift Markov process from the empty state to $\bx_1$; marginalising over datum and noise gives the generator of the generative model, whose coefficients are conditional expectations that are learned by regression. Because a coordinate is created at clock zero, its value at creation is independent of the state: no noisy-insertion kernel is ever modelled. Clocks may be synchronised into one time variable or left independent; training with the product law of the clocks licenses every monotone clock policy at sampling time.
 \end{abstract}
 
 \section{Setup}
 
 \paragraph{Coordinate space.}
-Let $\X=\X_1\times\dots\times\X_K$ be the state space of one coordinate; the factors are the \emph{modalities} (continuous, discrete, or otherwise). Each modality $k$ carries a \emph{noising process}, a Markov process on $\X_k$ with generator $\gen^{k}_{u}$ in its own time $u\in[0,1]$, whose fully noised law is a fixed reference $\pi_k$ reached \emph{exactly}. We write generation time throughout: $u=0$ is the reference end, $u=1$ the data end. Instances: the Gaussian path $x_u=u\,x_1+(1-u)\,\varepsilon$ with $\pi=\mathcal N(0,I)$, an absorbing (masked) CTMC with $\pi=\delta_{\mathrm{MASK}}$, any finite-time flow. A modality may be \emph{degenerate}: no noising process, its value is fixed when the coordinate is created (its clock jumps from $0$ to $1$). Write $\pi=\bigotimes_k\pi_k$.
+$\X=\X_1\times\dots\times\X_K$; the factors are the modalities. Modality $k$ has a reference measure $\pi_k$ and an \emph{interpolant} $\Iu^{k}(u;\varepsilon,x)$, $u\in[0,1]$, with $\Iu^k(0;\varepsilon,x)=\varepsilon$ and $\Iu^k(1;\varepsilon,x)=x$: the linear path $u\,x+(1-u)\,\varepsilon$ with $\pi_k=\mathcal N(0,I)$ on a Euclidean factor; the masked path ($\mathrm{MASK}$ until a $\mathrm{Unif}$ time, then $x$) with $\pi_k=\delta_{\mathrm{MASK}}$ on a discrete factor; any finite-time path on a manifold. A factor may be \emph{degenerate}: no interpolant, its value is fixed at creation (its clock jumps from $0$ to $1$). Write $\pi=\bigotimes_k\pi_k$ and $\Iu=(\Iu^k)_k$ for the coordinate interpolant, with one clock $u$ per coordinate (or one per factor, $u_{k}$, if wanted).
 
-\paragraph{Data space.}
+\paragraph{Data space and auxiliary state.}
+$\X^{*}=\bigsqcup_{D\ge 0}\X^{D}$. A countable set $\Sa$ carries the \emph{shape}: every $s\in\Sa$ determines an index set $\C(s)$ of coordinates, $|\C(s)|=D(s)$ (a count for sets, positions for sequences, nodes and edges for graphs). A datum is $(s_1,\bx_1)$ with $\bx_1=(x_{1,i})_{i\in\C(s_1)}$. During generation the auxiliary state is the set of inserted indices $\A\subseteq\C(s_1)$; the augmented state is
 \begin{equation}
-\X^{*}\;=\;\bigsqcup_{D\ge 0}\X^{D}.
+z=\bigl(\A,\ (x_i)_{i\in\A},\ (u_i)_{i\in\A}\bigr),
 \end{equation}
+where $u_i\in[0,1]$ is the clock of coordinate $i$. A global clock $t\in[0,1]$ drives the insertions.
 
-\paragraph{Auxiliary state.}
-Let $\Sa$ be a countable set. Every $s\in\Sa$ determines an index set of coordinates $\C(s)$ with $|\C(s)|=D(s)$: the length, and whatever else the shape of the data carries (an order, positions, a tree, a graph). Conditioned on $s$, the data is $\bx=(x_d)_{d\in\C(s)}\in\X^{D(s)}$. Examples: $\Sa=\N$ with $\C(n)=\{1,\dots,n\}$ and an exchangeable model (sets); $\Sa$ = strings with $\C(s)$ the positions (sequences); $\Sa$ = trees or graphs. A singleton $\Sa$ is a fixed shape and recovers ordinary multimodal diffusion.
+\section{The conditional process}
+\label{sec:conditional}
 
-\paragraph{Clocks.}
-A global clock $t\in[0,1]$ drives $\Sa$; every coordinate $d\in\C(s)$ carries its own clock $u_d\in[0,1]$ (if wanted, one clock per modality of the coordinate, $u_{d,k}$). The \emph{augmented state} is
+Fix a datum $(s_1,\bx_1)$. Draw independently, for every $i\in\C(s_1)$,
 \begin{equation}
-z=(s,\bx,\bu),\qquad \bx\in\X^{D(s)},\quad \bu\in[0,1]^{D(s)} .
+\tau_i\sim\kappa\quad(\Pr(\tau_i\le t)=\kappa(t)),\qquad \varepsilon_i\sim\pi ,
 \end{equation}
+and fix a \emph{clock policy}: non-decreasing $u_i(t)$ with $u_i(\tau_i)=0$, $\rho_i=\dd u_i/\dd t\ge0$. The auxiliary process and the conditional process are
+\begin{equation}
+\label{eq:condproc}
+\A_t=\{\,i:\tau_i\le t\,\},\qquad
+z_t=\Bigl(\A_t,\ \bigl(\Iu(u_i(t);\varepsilon_i,x_{1,i})\bigr)_{i\in\A_t},\ \bigl(u_i(t)\bigr)_{i\in\A_t}\Bigr).
+\end{equation}
+Coordinate $i$ is absent until $\tau_i$, appears at $\tau_i$ with value $\Iu(0)=\varepsilon_i$, and then follows its interpolant on its own clock. $z_0=(\emptyset)$ is the reference and $z_{\mathrm{end}}=(\C(s_1),\bx_1)$ is the datum: a stochastic interpolant from reference to data whose noise is $(\beps,\btau)$.
 
-\section{Noising construction: independent given the data}
-\label{sec:noising}
+Given $(\bx_1,\beps)$, \eqref{eq:condproc} is a Markov jump--drift process with \emph{conditional generator}
+\begin{equation}
+\label{eq:condgen}
+\begin{aligned}
+\gen^{\bx_1,\beps}_t f(z)\;=\;&\sum_{i\in\C(s_1)\setminus\A} h(t)\,\Bigl[f\bigl(z\cup\{(i,\varepsilon_i,0)\}\bigr)-f(z)\Bigr]
+&&\text{(insertion of the missing coordinates)}\\
+&+\sum_{i\in\A}\rho_i(t)\Bigl[\partial_u\Iu(u_i;\varepsilon_i,x_{1,i})\cdot\nabla_{x_i}f(z)+\partial_{u_i}f(z)\Bigr]
+&&\text{(interpolant drift on each clock)}
+\end{aligned}
+\end{equation}
+with $h(t)=\kappa'(t)/(1-\kappa(t))$ the hazard of $\tau_i$ given $\tau_i>t$. (For a discrete factor the drift term is the interpolant's jump generator; for a degenerate factor there is none.)
 
-Fix a datum $(s_1,\bx_1)$. The noising construction consists of two independent ingredients.
+\section{Marginalisation}
+
+The generative model is the Markov process with the same one-time marginals as the mixture of the conditional processes over $(s_1,\bx_1)\sim p_{\mathrm{data}}$ and $(\beps,\btau)$. Its generator is the conditional expectation of \eqref{eq:condgen} given the current state (the Markovian projection, i.e.\ the flow-matching argument for a jump--drift process):
+\begin{equation}
+\label{eq:margen}
+\begin{aligned}
+\gen_t f(z)\;=\;\E\bigl[\gen^{\bx_1,\beps}_t f(z)\,\big|\,z_t=z\bigr]
+\;=\;&h(t)\;\E\bigl[\,|\C(s_1)\setminus\A|\ \big|\ z\bigr]\;\sum_{c}p(c\mid z)\int\Bigl[f\bigl(z\cup\{(c,\xi,0)\}\bigr)-f(z)\Bigr]\pi(\dd\xi)\\
+&+\sum_{i\in\A}\rho_i(t)\Bigl[\E\bigl[\partial_u\Iu(u_i;\varepsilon_i,x_{1,i})\,\big|\,z\bigr]\cdot\nabla_{x_i}f(z)+\partial_{u_i}f(z)\Bigr],
+\end{aligned}
+\end{equation}
+where $c$ ranges over the values of the degenerate factors of a created coordinate (its \emph{type}) and $p(c\mid z)$ is the law of the type of a missing coordinate given $z$.
+
+\begin{proposition}[Marginal generator]
+\label{prop:marginal}
+For any clock policy with creation at clock zero, the mixture of the conditional processes \eqref{eq:condproc} has the one-time marginals of the Markov process with generator \eqref{eq:margen}.
+\end{proposition}
+
+Two facts do all the work.
 \begin{enumerate}
-\item \textbf{Noising on $\Sa$.} A CTMC on $\Sa$ started at $s_1$, with rates $\mu_t(s\to s')$ (in noising direction: deletions of coordinates in the simplest case, in general any edit of the shape). Its law at global time $t$ is $K_t(s_1,\cdot)$. When a coordinate leaves $\C(s)$ its value is discarded.
-\item \textbf{Noising of the coordinates.} Independently, every coordinate $d\in\C(s_1)$ runs its own noising process on its own clock: $x_d\mid x_{1,d}\sim k_{u_d}(x_{1,d},\cdot)$ with $k_u=\bigotimes_k k^{k}_{u}$ the transition kernel of $\gen^{k}$ (per modality, on the coordinate's clock).
+\item \textbf{Linearity.} The conditional generator is a sum over coordinates and conditional expectation is linear, so the marginal generator is the sum of the marginal generators of the components, each conditioned on the whole state. This is the multi-time decomposition of Diffuse Everything; no separate reversal theorem is needed.
+\item \textbf{Independence at creation.} For $i\notin\A_t$ the noise $\varepsilon_i$ has not entered the state, so $\varepsilon_i\perp z_t$ and the created value is drawn from $\pi$ unconditionally. This is the precise content of ``the noisy insertion is never modelled'': the insertion kernel is $\pi$ because a coordinate is created at clock $0$ of its interpolant. A policy that created a coordinate at $u_i>0$ would replace $\pi$ by the learned conditional $\mathrm{Law}(\Iu(u_i;\varepsilon_i,x_{1,i})\mid z)$.
 \end{enumerate}
-The joint law at times $(t,\bu)$ is therefore
-\begin{equation}
-\label{eq:product}
-p_{t,\bu}(s,\bx\mid s_1,\bx_1)\;=\;K_t(s_1,s)\prod_{d\in\C(s)}k_{u_d}(x_{1,d},x_d),
-\end{equation}
-a product over coordinates \emph{whose number and identity are random and determined by $s$}. This is the only structural assumption.
 
-\section{Generators}
-
-\subsection{Insertion process on \texorpdfstring{$\Sa$}{S}}
-
-In generation time the process on $\Sa$ runs with rates $\lambda_t(s\to s'\mid \bx,\bu)$, conditioned on the current data and clocks. A jump $s\to s'$ acts on the coordinates through the embedding
-\begin{equation}
-\iota_{s\to s'}(\bx,\bu;\xi)\;=\;\bigl((x_d)_{d\in\C(s)\cap\C(s')}\cup(\xi_d)_{d\in\C(s')\setminus\C(s)},\;(u_d)_{d\in\C(s)\cap\C(s')}\cup(0)_{d\in\C(s')\setminus\C(s)}\bigr):
-\end{equation}
-surviving coordinates keep their values and clocks, removed coordinates are dropped, created coordinates receive values $\xi_d$ and clock $0$. The generator is
-\begin{equation}
-\label{eq:genS}
-\rgen^{\Sa}_t f(s,\bx,\bu)\;=\;\sum_{s'\in\Sa}\lambda_t(s\to s'\mid\bx,\bu)\int\Bigl[f\bigl(s',\iota_{s\to s'}(\bx,\bu;\xi)\bigr)-f(s,\bx,\bu)\Bigr]\;\pi^{\otimes(\C(s')\setminus\C(s))}(\dd\xi).
-\end{equation}
-Created coordinates are drawn from the reference measure $\pi$ because they are created at clock $0$, where their law under~\eqref{eq:product} is $\pi$ independently of everything else.
-
-\subsection{Coordinate generators conditioned on \texorpdfstring{$s$}{s}}
-
-Conditioned on $s$, each coordinate $d\in\C(s)$ has a generator $\rgen^{(d)}_{u_d}[s,\bx,\bu]$ acting on $x_d$ only: the time reversal of $\gen$ at clock $u_d$, evaluated with the joint marginal~\eqref{eq:product}, i.e.\ conditioned on the whole state $(s,\bx,\bu)$. For a modality with a Gaussian path it is the velocity field $v(z;d)\approx\E[x_{1,d}-\varepsilon_d\mid z]$; for a diffusion, the reverse drift with the conditional score; for a CTMC, the reverse rate matrix with the conditional ratios. A clock policy assigns to every coordinate a non-decreasing $u_d(t)$ with $u_d=0$ at creation, $\rho_d=\dd u_d/\dd t\ge 0$; each coordinate generator also transports its own clock,
-\begin{equation}
-\label{eq:gend}
-\rho_d(t)\Bigl(\rgen^{(d)}_{u_d}[s,\bx,\bu]+\partial_{u_d}\Bigr).
-\end{equation}
-
-\subsection{Joint generator and reversal}
-
-\begin{equation}
-\label{eq:joint}
-\rgen_t\;=\;\rgen^{\Sa}_t\;+\;\sum_{d\in\C(s)}\rho_d(t)\Bigl(\rgen^{(d)}_{u_d}[s,\bx,\bu]+\partial_{u_d}\Bigr).
-\end{equation}
-The two kinds of generators act on different variables ($s$ and the $x_d$), so the sum is the generator of a Markov process on the augmented state, and they interact only through their coefficients: $\lambda_t$ reads the current coordinates and clocks, $\rgen^{(d)}$ reads $s$ and the other coordinates.
-
-\begin{theorem}[Reversal, informal]
-\label{thm:reversal}
-Under the noising construction of Section~\ref{sec:noising}, for any clock policy $\brho$ with creation at clock zero, the time reversal of the joint process is the Markov process with generator~\eqref{eq:joint}, where
-\begin{equation}
-\label{eq:lambda}
-\lambda_t(s\to s'\mid\bx,\bu)\;=\;\mu_t(s'\to s)\,\frac{p_{t,\bu}\bigl(s',(x_d)_{d\in\C(s)\cap\C(s')}\bigr)}{p_{t,\bu}\bigl(s,\bx\bigr)}
-\end{equation}
-is the CTMC reversal with the joint marginal, and each $\rgen^{(d)}$ is the single-modality reversal of $\gen$ at clock $u_d$ with the joint marginal.
-\end{theorem}
-
-\begin{proof}[Proof sketch]
-The construction is a product of independent processes given the data, one on $\Sa$ and one per coordinate, each with its own time; the multi-time reversal decomposition of Diffuse Everything applied to the augmented state gives a sum of single-component reversals with the joint marginal. In~\eqref{eq:lambda} the created coordinates do not appear in the ratio because their marginal at clock $0$ is $\pi$, which cancels; the same fact makes the creation kernel in~\eqref{eq:genS} equal to $\pi$.
-\end{proof}
-
-\begin{remark}[What is learned]
-Two families of objects: the reverse rates $\lambda_\theta(s\to s'\mid \bx,\bu)$ on $\Sa$, which in~\eqref{eq:lambda} is the known noising rate times a learned ratio (as in masked diffusion and Edit Flows), together with the types of created coordinates when the modalities are degenerate; and the reverse coordinate generators $\rgen^{(d)}_\theta$. No transition kernel between $s$ and the data is ever modelled: a policy that created a coordinate at $u_d>0$ would require, inside $\rgen^{\Sa}$, a learned conditional $p(x_d\mid s,\bx,\bu)$ at that noise level.
+\begin{remark}[Exchangeable coordinates]
+For sets the index $i$ is not observable in $z$ (only the multiset is), so the marginalisation also averages over \emph{which} missing coordinate is inserted; the insertion term collapses to hazard $\times$ expected missing count $\times$ type law, and the parametrisation must be permutation-equivariant. For sequences the position is observable after insertion and the conditional expectations are position-specific (Edit Flows).
 \end{remark}
 
-\section{Synchronising the clocks}
+\section{What is learned, and the loss}
 
-Any clock policy turns~\eqref{eq:joint} into a time-inhomogeneous Markov process in the single variable $t$: the clocks are functions of $t$ and of the creation times $\tau_d$, and each coordinate generator is reparametrised by $\rho_d(t)$. Three policies are of interest.
-\begin{itemize}
-\item \textbf{Synchronised.} $u_d(t)=(t-\tau_d)/(1-\tau_d)$, so $\rho_d=1/(1-\tau_d)$ and every coordinate reaches $u_d=1$ at $t=1$: one horizon, and a coordinate created late is denoised faster. If no coordinate is created after $t=0$ (fixed shape) this is $u_d\equiv t$, the single-time multimodal model.
-\item \textbf{Unit rate.} $u_d(t)=\min(t-\tau_d,1)$, $\rho_d=1$ while $u_d<1$; the run continues past $t=1$ until the last coordinate is clean.
-\item \textbf{Phase-separated.} $\rho_d=0$ while the insertion process is active, then all coordinates denoise together: first the shape, then the content.
-\end{itemize}
-None of them is privileged by the theory. Which one is licensed is decided by the law of the clocks at training time, Section~\ref{sec:training}.
-
-\section{Training}
-\label{sec:training}
-
-Sample a datum $(s_1,\bx_1)$, a global time $t\sim U(0,1)$ and clocks $u_d\sim U(0,1)$ independently for all $d\in\C(s_1)$; draw $(s,\bx)$ from~\eqref{eq:product}; minimise
+The coefficients of \eqref{eq:margen} are conditional expectations, learned by regression on conditional samples: draw $(s_1,\bx_1)$, $(\beps,\btau)$, times, build $z$ from \eqref{eq:condproc}, and minimise
 \begin{equation}
 \label{eq:loss}
-\E\Bigl[\ell^{\Sa}\bigl(\lambda_\theta(\,\cdot\mid \bx,\bu),\ s,\ s_1\bigr)\Bigr]\;+\;\E\Bigl[\sum_{d\in\C(s)}\ell^{(d)}\bigl(\rgen^{(d)}_\theta[s,\bx,\bu],\ x_{1,d},\ u_d\bigr)\Bigr],
+\E\Bigl[\,d_{\mathrm{Poisson}}\bigl(m_\theta(z),\ |\C(s_1)\setminus\A|\bigr)\Bigr]
++\E\Bigl[\,\mathrm{CE}\bigl(p_\theta(\cdot\mid z),\ c_j\bigr)\Bigr]
++\E\Bigl[\sum_{i\in\A}\bigl\|v_\theta(z;i)-\partial_u\Iu(u_i;\varepsilon_i,x_{1,i})\bigr\|^2\Bigr],
 \end{equation}
-where $\ell^{\Sa}$ is the loss of the reversal on $\Sa$ (a Bregman divergence for rates, cross-entropy for the types of created coordinates) and $\ell^{(d)}$ is the standard loss of the coordinate's process at its clock (flow matching, denoising score matching, or the masked-diffusion cross-entropy), each evaluated at the joint state.
+with $m_\theta(z)\approx\E[\,|\C(s_1)\setminus\A|\mid z]$ the expected missing count (the insertion intensity is $h(t)\,m_\theta$), $p_\theta(c\mid z)$ the type law ($j$ a uniformly chosen missing coordinate), and $v_\theta(z;i)\approx\E[\partial_u\Iu\mid z]$ the drift ($=\E[x_{1,i}-\varepsilon_i\mid z]$ for the linear path; for a discrete factor the corresponding term is the masked-diffusion cross-entropy). The Poisson Bregman divergence and the cross-entropy are the proper losses whose minimisers are the respective conditional expectations.
 
-\begin{remark}[Coupled versus decoupled clocks]
-Training with the product law $t\otimes\bigotimes_d u_d$ places training states everywhere in the time cube and licenses every clock policy at sampling time. Training instead with the push-forward of one policy, $u_d=\varphi(t,\tau_d)$, places them on the surface swept by that policy and licenses that policy only. Same model class, different law of the training times.
-\end{remark}
+\section{Clocks}
 
-\section{Design axes}
+\paragraph{Synchronising.}
+Any policy makes \eqref{eq:margen} a time-inhomogeneous Markov process in the single variable $t$. Synchronised clocks, $u_i(t)=(t-\tau_i)/(1-\tau_i)$ and $\rho_i=1/(1-\tau_i)$, bring every coordinate to $u_i=1$ at $t=1$ (a late coordinate is denoised faster); with a fixed shape this is $u_i\equiv t$, the single-time multimodal model. Unit-rate clocks, $u_i(t)=\min(t-\tau_i,1)$, continue past $t=1$ until the last coordinate is clean. Phase-separated clocks, $\rho_i=0$ while insertions are active, generate the shape first and the content afterwards.
 
-An instance has to choose: (i) $\Sa$ and its noising CTMC $\mu$ (which shape is grown and by which edits); (ii) which modalities of $\X$ are degenerate and which carry a noising process; (iii) the clock policy, a sampling-time choice under product-law training; (iv) the granularity of the clocks (per coordinate, per modality of a coordinate, per scalar), which decides which conditioning tasks are native time paths (a given value is a value held at clock $1$); (v) shape as a process on $\Sa$ versus shape as a value (a fixed maximal length with an ``absent'' symbol in $\X$), which the framework contains as $\Sa$ a singleton and which moves the modelling of absence into the coordinate processes.
+\paragraph{Coupled versus decoupled training.}
+The conditional expectations in \eqref{eq:margen} are defined at every point $(t,\bu)$ of the time cube, because the conditional law of $z$ at arbitrary $(t,\bu)$ is given by the same construction ($\A_t$ from $\btau$, $\Iu(u_i)$ from $(\varepsilon_i,x_{1,i})$). Training with the product law $t\otimes\bigotimes_i u_i$ learns them everywhere and licenses every clock policy at sampling time; training with $u_i=\varphi(t,\tau_i)$ learns them on the surface swept by that policy and licenses that policy only. Same model class, different law of the training times.
 
 \section{Instances}
 
@@ -154,22 +132,22 @@ An instance has to choose: (i) $\Sa$ and its noising CTMC $\mu$ (which shape is 
 \centering
 \begin{tabular}{@{}llll@{}}
 \toprule
- & $\Sa$ / edits & modalities of $\X$ & clocks \\
+ & shape $\Sa$ / insertion process & factors of $\X$ & clocks \\
 \midrule
-Diffuse Everything & singleton & fixed, each with a process & per modality, arbitrary paths \\
-Masked diffusion & singleton & absorbing tokens & one \\
+Diffuse Everything & fixed & each with an interpolant & per factor, arbitrary paths \\
+Masked diffusion & fixed & absorbing tokens & one \\
 Edit Flows & sequences; insert / delete / substitute & all degenerate & --- \\
 OneFlow & sequences; insert / delete / substitute & text degenerate, image Gaussian & unit rate, with a tail \\
-Ours (layouts) & sets; insertions & class degenerate, box Gaussian & synchronised (coupled) / any (decoupled) \\
+Ours (layouts) & sets; insertions with $\tau_i\sim\kappa$ & class degenerate, box Gaussian & synchronised (coupled) / any (decoupled) \\
 \bottomrule
 \end{tabular}
 \caption{Existing models as instances.}
 \end{table}
 
-Permutation invariance is not part of the framework: it enters only through $\Sa=\N$ and an equivariant parametrisation of $\lambda_\theta$ and $\rgen_\theta$. For sequences, $\Sa$ is the set of strings with positioned edits and the coordinate machinery is unchanged; for graphs, nodes and edges are coordinates with their own clocks.
+Permutation invariance is not part of the construction; it enters through $\Sa=\N$ and an equivariant parametrisation. Deletions and substitutions (Edit Flows, OneFlow) are further edits of the auxiliary process, with removed coordinates dropped from the state; the interpolant machinery per coordinate is unchanged.
 
 \begin{example}[Layouts]
-$\X=\mathcal Y\times\R^4$ with the class $y$ degenerate and the box $x$ on the Gaussian path; $\Sa=\N$ with exchangeable coordinates. The noising CTMC deletes each coordinate at an i.i.d.\ time with $\Pr(\tau\le t)=\kappa(t)$; by~\eqref{eq:lambda} its reversal is an insertion process with intensity $\lambda_t(n\to n+1\mid\bx,\bu)=\frac{\kappa'(t)}{1-\kappa(t)}\,\E[\,D(s_1)-n\mid z\,]$, and the class of the created coordinate is drawn from a learned $p_\theta(y\mid z)$; the box of the created coordinate is $\mathcal N(0,I)$. Each box has the generator $\rho_d(t)\,v_\theta(z;d)\cdot\nabla_{x_d}$ on its own clock. The synchronised, unit-rate and phase-separated policies are the three of Section~4.
+$\X=\mathcal Y\times\R^4$, class degenerate, box on the linear path; $\Sa=\N$, exchangeable coordinates; $\kappa(t)=\min(t/t_{\max},1)$, so insertions stop at $t_{\max}$ and only denoising remains afterwards. By \eqref{eq:margen} the insertion intensity is $\frac{\kappa'(t)}{1-\kappa(t)}\,m_\theta(z)$ with a class drawn from $p_\theta(y\mid z)$ and a box from $\mathcal N(0,I)$; each box then follows $\rho_i(t)\,v_\theta(z;i)$ on its own clock.
 \end{example}
 
 \end{document}
