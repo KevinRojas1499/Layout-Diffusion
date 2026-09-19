@@ -291,6 +291,34 @@ conditional-mix penalty: uncond 3.15 -> 2.53 (the uncond-only variable-length mo
 0.84, C->S+P 1.42 -> 1.36, C+S->P and completion unchanged. Completion with the model's own length (2.9 vs
 LayoutFlow's 1.51 with the length given) stays the weakest variable-length task.
 
+## Clock ablation (RICO, paper protocol, uncond x 5 runs): coupled vs decoupled per-element clocks, three sampling policies
+
+Per-element clocks (`insertion=oneflow`): an inserted box starts from pure noise on its own clock `u_i`. *Coupled*
+training (`model.clock=coupled`, default) sets `u_i = (t - tau_i)/(1 - tau_i)`, i.e. the states of the synchronised
+sampler; *decoupled* training (`model.clock=decoupled`) draws `u_i ~ U(0,1)` independently of `t` (the product law
+of the times), so every monotone clock policy is on-distribution. Sampling policies (`+sampling.clock=`): `sync`
+(all boxes clean at t = 1), `unit` (unit-rate clocks, the run continues past t = 1 until every box is clean,
+OneFlow's numerics), `insert_first` (clocks frozen until kappa = 1, then all boxes denoised together). Commit 8f09388.
+
+| training | sync | unit | insert_first |
+|---|---|---|---|
+| coupled, uncond-only (`rico-oneflow-continuous`, ep 1274) | **2.35 +/- 0.07** (earlier seed 2.29) | 3.62 +/- 0.08 | 2.43 +/- 0.18 |
+| coupled, random5 + cond_input (`rico-oneflow-random5-condin`, ep 1424) | 2.48 +/- 0.13 (earlier 2.53) | 4.17 +/- 0.29 | **2.33 +/- 0.09** |
+| decoupled, uncond-only (`rico-oneflow-decoupled`, ep 1924) | 4.17 +/- 0.05 | 4.32 +/- 0.06 | 3.76 +/- 0.14 |
+| decoupled, random5 + cond_input (`rico-oneflow-decoupled-random5-condin`, ep 1424) | 2.59 +/- 0.16 | 2.67 +/- 0.12 | 2.57 +/- 0.04 |
+
+Conditional tasks of the decoupled random5 model (sync clocks): refinement 0.88 / 0.688, C->S+P 1.47 / 0.328,
+C+S->P 1.26 / 0.42, completion 2.93 / 0.5 (coupled: 0.84, 1.36, 1.11, 2.92).
+
+Reading: (1) the coupled model is licensed only on its own surface -- unit-rate clocks (never seen in training) lose
+1.3-1.7 FID, while `insert_first` sits on the boundary of the trained states and is fine (best number for the
+random5 model, within noise). (2) The decoupled model supports all three policies with at most 0.1 between them,
+as the theory says, but pays for the generality: the unconditional model is far worse (4.2 vs 2.35; its
+validation FID was still creeping down at 2,000 epochs -- the training budget is spent on states the synchronised
+sampler never visits), the random5 model is only slightly worse (2.59 vs 2.48; its conditional quarters already put
+elements at heterogeneous clocks). No policy beats `sync` on the decoupled models. Conclusion: coupled clocks are
+the method; the grid is the experimental content of the "the clock policy is a training-time choice" statement.
+
 ## Content-aware generation on CGL (RALF release, RALF's evaluator, test split)
 
 Setup: `src.data.CGL` + frozen DINOv2-small canvas tokens (8x8 grid + saliency, `scripts/precompute_canvas_feats.py`)
