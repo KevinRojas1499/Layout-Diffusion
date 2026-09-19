@@ -272,6 +272,25 @@ Start-time sweep on the unmasking checkpoint (test split, so *not* used for sele
 0.95 -> 0.98 / 0.632, 0.97 -> 1.10 / 0.679, 0.985 -> 2.47 / 0.708, 0.995 -> 27.3 / 0.703. FID and fidelity trade
 off; no setting dominates LayoutFlow's point.
 
+## All tasks from one model: `model.cond=random5` (RICO, paper protocol, full test set, max-IoU)
+
+random5 = random4's four quarters plus a refinement fifth (t drawn in [0.9, 1], the noisy-layout start state), so the
+refinement task is trained rather than inherited. Best-by-val checkpoints; uncond over 5 runs, the rest single.
+
+| Model | uncond | refinement | C->S+P | C+S->P | completion |
+|---|---|---|---|---|---|
+| LayoutFlow paper | 2.37 | **0.77** / **0.700** | 1.48 / 0.322 | **1.03** / 0.470 | 1.51 / **0.741** |
+| Fixed length (unmasking), random5 (`rico-elemmask-gmm-t050-random5`, ep 1149) | **2.15 +/- 0.10** | 0.78 / 0.690 | **1.27** / 0.335 | 1.15 / 0.441 | **1.66** / 0.613 |
+| Variable length, random5 + cond_input (`rico-varlen-gmm-t050-random5-condin`, ep 1524) | 3.15 +/- 0.17 | 0.90 / 0.689 | 1.42 / 0.333 | 1.12 / 0.443 | 2.91 / 0.524 (own length) |
+| Variable length, OneFlow-style insertion, random5 + cond_input (`rico-oneflow-random5-condin`, ep 1424) | 2.53 +/- 0.17 | 0.84 / 0.688 | 1.36 / 0.339 | 1.11 / 0.453 | 2.92 / 0.532 (own length) |
+
+The refinement fifth is free: the fixed-length random5 model is better than the uncond-only one on *every* task
+(uncond 2.15 vs 2.41, refinement 0.78 vs 1.10) and matches LayoutFlow's refinement point. For the variable-length
+model, per-element clocks (OneFlow-style insertion from pure noise, see the ablation below) remove most of the
+conditional-mix penalty: uncond 3.15 -> 2.53 (the uncond-only variable-length model is 2.55), refinement 0.90 ->
+0.84, C->S+P 1.42 -> 1.36, C+S->P and completion unchanged. Completion with the model's own length (2.9 vs
+LayoutFlow's 1.51 with the length given) stays the weakest variable-length task.
+
 ## Content-aware generation on CGL (RALF release, RALF's evaluator, test split)
 
 Setup: `src.data.CGL` + frozen DINOv2-small canvas tokens (8x8 grid + saliency, `scripts/precompute_canvas_feats.py`)
@@ -404,7 +423,7 @@ schedule) matches our variable-length model within noise, so the gain over the d
 continuous set formulation, not from the specific insertion mechanism. The OneFlow-style variant (same per-element
 rates, but an inserted box starts from pure noise on its own clock, `t_elem = (t - tau) / (1 - tau)`, instead of
 being revealed from the GMM head at insertion) is *better* than both, 2.29 vs 2.53 / 2.55 (noise ~0.1) -- so, as a
-finding rather than a baseline, per-element clocks are a design worth adopting; it is not yet run with the
-conditional mix (`cond=random5`), all three rows here are unconditional-only models. 128-bin discrete
+finding rather than a baseline, per-element clocks are a design worth adopting (all three rows here are
+unconditional-only models; with the random5 mix the OneFlow-style model scores 2.53 vs 3.15, see the random5 table). 128-bin discrete
 tokens: finer bins make the discrete baseline *worse* (8.80 vs 6.43 at 1,000 steps), so 32 bins is its best setting.
 Ablation complete.
