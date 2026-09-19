@@ -345,3 +345,9 @@ shows its value, as CONTENT_AWARE.md's risk section anticipated. Late checkpoint
 ones for every run (residual memorisation), so validation-FID checkpoint selection is part of the recipe.
 Gated cross-attention (tanh gate, zero-init; the ungated version did not train) is running as
 `cgl-varlen-canvas-crossg-regflip`.
+
+**Gated cross-attention canvas** (`backbone_model.ctx_mode=cross`, tanh gate zero-initialised; elements self-attend
+among themselves only and read the canvas through a separate gated sub-layer, LayoutGD's structure), dropout +
+hflip, best-by-val epoch 559, test split: **FID 2.41**, Occ 0.150, Rea 0.023, Und_l 0.937, **Und_s 0.800**,
+**Ove 0.0115**, count MAE 1.47. Best canvas model so far (prepend: 3.32 / 0.734 / 0.020); slightly less canvas use
+(occlusion 0.150 vs 0.144). Ungated cross-attention did not train (flat flow loss); the zero-init gate fixed it.
