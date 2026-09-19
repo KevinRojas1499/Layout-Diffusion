@@ -73,9 +73,9 @@ class Block(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, timestep, key_padding_mask=None, ctx=None, ctx_padding_mask=None):
+    def forward(self, x, timestep, key_padding_mask=None, ctx=None, ctx_padding_mask=None, attn_bias=None):
         x = self.norm1(x, timestep)
-        x = x + self.dropout1(self.self_attn(x, x, x, key_padding_mask=key_padding_mask, need_weights=False)[0])
+        x = x + self.dropout1(self.self_attn(x, x, x, key_padding_mask=key_padding_mask, attn_mask=attn_bias, need_weights=False)[0])
         if self.cross and ctx is not None:
             q = self.norm_c(x)
             x = x + torch.tanh(self.cross_gate) * self.dropout_c(self.cross_attn(q, ctx, ctx, key_padding_mask=ctx_padding_mask, need_weights=False)[0])
@@ -89,9 +89,9 @@ class TransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
         self.norm = norm
 
-    def forward(self, x, timestep, key_padding_mask=None, ctx=None, ctx_padding_mask=None):
+    def forward(self, x, timestep, key_padding_mask=None, ctx=None, ctx_padding_mask=None, attn_bias=None):
         for layer in self.layers:
-            x = layer(x, timestep, key_padding_mask=key_padding_mask, ctx=ctx, ctx_padding_mask=ctx_padding_mask)
+            x = layer(x, timestep, key_padding_mask=key_padding_mask, ctx=ctx, ctx_padding_mask=ctx_padding_mask, attn_bias=attn_bias)
         return self.norm(x)
 
 

@@ -27,7 +27,7 @@ class VarLenBackbone(nn.Module):
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
                  num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64,
-                 cond_input=False, elem_rates=False, ctx_mode='prepend'):
+                 cond_input=False, elem_rates=False, ctx_mode='prepend', geo_bias=False):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -38,6 +38,12 @@ class VarLenBackbone(nn.Module):
         self.type_embed = nn.Embedding(num_cat + 1, latent_dim)      # num_cat = [MASK]
         self.elem_embed = nn.Linear(2 * latent_dim, d_model)
         self.global_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # LayoutGD-style edge features: the attention between two elements is biased by their relative geometry
+        # (offsets, size ratios, edge alignment, intersection, containment), computed from the current boxes
+        self.geo_bias, self.nhead = geo_bias, nhead
+        if geo_bias:
+            self.edge_mlp = nn.Sequential(nn.Linear(14, 64), nn.GELU(), nn.Linear(64, nhead))
+            nn.init.zeros_(self.edge_mlp[-1].weight); nn.init.zeros_(self.edge_mlp[-1].bias)    # starts as plain attention
         # conditional training (cond=random4): the network must see which elements / coordinates are given,
         # otherwise "all visible because given" and "all visible because insertion is done" are indistinguishable
         self.cond_input = cond_input
@@ -63,6 +69,24 @@ class VarLenBackbone(nn.Module):
         self.cls_cond = nn.Embedding(num_cat, d_model)
         self.gmm_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
                                       nn.Linear(d_model, self.K * (1 + 2 * self.geom_dim)))
+
+    def edge_features(self, geom: Tensor, visible: Tensor) -> Tensor:
+        '''geom (B,S,4) cx,cy,w,h in [-1,1] space, visible (B,S) -> (B,S,S,14) pairwise features (0 where either is not visible)'''
+        cx, cy, w, h = geom.unbind(-1)
+        l, r, tp, bt = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+        d = lambda a: a.unsqueeze(2) - a.unsqueeze(1)                                     # (B,S,S): i minus j
+        eps = 1e-3
+        iw = (torch.minimum(r.unsqueeze(2), r.unsqueeze(1)) - torch.maximum(l.unsqueeze(2), l.unsqueeze(1))).clamp(min=0)
+        ih = (torch.minimum(bt.unsqueeze(2), bt.unsqueeze(1)) - torch.maximum(tp.unsqueeze(2), tp.unsqueeze(1))).clamp(min=0)
+        inter = iw * ih
+        area = (w.clamp(min=eps) * h.clamp(min=eps))
+        contain_ij = ((l.unsqueeze(2) <= l.unsqueeze(1)) & (r.unsqueeze(2) >= r.unsqueeze(1)) & (tp.unsqueeze(2) <= tp.unsqueeze(1)) & (bt.unsqueeze(2) >= bt.unsqueeze(1))).float()
+        f = torch.stack([d(cx), d(cy), torch.log(w.clamp(min=eps)).unsqueeze(2) - torch.log(w.clamp(min=eps)).unsqueeze(1),
+                         torch.log(h.clamp(min=eps)).unsqueeze(2) - torch.log(h.clamp(min=eps)).unsqueeze(1),
+                         d(l).abs(), d(r).abs(), d(tp).abs(), d(bt).abs(), d(cx).abs(), d(cy).abs(),
+                         inter / area.unsqueeze(1), inter / area.unsqueeze(2), contain_ij, contain_ij.transpose(1, 2)], -1)
+        both = (visible.unsqueeze(2) & visible.unsqueeze(1)).unsqueeze(-1)
+        return f * both
 
     def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None,
                 t_elem: Tensor = None, ctx_hide: Tensor = None):
@@ -93,7 +117,14 @@ class VarLenBackbone(nn.Module):
                 cross_hide = cross_hide.clone(); cross_hide[cross_hide.all(1), 0] = False
         if t_elem is not None:
             t = torch.cat([t.unsqueeze(1).expand(-1, n_pre), t_elem], dim=1)
-        h = self.transformer(x, timestep=t, key_padding_mask=hidden, ctx=cross_ctx, ctx_padding_mask=cross_hide)
+        attn_bias = None
+        if self.geo_bias:
+            visible = exists & (cat != self.mask_id)
+            B, L = hidden.shape
+            bias = torch.zeros(B, L, L, self.nhead, device=x.device)
+            bias[:, n_pre:, n_pre:] = self.edge_mlp(self.edge_features(geom, visible))
+            attn_bias = bias.permute(0, 3, 1, 2).reshape(B * self.nhead, L, L)
+        h = self.transformer(x, timestep=t, key_padding_mask=hidden, ctx=cross_ctx, ctx_padding_mask=cross_hide, attn_bias=attn_bias)
         h_glob, h = h[:, 0], h[:, n_pre:]
         ins_rate = F.softplus(self.ins_head(h_glob)).squeeze(-1)
         extra = {'h_glob': h_glob, 'elem_rate': F.softplus(self.elem_ins_head(h)).squeeze(-1) if self.elem_rates else None}
