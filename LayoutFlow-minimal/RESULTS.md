@@ -371,9 +371,20 @@ bias** (`backbone_model.geo_bias=true`, LayoutGD's edge features; ep 359 / 999):
 Und_s 0.726 / **0.777**, Ove 0.0113 / **0.0091** (lowest overlap of any run), count 1.42 / 1.40 -> the edge
 features help exactly the geometric metrics. Running the full recipe: cross + dropout + hflip + geo bias
 (`cgl-varlen-canvas-crossg-regflip-geo`).
-Early test-split score of that run at its first FID-selected checkpoint (ep 239, val FID 1.56): FID **1.94**, Occ
-0.151, Rea 0.023, Und_l 0.894, Und_s 0.662, Ove 0.014, count 1.63 -- the best FID of any canvas model so far, but
-underlay/count are behind the later checkpoints of the other runs; final best/last rows will follow when it ends.
+**Full recipe result** (`cgl-varlen-canvas-crossg-regflip-geo`, val FID kept improving to 1.19 at ep 689; test
+split, best-by-val ep 689 / last ep 999):
+
+| checkpoint | FID | Occ | Rea | Und_l | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|---|
+| cross + dropout + hflip + geo bias, ep 689 / 999 | **1.53** / 1.72 | 0.148 / 0.147 | 0.023 | 0.933 / 0.929 | 0.784 / 0.781 | **0.0097** / **0.0089** | 1.54 / 1.54 |
+| previous best canvas model (cross + dropout + hflip, ep 559) | 2.41 | 0.150 | 0.023 | 0.937 | 0.800 | 0.0115 | 1.47 |
+| RALF (their released outputs) | 1.32 | 0.126 | 0.018 | 0.992 | 0.978 | 0.0042 | 1.08 |
+| real test layouts (ceiling) | 0.80 | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
+
+The geometric bias closes most of the FID gap to RALF (2.41 -> 1.53, RALF 1.32) and gives the lowest overlap of any
+run, at a small cost in strict underlay (0.78 vs 0.80) and count (1.54 vs 1.47). The early ep-239 checkpoint of the
+same run scored FID 1.94 / Und_s 0.66, so the underlay metric is the one that needs the long training. What remains
+between us and RALF is the underlay/occlusion/count triple, i.e. how well the canvas is *used*, not the layout prior.
 
 
 ### Edit Flows ablation on RICO (paper protocol)
