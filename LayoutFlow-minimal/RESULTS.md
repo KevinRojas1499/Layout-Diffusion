@@ -376,3 +376,10 @@ dropout (`cgl-varlen-canvas-crossg-flip`).
 The CTMC Euler sampler needs many steps; the 1,000-step number is the fair one. Running: the same with 128-bin
 tokens (RALF's resolution), and the continuous set-based Edit-Flow / OneFlow-style variants built with our machinery
 (labelled as such).
+
+Gated cross-attention + hflip without dropout (ep 449 / 999): FID 3.49 / 3.65, Occ 0.145, Und_s 0.683 / 0.712,
+Ove 0.018, count 1.42 / 1.38 -> dropout is needed for the cross design too. Same + **pairwise geometric attention
+bias** (`backbone_model.geo_bias=true`, LayoutGD's edge features; ep 359 / 999): FID 2.93 / 3.38, Occ 0.143,
+Und_s 0.726 / **0.777**, Ove 0.0113 / **0.0091** (lowest overlap of any run), count 1.42 / 1.40 -> the edge
+features help exactly the geometric metrics. Running the full recipe: cross + dropout + hflip + geo bias
+(`cgl-varlen-canvas-crossg-regflip-geo`).
