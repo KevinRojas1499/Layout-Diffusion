@@ -40,7 +40,7 @@ checkpoint of a 2,000-epoch run unless stated. Details and the other metrics are
 | **Baselines, strictly as published** | discrete Edit Flow, LayoutDM 32-bin tokens, 100 / 1,000 steps (5 runs) | 13.25 / 6.43 |
 | | discrete Edit Flow, 128-bin tokens, 100 / 1,000 steps (5 runs) | 14.90 / 8.80 |
 | | OneFlow (interleaved schedule, no time input, unweighted loss), 50 / 100 / 1,000 steps (5 runs) | 63.0 / 66.2 / 75.7 |
-| | OneFlow + t_text input (Edit Flows' original), 50 / 100 steps (5 runs) | 3.31 / 3.38 |
+| | OneFlow + t_text input (Edit Flows' original), 50 / 100 / 1,000 steps (5 runs) | **3.31** / 3.38 / 5.31 |
 | **Length** | fixed length (unmasking), GMM, t_max 0.5 (5 runs; single) | 2.41 +/- 0.08 (2.30) |
 | | variable length (insertion), GMM, t_max 0.5 (5 runs; single) | 2.55 +/- 0.08 (2.43) |
 | **Reveal head** (fixed length) | GMM / point-estimate mean / single Gaussian | 2.30 / 2.39 / 2.39 |
@@ -502,4 +502,24 @@ being revealed from the GMM head at insertion) is *better* than both, 2.29 vs 2.
 finding rather than a baseline, per-element clocks are a design worth adopting (all three rows here are
 unconditional-only models; with the random5 mix the OneFlow-style model scores 2.53 vs 3.15, see the random5 table). 128-bin discrete
 tokens: finer bins make the discrete baseline *worse* (8.80 vs 6.43 at 1,000 steps), so 32 bins is its best setting.
-Ablation complete.
+
+**OneFlow baseline** (`src/models/layout_oneflow.py`, commits 1272906 / 589c1d2; RICO, 2,000 epochs, best-by-val,
+uncond x 5 runs). A faithful port of Nguyen et al. 2025: a *sequence* of elements in dataset order, insertion-only
+Edit Flow with kappa_t = t, per-gap zero-inflated Poisson (pi by BCE, lambda_nonzero by Poisson NLL) and
+bag-of-tokens heads, each element's box a continuous latent born as N(0, I) at t_box = 0 on the interleaved time
+schedule (tau_text in [0, 2], tau_box = tau_text - kappa^{-1}(u)), unit-rate box clocks, Alg. 1-2 sampler (runs to
+t = 2). One layout-specific choice: every element is one mixed token (class + box latent) rather than a class token
+followed by a separate `<|box|>` token, which would only add malformed sequences.
+
+| variant | 50 steps (paper default) | 100 | 1,000 |
+|---|---|---|---|
+| as published: no time input to the insertion heads, unweighted loss (`rico-oneflow-baseline`) | 63.0 +/- 0.8 | 66.2 +/- 0.8 | 75.7 +/- 0.5 |
+| + t_text fed to the network, Edit Flows' original (`rico-oneflow-baseline-t`, `model.time_input=true`) | **3.31 +/- 0.17** | 3.38 +/- 0.09 | 5.31 +/- 0.18 |
+
+The published recipe collapses here: every sample saturates the 20-element cap. The insertion heads are calibrated
+on training states (predicted missing 6.6 vs true 6.6 at t = 0.3, 3.0 vs 2.8 at t = 0.7) but, seeing no time, keep
+a residual 0.47 expected missing at t = 1 where nothing is missing, and the hazard 1/(1-t) of the linear schedule
+amplifies that residual without bound in the last steps (more steps = worse). Feeding t lets the heads learn
+"nothing is missing at t = 1" exactly and turns 63 into 3.3 -- one FID point behind our per-element-clock model
+(2.29 / 2.35) and 0.8 behind our masked-reveal model (2.55); more sampling steps hurt it (5.31 at 1,000), the
+usual sign of a slightly mis-calibrated insertion rate integrated over a longer path. Ablation complete.
