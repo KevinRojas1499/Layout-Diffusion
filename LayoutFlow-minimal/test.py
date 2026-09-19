@@ -73,8 +73,7 @@ def main(cfg: DictConfig):
         # LayoutFlowDiscrete/VarLen keep the backbone and sampler out of the checkpoint's hparams;
         # rebuild those from the model config (its architecture knobs must match the training run)
         hparams = torch.load(cfg.checkpoint, map_location='cpu', weights_only=False)['hyper_parameters']
-        rebuilt = {} if ('backbone_model' in hparams or 'backbone_model' not in cfg.model) else \
-            {'backbone_model': instantiate(cfg.model.backbone_model), 'sampler': instantiate(cfg.model.sampler)}
+        rebuilt = {k: instantiate(cfg.model[k]) for k in ('backbone_model', 'sampler') if k in cfg.model and k not in hparams}
         model = hydra.utils.get_class(cfg.model._target_).load_from_checkpoint(
             cfg.checkpoint, map_location=device, pretrained_dir=cfg.pretrained_dir, **rebuilt)
         model.inference_steps = cfg.inference_steps

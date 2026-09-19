@@ -1,0 +1,28 @@
+# @package _global_
+# OneFlow (Nguyen et al. 2025) on layouts: the mixed-modal variable-length baseline. A sequence of elements in
+# the dataset's order; insertion-only Edit Flow (kappa_t = t, zero-inflated Poisson + bag-of-tokens heads, no
+# time input for the insertion heads) over the classes, each element's box a continuous latent inserted as
+# N(0, I) at t_box = 0 and flow-matched on its own unit-rate clock (interleaved time schedule, App. D.1).
+# See src/models/layout_oneflow.py.
+model:
+  _target_: src.models.layout_oneflow.LayoutOneFlow
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: reduce_on_plateau
+  sampler:
+    _target_: src.sampler.GaussianSampler
+    out_dim: 4
+  pretrained_dir: ???
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  num_cat: ${dataset.dataset.num_cat}
+  max_len: ${data.max_len}
+  inference_steps: 50     # the paper's image sampler: Euler, 50 steps (the run continues to t = 2 at unit rate)
+  d_model: 512
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.1
+  box_loss_weight: 1.0
+  ralf_cache: null
