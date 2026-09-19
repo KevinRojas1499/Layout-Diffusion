@@ -351,3 +351,10 @@ among themselves only and read the canvas through a separate gated sub-layer, La
 hflip, best-by-val epoch 559, test split: **FID 2.41**, Occ 0.150, Rea 0.023, Und_l 0.937, **Und_s 0.800**,
 **Ove 0.0115**, count MAE 1.47. Best canvas model so far (prepend: 3.32 / 0.734 / 0.020); slightly less canvas use
 (occlusion 0.150 vs 0.144). Ungated cross-attention did not train (flat flow loss); the zero-init gate fixed it.
+
+Final v3 rows for the remaining runs (test split, best-by-val / last): flip only (ep 319 / 999) FID 3.58 / 4.86,
+Occ 0.135 / 0.132, Rea 0.021, Und_s 0.723 / 0.741, Ove 0.013 / 0.012, count MAE 1.34 / 1.32; gated cross-attention +
+dropout + flip (ep 559 / 999) FID 2.41 / 2.77, Occ 0.150 / 0.149, Rea 0.023, Und_s 0.800 / 0.810, Ove 0.0115 / 0.0104,
+count 1.47 / 1.44. So hflip removes memorisation without costing canvas use, token dropout buys FID at the cost of
+canvas use, and gated cross-attention gives the geometric gains. Next run: gated cross-attention + hflip, no
+dropout (`cgl-varlen-canvas-crossg-flip`).
