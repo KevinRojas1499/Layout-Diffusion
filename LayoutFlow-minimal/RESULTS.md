@@ -428,8 +428,16 @@ split, best-by-val ep 689 / last ep 999):
 | RALF (their released outputs) | 1.32 | 0.126 | 0.018 | 0.992 | 0.978 | 0.0042 | 1.08 |
 | real test layouts (ceiling) | 0.80 | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
 
+| same recipe with per-element clocks (`insertion=oneflow`, `cgl-oneflow-canvas-crossg-regflip-geo`, ep 399 / 999) | 2.28 / 2.72 | 0.153 / 0.151 | 0.023 | 0.912 / 0.931 | 0.716 / 0.777 | 0.0102 / **0.0073** | 1.64 / 1.59 |
+
 The geometric bias closes most of the FID gap to RALF (2.41 -> 1.53, RALF 1.32) and gives the lowest overlap of any
-run, at a small cost in strict underlay (0.78 vs 0.80) and count (1.54 vs 1.47). The early ep-239 checkpoint of the
+run, at a small cost in strict underlay (0.78 vs 0.80) and count (1.54 vs 1.47). Per-element clocks, which win by
+0.25 FID on RICO, do *not* transfer to CGL: same recipe, FID 2.28 vs 1.53, strict underlay 0.72 vs 0.78, count 1.64
+vs 1.54 (only overlay improves, 0.0073 at the last checkpoint); its validation FID plateaued at 1.68 (ep 399) where
+the GMM-reveal run kept improving to 1.19. A plausible reason is that on CGL an element's box is strongly determined
+by the canvas and the other elements at the moment it is inserted (underlay under text, text beside the product),
+so revealing it from a posterior sample is a better start than pure noise; on RICO the box posterior at insertion is
+broad. GMM reveal stays the CGL recipe. The early ep-239 checkpoint of the
 same run scored FID 1.94 / Und_s 0.66, so the underlay metric is the one that needs the long training. What remains
 between us and RALF is the underlay/occlusion/count triple, i.e. how well the canvas is *used*, not the layout prior.
 
