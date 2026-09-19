@@ -393,6 +393,7 @@ between us and RALF is the underlay/occlusion/count triple, i.e. how well the ca
 |---|---|
 | Discrete Edit Flow, LayoutDM 32-bin tokens, 100 sampling steps (5 runs) | 13.25 +/- 0.43 |
 | same checkpoint, 1,000 sampling steps (the demo's default) | **6.43** |
+| Discrete Edit Flow, 128-bin tokens (RALF's resolution), 100 / 1,000 steps (5 runs) | 14.90 +/- 0.72 / 8.80 +/- 0.48 |
 | Continuous set Edit-Flow variant with our machinery (`insertion=editflow`, best-val ckpt ep 1899, 5 runs) | 2.53 +/- 0.11 |
 | Continuous set OneFlow-style variant with our machinery (`insertion=oneflow`, best-val ckpt ep 1274, 5 runs) | **2.29 +/- 0.14** |
 | LayoutDM (paper) / LayoutFlow (paper) / ours variable length | 4.43 / 2.37 / 2.55 +/- 0.08 |
@@ -404,5 +405,6 @@ continuous set formulation, not from the specific insertion mechanism. The OneFl
 rates, but an inserted box starts from pure noise on its own clock, `t_elem = (t - tau) / (1 - tau)`, instead of
 being revealed from the GMM head at insertion) is *better* than both, 2.29 vs 2.53 / 2.55 (noise ~0.1) -- so, as a
 finding rather than a baseline, per-element clocks are a design worth adopting; it is not yet run with the
-conditional mix (`cond=random5`), all three rows here are unconditional-only models. Running: the discrete baseline
-with 128-bin tokens (RALF's resolution; scored at 100 and 1,000 steps).
+conditional mix (`cond=random5`), all three rows here are unconditional-only models. 128-bin discrete
+tokens: finer bins make the discrete baseline *worse* (8.80 vs 6.43 at 1,000 steps), so 32 bins is its best setting.
+Ablation complete.
