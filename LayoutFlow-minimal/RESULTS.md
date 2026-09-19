@@ -365,21 +365,28 @@ count 1.47 / 1.44. So hflip removes memorisation without costing canvas use, tok
 canvas use, and gated cross-attention gives the geometric gains. Next run: gated cross-attention + hflip, no
 dropout (`cgl-varlen-canvas-crossg-flip`).
 
-### Edit Flows ablation on RICO (paper protocol)
-
-| Baseline | FID |
-|---|---|
-| Discrete Edit Flow, LayoutDM 32-bin tokens, 100 sampling steps (5 runs) | 13.25 +/- 0.43 |
-| same checkpoint, 1,000 sampling steps (the demo's default) | **6.43** |
-| LayoutDM (paper) / LayoutFlow (paper) / ours variable length | 4.43 / 2.37 / 2.55 |
-
-The CTMC Euler sampler needs many steps; the 1,000-step number is the fair one. Running: the same with 128-bin
-tokens (RALF's resolution), and the continuous set-based Edit-Flow / OneFlow-style variants built with our machinery
-(labelled as such).
-
 Gated cross-attention + hflip without dropout (ep 449 / 999): FID 3.49 / 3.65, Occ 0.145, Und_s 0.683 / 0.712,
 Ove 0.018, count 1.42 / 1.38 -> dropout is needed for the cross design too. Same + **pairwise geometric attention
 bias** (`backbone_model.geo_bias=true`, LayoutGD's edge features; ep 359 / 999): FID 2.93 / 3.38, Occ 0.143,
 Und_s 0.726 / **0.777**, Ove 0.0113 / **0.0091** (lowest overlap of any run), count 1.42 / 1.40 -> the edge
 features help exactly the geometric metrics. Running the full recipe: cross + dropout + hflip + geo bias
 (`cgl-varlen-canvas-crossg-regflip-geo`).
+Early test-split score of that run at its first FID-selected checkpoint (ep 239, val FID 1.56): FID **1.94**, Occ
+0.151, Rea 0.023, Und_l 0.894, Und_s 0.662, Ove 0.014, count 1.63 -- the best FID of any canvas model so far, but
+underlay/count are behind the later checkpoints of the other runs; final best/last rows will follow when it ends.
+
+
+### Edit Flows ablation on RICO (paper protocol)
+
+| Baseline | FID |
+|---|---|
+| Discrete Edit Flow, LayoutDM 32-bin tokens, 100 sampling steps (5 runs) | 13.25 +/- 0.43 |
+| same checkpoint, 1,000 sampling steps (the demo's default) | **6.43** |
+| Continuous set Edit-Flow variant with our machinery (`insertion=editflow`, best-val ckpt ep 1899, 5 runs) | 2.53 +/- 0.11 |
+| LayoutDM (paper) / LayoutFlow (paper) / ours variable length | 4.43 / 2.37 / 2.55 +/- 0.08 |
+
+The CTMC Euler sampler needs many steps; the 1,000-step number is the fair one. The continuous Edit-Flow variant
+(per-element insert/delete rates instead of a global Poisson count, otherwise our backbone, GMM head and reveal
+schedule) matches our variable-length model within noise, so the gain over the discrete baseline comes from the
+continuous set formulation, not from the specific insertion mechanism. Running: the discrete baseline with 128-bin
+tokens (RALF's resolution; scored at 100 and 1,000 steps) and the continuous OneFlow-style variant.
