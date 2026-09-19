@@ -98,6 +98,12 @@ what the recipe does.
 | Unmasking, mean, t_max=0.5 | 10.08 | 0.074 | 0.015 | `publaynet-elemmask-mean-t050`, ep 239 |
 | Variable length, GMM, t_max=0.25 | 10.30 | 0.142 | 0.014 | `publaynet-varlen-gmm-t025`, ep 236 |
 
+**Variable-length run completed (resumed from epoch 473 to 1000, EMA off, 2026-09-19):** paper protocol, 3 repeats:
+best-by-validation checkpoint (ep 680, val 0.650) **10.21 +/- 0.12** (alignment 0.152, overlap 0.013); last checkpoint
+(ep 999) **9.78 +/- 0.24** (alignment 0.127); the earlier epoch-299 checkpoint scored 9.05. LayoutFlow 8.87, floor 8.10.
+Validation FID kept improving while the test-split FID did not: the two splits differ (real val vs test = 8.10),
+so report the selection-free last checkpoint and say so. Not closed for the paper.
+
 In-training validation FID at the stop (best): ElemMask gmm 0.54, mean 0.57, VarLen t050 0.65,
 t025 0.84; t_max=1.0 runs 2.8 (ElemMask gmm), 6.5 (ElemMask mean), 25.6 (VarLen). Epochs are 609
 steps (311,397 layouts). Earlier snapshot for the curve: VarLen t025 at epoch 128 had val 1.10 and
@@ -358,3 +364,15 @@ dropout + flip (ep 559 / 999) FID 2.41 / 2.77, Occ 0.150 / 0.149, Rea 0.023, Und
 count 1.47 / 1.44. So hflip removes memorisation without costing canvas use, token dropout buys FID at the cost of
 canvas use, and gated cross-attention gives the geometric gains. Next run: gated cross-attention + hflip, no
 dropout (`cgl-varlen-canvas-crossg-flip`).
+
+### Edit Flows ablation on RICO (paper protocol)
+
+| Baseline | FID |
+|---|---|
+| Discrete Edit Flow, LayoutDM 32-bin tokens, 100 sampling steps (5 runs) | 13.25 +/- 0.43 |
+| same checkpoint, 1,000 sampling steps (the demo's default) | **6.43** |
+| LayoutDM (paper) / LayoutFlow (paper) / ours variable length | 4.43 / 2.37 / 2.55 |
+
+The CTMC Euler sampler needs many steps; the 1,000-step number is the fair one. Running: the same with 128-bin
+tokens (RALF's resolution), and the continuous set-based Edit-Flow / OneFlow-style variants built with our machinery
+(labelled as such).
