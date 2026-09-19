@@ -27,6 +27,46 @@ Published numbers (LayoutFlow, ECCV 2024, Table 1, unconditional): LayoutFlow RI
 PubLayNet **8.87**; LayoutDiffusion 2.49 / 8.63; LayoutDM (retrained) 4.43 / 36.85. The baselines are
 given the number of elements; ours (VarLen) generates it.
 
+## RICO ablation summary (paper protocol: test split, 2,000 samples, LayoutGAN++ FID net)
+
+Unconditional FID; "5 runs" = mean +/- std over 5 sampling seeds, otherwise a single run (noise ~0.1). Best-by-val
+checkpoint of a 2,000-epoch run unless stated. Details and the other metrics are in the sections below.
+
+| Axis | Setting | FID |
+|---|---|---|
+| **Reference** | LayoutFlow (paper / upstream checkpoint, our evaluator) | 2.37 / 2.24 |
+| | LayoutDM (paper), LayoutDiffusion (paper) | 4.43, 2.49 |
+| | validation data vs test (noise floor of the metric) | 2.10 |
+| **Baselines, strictly as published** | discrete Edit Flow, LayoutDM 32-bin tokens, 100 / 1,000 steps (5 runs) | 13.25 / 6.43 |
+| | discrete Edit Flow, 128-bin tokens, 100 / 1,000 steps (5 runs) | 14.90 / 8.80 |
+| | OneFlow (interleaved schedule, no time input, unweighted loss), 50 / 100 / 1,000 steps (5 runs) | 63.0 / 66.2 / 75.7 |
+| | OneFlow + t_text input (Edit Flows' original), 50 / 100 steps (5 runs) | 3.31 / 3.38 |
+| **Length** | fixed length (unmasking), GMM, t_max 0.5 (5 runs; single) | 2.41 +/- 0.08 (2.30) |
+| | variable length (insertion), GMM, t_max 0.5 (5 runs; single) | 2.55 +/- 0.08 (2.43) |
+| **Reveal head** (fixed length) | GMM / point-estimate mean / single Gaussian | 2.30 / 2.39 / 2.39 |
+| (variable length) | GMM / single Gaussian | 2.43 / 2.51 |
+| **Reveal horizon t_max** (fixed) | 0.5 / 1.0 (GMM) | 2.30 / 3.72 |
+| (variable) | 0.25 / 0.5 / 1.0 | 2.55 / 2.43 / 11.94 |
+| **Insertion mechanism** (variable length, 5 runs) | masked reveal, global Poisson count (ours v1) | 2.55 +/- 0.08 |
+| | Edit-Flow-style per-element rates, GMM reveal | 2.53 +/- 0.11 |
+| | per-element clocks: box born from N(0,I) at its own clock 0 (two seeds) | **2.29 +/- 0.14 / 2.35 +/- 0.07** |
+| **Clocks** (per-element clocks, 5 runs) | coupled training, sync / unit / insert_first sampling | 2.35 / 3.62 / 2.43 |
+| | decoupled training (product law of the times), sync / unit / insert_first | 4.17 / 4.32 / 3.76 |
+| **Conditional mix random5** (all tasks in one model, uncond column) | fixed length | **2.15 +/- 0.10** |
+| | variable length, masked reveal + cond_input | 3.15 +/- 0.17 |
+| | variable length, per-element clocks + cond_input (two seeds) | 2.53 +/- 0.17 / 2.48 +/- 0.13 |
+| **EMA 0.999** (5 runs) | fixed / variable length (vs 2.41 / 2.55 without) | 2.61 / 2.85 |
+| **Classifier-free guidance** on categories (cat_drop 0.1, 5 runs) | w = 1 (off) / 1.25 / 1.5 / 2.0, fixed length | 2.46 / 2.39 / 2.60 / 3.41 |
+| | same, variable length | 2.46 / 2.52 / 2.74 / 3.52 |
+| **Sampler** (variable length, 3 runs, vs 2.62 default) | gmm_temp 0.3 / heun / reveal_eps 0.7 / snap 32 | 2.54 / 2.44 / 5.12 / worse |
+
+Reading: the two things that matter are the reveal horizon (t_max <= 0.5) and how a new element's box enters
+(born at its own clock zero beats every learned reveal head on RICO); everything else -- head family, EMA,
+guidance, higher-order solvers, sampler temperatures -- is within noise or harmful. Generating the length costs
+~0.1 FID over the fixed-length model; the conditional mix costs another ~0.1-0.2 with per-element clocks (0.6 with
+the reveal head). The strictly-discrete baselines are 3-30x worse; OneFlow's recipe collapses on this data size
+unless the insertion heads see the time.
+
 ## RICO, unconditional, paper protocol
 
 Checkpoint = best in-training validation FID of each run (2000 epochs, validation every 25).
