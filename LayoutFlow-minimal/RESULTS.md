@@ -330,3 +330,18 @@ in the architecture and feeds LayoutDiT's saliency bounding box as a fixed eleme
 with a plain transformer over raw boxes. Cheap next steps for us, in order: a "+retrieval" row (indices provided),
 a de-overlap counterpart to `contain`, and a pairwise-geometry term; a cross-attention canvas variant was tried and
 failed to train (flat flow loss; `cgl-varlen-canvas-cross-regflip-failed`).
+
+Final v3 checkpoints (best-by-validation-FID / last), test split:
+
+| | FID | Occ | Rea | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|
+| Variable length, dropout + hflip (ep 329 / 999) | 3.32 / 4.04 | 0.144 | 0.022 | 0.734 / 0.750 | 0.020 | 1.49 / 1.45 |
+| Variable length, dropout only (ep 499 / 999) | 3.51 / 4.28 | 0.148 | 0.022 | 0.705 / 0.718 | 0.024 / 0.022 | 1.51 / 1.49 |
+| Padding baseline (10 slots + empty class), dropout + hflip (ep 409 / 999) | 4.02 / 4.44 | 0.144 | 0.022 | 0.774 / 0.797 | 0.013 / 0.012 | 1.37 / 1.37 |
+
+Under equal regularisation the padding baseline matches or beats insertion on count MAE (1.37 vs 1.49) and on
+the graphic metrics, while insertion wins FID by 0.7: on CGL (<= 10 elements) the count is not where insertion
+shows its value, as CONTENT_AWARE.md's risk section anticipated. Late checkpoints are worse than mid-training
+ones for every run (residual memorisation), so validation-FID checkpoint selection is part of the recipe.
+Gated cross-attention (tanh gate, zero-init; the ungated version did not train) is running as
+`cgl-varlen-canvas-crossg-regflip`.
