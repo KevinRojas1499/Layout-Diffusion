@@ -16,8 +16,12 @@ from src.models.layout_flow_varlen import LayoutFlowVarLen
 
 class LayoutFlowText(LayoutFlowVarLen):
     def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None,
-                 text_mode='joint', **kwargs):
+                 text_mode='joint', text_grad_to_layout=False, **kwargs):
         super().__init__(*args, **kwargs)
+        # the text loss is ~60x the layout losses; letting its gradient reach the shared layout backbone (through the
+        # soft prompt) slowly degrades the boxes (v3: flow loss 0.27 -> 0.40 over 50 epochs). Off: the prompt sees a
+        # detached layout state; the layout stays text-aware through the pooled feature, trained by the layout losses.
+        self.text_grad_to_layout = text_grad_to_layout
         self.text_factor = text_factor                # src.text_factor.TextFactor (hydra-instantiated)
         self.text_id, self.text_loss_weight, self.text_chunk = text_id, text_loss_weight, text_chunk
         # 'joint': text and boxes co-evolve on the element clocks, coupled both ways (the model);
@@ -51,7 +55,8 @@ class LayoutFlowText(LayoutFlowVarLen):
         return (p for p in super().parameters(recurse) if p.requires_grad)
 
     def _cond(self, h, h_glob, b, i):
-        return torch.cat([h[b, i], h_glob[b]], -1)
+        c = torch.cat([h[b, i], h_glob[b]], -1)
+        return c if self.text_grad_to_layout else c.detach()
 
     # ---------------- training ----------------
     def _text_pre(self, batch, visible, y, clocks):

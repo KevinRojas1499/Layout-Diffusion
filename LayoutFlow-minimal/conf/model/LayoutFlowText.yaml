@@ -19,6 +19,7 @@ model:
   init_layout_ckpt: null      # layout-only checkpoint to start the layout backbone from
   init_ckpt: null             # previous layout + text checkpoint to continue from
   text_mode: joint            # joint (the model) | caption (layout-then-caption baseline: same LM, text after the layout, no coupling)
+  text_grad_to_layout: false  # true lets the text loss train the layout backbone through the prompt (degrades the boxes)
   optimizer:
     _partial_: true
     _target_: torch.optim.AdamW
