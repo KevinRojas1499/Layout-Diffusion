@@ -98,7 +98,8 @@ class VarLenBackbone(nn.Module):
         return f * both
 
     def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None,
-                t_elem: Tensor = None, ctx_hide: Tensor = None, ret: Tensor = None, ret_hide: Tensor = None, sal: Tensor = None):
+                t_elem: Tensor = None, ctx_hide: Tensor = None, ret: Tensor = None, ret_hide: Tensor = None, sal: Tensor = None,
+                elem_extra: Tensor = None):
         '''
         geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None,
         cmask (B,S,5) conditioning mask over [x,y,w,h,cat] (1 = free, 0 = given) or None
@@ -108,6 +109,8 @@ class VarLenBackbone(nn.Module):
         -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,), extra {h_glob (B,d_model), elem_rate (B,S) or None}
         '''
         x = self.elem_embed(torch.cat([self.geom_embed(geom), self.type_embed(cat)], dim=-1))
+        if elem_extra is not None:                    # extra per-element features (e.g. the pooled text state), (B,S,d_model)
+            x = x + elem_extra
         if self.cond_input:
             given = torch.zeros(*cat.shape, 5, device=x.device) if cmask is None else 1 - cmask
             x = x + self.cond_embed(given)

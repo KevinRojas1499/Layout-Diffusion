@@ -95,8 +95,22 @@ class LayoutFlowVarLen(BaseGenModel):
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
         self.sampling = dict(self.DEFAULT_SAMPLING)
 
-    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None, ctx_hide=None, ret=None, ret_hide=None, sal=None):
-        return self.model(xt, yt, exists, t, ctx, cmask, t_elem, ctx_hide, ret, ret_hide, sal)
+    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None, ctx_hide=None, ret=None, ret_hide=None, sal=None, elem_extra=None):
+        return self.model(xt, yt, exists, t, ctx, cmask, t_elem, ctx_hide, ret, ret_hide, sal, elem_extra)
+
+    # ---- hooks for a per-element text factor (src/models/layout_flow_text.py); no-ops here ----
+    def _text_pre(self, batch, visible, y, clocks):
+        return None, None
+    def _text_post(self, state, h, h_glob):
+        return None
+    def _text_infer_init(self, batch):
+        return None
+    def _text_infer_pre(self, state, visible, y, clocks):
+        return None
+    def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last):
+        return state
+    def _text_infer_finish(self, state, exists, order):
+        return None
 
     def kappa(self, t):
         return (t / self.t_max).clamp(max=1.0)
@@ -228,7 +242,9 @@ class LayoutFlowVarLen(BaseGenModel):
         ret_hide = None
         if batch.get('ret') is not None and self.ret_drop > 0:
             ret_hide = torch.rand(xt.shape[0], device=self.device) < self.ret_drop
-        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None, ctx_hide, batch.get('ret'), ret_hide, batch.get('sal'))
+        clocks = self._t_elem if self.oneflow else t.view(-1, 1).expand_as(visible)
+        elem_extra, text_state = self._text_pre(batch, visible, yt, clocks)
+        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None, ctx_hide, batch.get('ret'), ret_hide, batch.get('sal'), elem_extra)
 
         vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
         ut = x1 - x0
@@ -271,6 +287,9 @@ class LayoutFlowVarLen(BaseGenModel):
             self.log('ins_loss', ins_loss, on_step=True, on_epoch=True, sync_dist=True)
             self.log('ins_mae', (ins_rate - missing).abs().mean(), on_step=False, on_epoch=True, sync_dist=True)
 
+        text_loss = self._text_post(text_state, h, extra['h_glob'])
+        if text_loss is not None:
+            loss = loss + text_loss
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return loss
 
@@ -455,6 +474,7 @@ class LayoutFlowVarLen(BaseGenModel):
         y = torch.where(given, batch['type'].long(), torch.full((B, S), self.mask_id, dtype=torch.long, device=dev))
         s = self.sampling
         ctx, ret, sal = batch.get('ctx'), batch.get('ret'), batch.get('sal')
+        text_state = self._text_infer_init(batch)
         tau = torch.zeros(B, S, device=dev)                                  # oneflow: insertion time per slot
         clock = s['clock'] if self.oneflow else None
         # per-element clocks (oneflow): given elements start at t_start on their own clock
@@ -486,9 +506,13 @@ class LayoutFlowVarLen(BaseGenModel):
             elif clock == 'insert_first':
                 ds = (1 - sc).clamp(max=(0.0 if t_next <= self.t_max else dt / (1 - self.t_max))) * exists
             t_elem = sc * exists if self.oneflow else None
-            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem, ret=ret, sal=sal)
             masked = exists & (y == self.mask_id)
             visible = exists & ~masked
+            clocks = sc if self.oneflow else torch.full((B, S), t_i, device=dev)
+            ds_elem = ds if self.oneflow else torch.full((B, S), dt, device=dev)
+            elem_extra = self._text_infer_pre(text_state, visible, y, clocks)
+            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem, ret=ret, sal=sal, elem_extra=elem_extra)
+            text_state = self._text_infer_step(text_state, h, extra['h_glob'], visible, y, clocks, ds_elem, i == N_tot - 1)
             vis = visible.unsqueeze(-1)
             dt_elem = ds.unsqueeze(-1) if self.oneflow else dt              # own clock
             if s['cfg_w'] != 1.0:
@@ -529,6 +553,7 @@ class LayoutFlowVarLen(BaseGenModel):
 
         # pack the generated elements to the front, as the dataset does
         order = exists.int().argsort(dim=1, descending=True, stable=True)
+        self.last_texts = self._text_infer_finish(text_state, exists, order)
         x, y, exists = x.gather(1, order.unsqueeze(-1).expand_as(x)), y.gather(1, order), exists.gather(1, order)
         geom = exists.unsqueeze(-1) * self.sampler.preprocess(x, reverse=True)
         if s['snap_grid']:
