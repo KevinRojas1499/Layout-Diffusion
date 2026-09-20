@@ -525,8 +525,40 @@ A single projection at the last step lifts strict underlay from 0.78 to 0.95 wit
 unchanged; guiding earlier buys a little more Und_s at a real FID cost (the enlarged underlays drift off the size
 distribution). The naive version (contain everything the underlay touches) reaches 0.99 but destroys FID -- the
 0.99 numbers in the literature are cheap to reach if FID is not reported. We report the projection row, labelled.
-Running: the same recipe trained with a containment hinge loss on the predicted clean layout
-(`model.relation_loss_weight=1.0`, with and without retrieval), to get the effect natively. The early ep-239 checkpoint of the
+
+**Trained alternatives and the saliency-box token** (same recipe, 1000 epochs, best-by-val / last, test split):
+
+| run | FID | Occ | Rea | Und_l | Und_s | Ove | count |
+|---|---|---|---|---|---|---|---|
+| + containment hinge loss, weight 1.0 (`model.relation_loss_weight=1`, `...-geo-rel`, ep 389 / 999) | 5.61 / 5.87 | 0.154 / 0.153 | 0.020 / 0.021 | 0.983 / 0.988 | 0.931 / 0.943 | 0.0152 / 0.0132 | 1.56 / 1.53 |
+| + retrieval + containment loss (`...-geo-ret16-rel`, ep 469 / 999) | 4.88 / 5.31 | 0.149 / 0.151 | 0.020 | 0.986 / 0.988 | 0.945 / 0.946 | 0.0147 / 0.0130 | 1.59 / 1.56 |
+| + saliency-box token (LayoutDiT's threshold-25 largest-component box, `backbone_model.sal_token`, `...-geo-sal`, ep 639 / 999) | 2.33 / 2.62 | 0.158 / 0.155 | 0.023 | 0.938 / 0.945 | 0.808 / 0.825 | 0.0087 / **0.0063** | 1.47 / **1.43** |
+| retrieval run, last + projection | 1.99 | 0.152 | 0.021 | 0.969 | **0.962** | **0.0059** | 1.48 |
+| best recipe, last + projection | 1.72 | 0.147 | 0.022 | 0.958 | 0.949 | 0.0089 | 1.54 |
+
+The trained containment loss gets strict underlay to 0.93-0.95 natively but at weight 1.0 it distorts the layout
+distribution (FID 5-6, overlap up, slow convergence: val FID stalled at 5.0 from ep 389): the hinge on the
+predicted clean layout is active at every t and pulls underlays outward long before their content is decided. A
+smaller weight would trade this off, but the sampling-time projection already gives Und_s 0.95 at no FID cost,
+so we keep the projection and drop the loss. The saliency-box token does not help occlusion (0.158 vs 0.148; the
+box spans the full width for most posters and only locates the product vertically) and costs FID; it improves
+overlap and count slightly. Retrieval + projection is the best graphic-metric configuration (Und_s 0.962, Ove
+0.0059, count 1.48) at FID 1.99; the best recipe + projection is the best overall (FID 1.54, Und_s 0.950).
+
+**CGL summary for the paper** (test split, RALF's evaluator; FID against the real test layouts, floor 0.80):
+
+| | FID | Occ | Rea | Und_l | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|---|
+| ours (cross + dropout + hflip + geo bias) | **1.53** | 0.148 | 0.023 | 0.933 | 0.784 | 0.0097 | 1.54 |
+| ours + containment projection | 1.54 | 0.149 | 0.022 | 0.959 | 0.950 | 0.0097 | 1.54 |
+| ours + retrieval + containment projection | 1.99 | 0.152 | 0.021 | 0.969 | 0.962 | 0.0059 | 1.48 |
+| RALF (released outputs) | 1.32 | 0.126 | 0.018 | 0.992 | 0.978 | 0.0042 | 1.08 |
+| LayoutDiT / LayoutGD (papers) | - | 0.124 / 0.120 | 0.016 / 0.014 | 0.995 / 0.999 | 0.988 / 0.994 | 0.0016 / 0.0004 | - |
+| real test layouts | 0.80 | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
+
+What remains behind is occlusion (0.15 vs 0.12-0.13) and overlap; neither the retrieved layouts, the saliency box
+nor the geometric bias moved occlusion, so it is most likely the image side (LayoutDiT/LayoutGD train a ViT on
+RGB + saliency at 384x256; we use 64 frozen DINOv2 tokens + one saliency token). The early ep-239 checkpoint of the
 same run scored FID 1.94 / Und_s 0.66, so the underlay metric is the one that needs the long training. What remains
 between us and RALF is the underlay/occlusion/count triple, i.e. how well the canvas is *used*, not the layout prior.
 
