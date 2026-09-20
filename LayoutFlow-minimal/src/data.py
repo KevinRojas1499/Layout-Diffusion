@@ -39,7 +39,7 @@ def collate_fn(batch, max_len=None, format='xywh'):
                 dummy_array[:total_elems[i]] = batch[i][key][:max_len]
             batch[i][key] = dummy_array
 
-    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id', 'ret') if k in batch[0]}
+    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id', 'ret', 'sal') if k in batch[0]}
     out = default_collate(batch)
     if 'ctx' in extra:
         out['ctx'] = torch.stack(extra['ctx'])
@@ -47,6 +47,8 @@ def collate_fn(batch, max_len=None, format='xywh'):
         out['id'] = extra['id']
     if 'ret' in extra:
         out['ret'] = torch.stack(extra['ret'])
+    if 'sal' in extra:
+        out['sal'] = torch.stack(extra['sal'])
     return out
 
 
@@ -109,7 +111,7 @@ class CGL(Dataset):
     RETRIEVAL_NAMES = {'train': 'train', 'val': 'val', 'test': 'test', 'with_no_annotations_test': 'with_no_annotation'}
 
     def __init__(self, split='train', data_path='./cgl', feats_path='./canvas_feats/cgl', num_cat=5, in_memory=True,
-                 pad_empty=False, max_len=10, hflip=False, grid=8, retrieval_k=0):
+                 pad_empty=False, max_len=10, hflip=False, grid=8, retrieval_k=0, salbox=False):
         import glob
         import pyarrow.parquet as pq
         super().__init__()
@@ -135,6 +137,13 @@ class CGL(Dataset):
             self.samples.append({'id': i, 'type': lab, 'bbox': box, 'length': torch.tensor(len(lab)), 'ctx_idx': order[i]})
         # retrieval augmentation (RALF): the K DreamSim-nearest *training* layouts of each canvas, from RALF's
         # precomputed index tables (the train table excludes the query itself). ret (K, max_len, 5) = cx, cy, w, h, label.
+        # saliency bounding box token (LayoutDiT / LayoutGD): scripts/precompute_salbox.py -> {split}_salbox.pt
+        self.salbox = salbox
+        if salbox:
+            sb = torch.load(f'{feats_path}/{name}_salbox.pt')
+            sb_order = {i: n for n, i in enumerate(sb['id'])}
+            for smp in self.samples:
+                smp['sal'] = sb['salbox'][sb_order[smp['id']]]
         self.retrieval_k = retrieval_k
         if retrieval_k:
             import os
@@ -164,6 +173,8 @@ class CGL(Dataset):
             s['ctx'] = s['ctx'].view(self.grid, self.grid, -1).flip(1).reshape(self.grid * self.grid, -1)   # mirror the feature grid
             if self.retrieval_k:
                 s['ret'][..., 0] = torch.where(s['ret'][..., 4] > 0, 1 - s['ret'][..., 0], s['ret'][..., 0])
+            if self.salbox:
+                s['sal'] = s['sal'].clone(); s['sal'][0] = 1 - s['sal'][0]
         # collate_fn builds xywh from an (x, y, w, h) corner box; CGL boxes are already centred
         s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
         return s

@@ -25,6 +25,7 @@ model:
     ctx_dim: 0              # content-aware: canvas feature dim (385 for scripts/precompute_canvas_feats.py), 0 = none
     geo_bias: false         # LayoutGD-style pairwise geometric attention bias (a GAT with edge features)
     ret_k: 0                # retrieval augmentation (RALF): number of retrieved training layouts joining the context (dataset.dataset.retrieval_k)
+    sal_token: false        # saliency bounding box token (LayoutDiT / LayoutGD; dataset.dataset.salbox=true)
     ctx_mode: prepend       # content-aware: prepend canvas tokens to the set | cross: cross-attention to them
   sampler:
     _target_: src.sampler.GaussianSampler

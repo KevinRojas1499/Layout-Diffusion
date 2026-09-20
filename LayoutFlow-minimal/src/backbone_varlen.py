@@ -27,7 +27,7 @@ class VarLenBackbone(nn.Module):
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
                  num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64,
-                 cond_input=False, elem_rates=False, ctx_mode='prepend', geo_bias=False, ret_k=0):
+                 cond_input=False, elem_rates=False, ctx_mode='prepend', geo_bias=False, ret_k=0, sal_token=False):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -57,6 +57,10 @@ class VarLenBackbone(nn.Module):
         self.ret_k = ret_k
         if ret_k:
             self.ret_slot = nn.Embedding(ret_k, d_model)
+        # saliency bounding box token (LayoutDiT's sal_box MLP): one context token from the 4 box numbers
+        self.sal_token = sal_token
+        if sal_token:
+            self.sal_embed = nn.Sequential(nn.Linear(4, d_model), nn.SiLU(), nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         if ctx_dim:
             self.ctx_embed = nn.Linear(ctx_dim, d_model)
             self.ctx_pos = nn.Parameter(torch.randn(1, ctx_len, d_model) * 0.02)
@@ -94,7 +98,7 @@ class VarLenBackbone(nn.Module):
         return f * both
 
     def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None,
-                t_elem: Tensor = None, ctx_hide: Tensor = None, ret: Tensor = None, ret_hide: Tensor = None):
+                t_elem: Tensor = None, ctx_hide: Tensor = None, ret: Tensor = None, ret_hide: Tensor = None, sal: Tensor = None):
         '''
         geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None,
         cmask (B,S,5) conditioning mask over [x,y,w,h,cat] (1 = free, 0 = given) or None
@@ -109,6 +113,11 @@ class VarLenBackbone(nn.Module):
             x = x + self.cond_embed(given)
         pre = [self.global_token.expand(x.shape[0], -1, -1)]
         ctx_tok = self.ctx_embed(ctx) + self.ctx_pos if self.ctx_dim else None
+        if self.sal_token and sal is not None:
+            assert self.ctx_dim, 'the saliency-box token uses the context path: set ctx_dim > 0'
+            ctx_tok = torch.cat([ctx_tok, self.sal_embed(2 * sal - 1).unsqueeze(1)], 1)
+            if ctx_hide is not None:
+                ctx_hide = torch.cat([ctx_hide, torch.zeros(ctx_hide.shape[0], 1, dtype=torch.bool, device=x.device)], 1)
         if self.ret_k and ret is not None:
             assert self.ctx_dim, 'retrieval augmentation uses the context path: set ctx_dim > 0'
             B_, K, M, _ = ret.shape

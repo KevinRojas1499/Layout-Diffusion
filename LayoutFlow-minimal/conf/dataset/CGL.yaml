@@ -8,6 +8,7 @@ dataset:
   feats_path: ???     # dir with {train,val,test,with_no_annotations_test}.pt
   num_cat: 5
   retrieval_k: 0      # RALF retrieval augmentation: K DreamSim-nearest training layouts per canvas (0 = off)
+  salbox: false       # saliency bounding box per canvas (scripts/precompute_salbox.py), for backbone_model.sal_token
 
 batch_size: 512
 num_workers: 2

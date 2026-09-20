@@ -23,6 +23,7 @@ model:
     cond_input: false       # true with cond=random4: feed the given/held mask to the network (needed by the insertion model)
     geo_bias: false         # LayoutGD-style pairwise geometric attention bias (a GAT with edge features)
     ret_k: 0                # retrieval augmentation (RALF): number of retrieved training layouts joining the context (dataset.dataset.retrieval_k)
+    sal_token: false        # saliency bounding box token (LayoutDiT / LayoutGD; dataset.dataset.salbox=true)
     ctx_mode: prepend       # content-aware: prepend canvas tokens to the set | cross: cross-attention to them
     ctx_dim: 0              # content-aware: canvas feature dim (385 for scripts/precompute_canvas_feats.py), 0 = none
   sampler:
