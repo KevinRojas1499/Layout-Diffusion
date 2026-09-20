@@ -15,21 +15,29 @@ from src.models.layout_flow_varlen import LayoutFlowVarLen
 
 
 class LayoutFlowText(LayoutFlowVarLen):
-    def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, **kwargs):
+    def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.text_factor = text_factor                # src.text_factor.TextFactor (hydra-instantiated)
         self.text_id, self.text_loss_weight, self.text_chunk = text_id, text_loss_weight, text_chunk
         self.save_hyperparameters(ignore=['backbone_model', 'sampler', 'text_factor'])
+        if init_ckpt:                                 # continue from a previous layout + text run (all trainable tensors)
+            sd = torch.load(init_ckpt, map_location='cpu', weights_only=False)['state_dict']
+            res = self.load_state_dict(sd, strict=False)
+            print(f'[LayoutFlowText] initialised from {init_ckpt}: {len(sd)} tensors, missing {len(res.missing_keys)} (frozen backbone), unexpected {len(res.unexpected_keys)}')
         if init_layout_ckpt:                          # start from a layout-only run of the same backbone
             sd = torch.load(init_layout_ckpt, map_location='cpu', weights_only=False)['state_dict']
             sd = {k: v for k, v in sd.items() if k.startswith('model.')}
             res = self.load_state_dict(sd, strict=False)
             print(f'[LayoutFlowText] layout backbone initialised from {init_layout_ckpt}: {len(sd)} tensors, unexpected {len(res.unexpected_keys)}')
 
-    def configure_optimizers(self):
-        # the text factor's trainable parameters (LoRA + FlexMDM extras + prefix/pool) join the layout optimizer
-        opt = super().configure_optimizers()
-        return opt
+    def state_dict(self, *args, **kwargs):
+        # checkpoints carry only the trainable tensors (the frozen 7B backbone is re-loaded from the Hub)
+        sd = super().state_dict(*args, **kwargs)
+        frozen = {n for n, p in self.named_parameters() if not p.requires_grad}
+        return {k: v for k, v in sd.items() if k not in frozen}
+
+    def load_state_dict(self, sd, strict=True):
+        return super().load_state_dict(sd, strict=False)
 
     def parameters(self, recurse=True):
         return (p for p in super().parameters(recurse) if p.requires_grad)

@@ -17,6 +17,7 @@ model:
   text_loss_weight: 1.0
   text_chunk: 512             # text sequences per LM forward
   init_layout_ckpt: null      # layout-only checkpoint to start the layout backbone from
+  init_ckpt: null             # previous layout + text checkpoint to continue from
   optimizer:
     _partial_: true
     _target_: torch.optim.AdamW
