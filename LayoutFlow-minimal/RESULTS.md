@@ -636,3 +636,14 @@ Evaluation (`scripts/eval_crello.py`, test split): layout alignment / overlap / 
 the text: empty fraction, chars and words, distinct-1/2, NLL per token under Qwen2.5-0.5B, and the text-length vs
 box-size relation (Pearson of chars with box width and area, lines with box height) -- the joint model's specific
 claim, which a layout-then-caption pipeline cannot produce. Numbers to follow when v2 finishes.
+
+**v1 numbers (40 epochs; test split, generated / real):** elements per layout 7.8 / 9.6, class histogram
+matched (0.46/0.40/0.10/0.03/0.01 vs 0.47/0.40/0.09/0.03/0.02), alignment x100 1.52 / 0.21, overlap 1.10 / 1.69;
+text: empty fraction 0.23 / 0.00, chars 11.8 / 19.0, words 2.5 / 3.2, distinct-1 0.10 / 0.26,
+distinct-2 0.33 / 0.59, Qwen2.5-0.5B NLL per token 4.20 / 4.15; text-length vs box-size:
+corr(chars, width) 0.06 / 0.21, corr(chars, area) 0.04 / 0.15, corr(lines, height) 0.00 / 0.34.
+The language side is at the data's fluency already; length, diversity and -- the point of the joint model -- the
+text-length / box-size relation are not learned at 40 epochs (correlations ~0). The session's job was lost while
+v2 trained (epoch 22 of 200); `crello-text-v3` continues from its checkpoint (3 GPUs, 180 epochs). For the run after
+that, the text -> layout feature now carries explicit length counts (tokens present, masks pending, newlines;
+commit above), the direct route to the size relation.
