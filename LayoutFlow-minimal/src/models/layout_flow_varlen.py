@@ -182,13 +182,13 @@ class LayoutFlowVarLen(BaseGenModel):
     def relation_loss(self, xt, vt, x1, y1, visible, s):
         '''
         Hinge on strict containment of the predicted clean boxes, for the (underlay, text) pairs that are contained in
-        the data. Boxes are cx, cy, w, h in the preprocessed [-1, 1] space (an affine map, so containment is preserved;
-        the margin is given in canvas units and scaled by 2). Pairs are weighted by the elements' clocks (a prediction at
-        s ~ 0 is noise) and the loss is averaged over pairs.
+        the data. Edges are computed in canvas space (the sampler's preprocessing maps w, h too, so edges must not be
+        taken in the model space); the margin is in canvas units. Pairs are weighted by the elements' clocks (a
+        prediction at s ~ 0 is noise) and the loss is averaged over pairs.
         '''
         x1_hat = xt + (1 - s).unsqueeze(-1) * vt
         ltrb = lambda b: torch.cat([b[..., :2] - b[..., 2:] / 2, b[..., :2] + b[..., 2:] / 2], -1)
-        p, g = ltrb(x1_hat), ltrb(x1)
+        p, g = ltrb(self.sampler.preprocess(x1_hat, reverse=True)), ltrb(self.sampler.preprocess(x1, reverse=True))
         under = visible & (y1 == self.relation_underlay_id)
         text = visible & (y1 == self.relation_text_id)
         # ground-truth containment (B, S_under, S_text)
@@ -197,7 +197,7 @@ class LayoutFlowVarLen(BaseGenModel):
         pair = under[:, :, None] & text[:, None, :] & inside
         if not pair.any():
             return vt.sum() * 0
-        m = 2 * self.relation_margin
+        m = self.relation_margin
         viol = (F.relu(m + p[:, :, None, 0] - p[:, None, :, 0]) + F.relu(m + p[:, :, None, 1] - p[:, None, :, 1]) +
                 F.relu(m + p[:, None, :, 2] - p[:, :, None, 2]) + F.relu(m + p[:, None, :, 3] - p[:, :, None, 3]))
         w = (s[:, :, None] * s[:, None, :]).sqrt() * pair
@@ -325,10 +325,42 @@ class LayoutFlowVarLen(BaseGenModel):
         solver='euler',    # 'heun': second-order steps once everything is revealed (kappa = 1)
         cfg_w=1.0,         # classifier-free guidance on the categories: v_u + w (v_c - v_u); 1 = off
         snap_grid=0,       # > 0: round the final ltrb edges to multiples of 1/snap_grid
+        contain_guide=0.0, # > 0: containment guidance -- each step moves the predicted clean layout down the hinge
+                           # "every non-underlay element overlapping an underlay lies strictly inside it" (see contain_step)
+        contain_from=0.5,  # apply the guidance once every element's clock is past this value
         clock='sync',      # oneflow clock policy: 'sync' (all boxes clean at t = 1, ds = dt / (1 - tau)) | 'unit'
                            # (ds = dt, the run continues past t = 1 until every box is clean, OneFlow-style) |
                            # 'insert_first' (clocks frozen until kappa = 1, then everything is denoised together)
     )
+
+    @torch.no_grad()
+    def contain_step(self, x, y, visible, lam):
+        '''
+        Containment guidance (sampling only, no retraining): for every pair (underlay u, non-underlay element k) whose
+        boxes overlap, push the *underlay* to contain k with margin relation_margin -- a gradient step of size lam on the
+        hinge, taken on the underlay's ltrb edges (lam = 1 is a full projection; smaller values let the velocity
+        field react to the corrected state over the remaining steps).
+        '''
+        B, S, _ = x.shape
+        under = visible & (y == self.relation_underlay_id)
+        other = visible & ~under
+        if not (under.any() and other.any()):
+            return x
+        m = self.relation_margin
+        xc = self.sampler.preprocess(x, reverse=True)                                   # canvas space: edges are meaningful here
+        l, tp, r, bt = (xc[..., 0] - xc[..., 2] / 2), (xc[..., 1] - xc[..., 3] / 2), (xc[..., 0] + xc[..., 2] / 2), (xc[..., 1] + xc[..., 3] / 2)
+        # pairwise overlap (B, S_u, S_k)
+        ov = (l[:, :, None] < r[:, None, :]) & (l[:, None, :] < r[:, :, None]) & (tp[:, :, None] < bt[:, None, :]) & (tp[:, None, :] < bt[:, :, None])
+        pair = (under[:, :, None] & other[:, None, :] & ov).float()
+        # required expansion of the underlay's four edges (positive = move outward), max over its overlapping elements
+        dl = (F.relu(m + l[:, :, None] - l[:, None, :]) * pair).amax(2)
+        dt_ = (F.relu(m + tp[:, :, None] - tp[:, None, :]) * pair).amax(2)
+        dr = (F.relu(m + r[:, None, :] - r[:, :, None]) * pair).amax(2)
+        db = (F.relu(m + bt[:, None, :] - bt[:, :, None]) * pair).amax(2)
+        step = lam * under.float()
+        l2, t2, r2, b2 = l - step * dl, tp - step * dt_, r + step * dr, bt + step * db
+        new = self.sampler.preprocess(torch.stack([(l2 + r2) / 2, (t2 + b2) / 2, r2 - l2, b2 - t2], -1))
+        return torch.where(under.unsqueeze(-1), new, x)
 
     @torch.no_grad()
     def editflow_insert(self, x, y, exists, h, extra, ins_rate, p, t_next, s, tau):
@@ -465,6 +497,8 @@ class LayoutFlowVarLen(BaseGenModel):
                 x = torch.where(vis, x + v * dt_elem, x)
             if self.oneflow:
                 sc = ((sc + ds).clamp(max=1.0)) * exists
+            if s['contain_guide'] > 0 and t_next >= s['contain_from']:
+                x = self.contain_step(x, y, visible, s['contain_guide'])
             if task != 'uncond':
                 x = held * x1 + (1 - held) * x
 
