@@ -489,7 +489,44 @@ model -- strict underlay 0.825 / 0.832 (vs 0.784), overlay 0.0070 / 0.0059 (vs 0
 the geometric conventions (underlay under text, non-overlap, how many elements) rather than as a copy source, and
 the count gain is far from RALF's (1.08). So retrieval does not bridge the gap on its own; the remaining
 difference to RALF (Und_s 0.98, count 1.08) is where its autoregressive 128-bin decoder copies exact coordinates
-and counts from the retrieved layouts, which a continuous set generator does not do. The early ep-239 checkpoint of the
+and counts from the retrieved layouts, which a continuous set generator does not do.
+
+### Where the underlay gap actually is, and the containment projection
+
+Diagnostic on the exported test samples (any non-underlay element counts, as in RALF's / LayoutDiT's metric; here
+text only, which is slightly stricter): class histogram and underlays per layout match the data (1.07 vs 1.09;
+logo/text/underlay/embellishment 13.1/62.9/22.8/1.2% vs 13.3/62.2/22.6/1.9%); only 2.9% of our underlays have no
+text on them at all (real 1.0%, RALF 1.3%); but 24% have their text sticking out, by a **median of 1% of the
+canvas** (real 2.1%, RALF 3.6%, retrieval run 19%). The relation is learned; the strict-containment convention is
+not learned to the pixel by an MSE-trained flow. LayoutDiT's code (github yuli0103/LayoutDiT) confirms there is no
+architectural ingredient for this: a plain epsilon-prediction DDPM over 16 padded slots (one-hot class incl.
+empty + box), MSE only, deterministic DDIM with 100 steps, argmax/clamp decoding, no relation loss, no
+post-processing; its Und_s (0.988) equals the real data's and LayoutGD's (0.994) exceeds it, i.e. a mode-seeking
+deterministic sampler produces layouts more regular than the data (their table has no FID). Its image side differs
+(4-channel RGB+saliency ViT trained from scratch at 384x256, plus a saliency-*box* token), which is the plausible
+source of the occlusion gap (0.148 vs 0.124), not of the underlay gap.
+
+**Containment guidance / projection** (`+sampling.contain_guide=lam,contain_from=t0,contain_min=0.5`, commit
+787a134): at every sampler step past t0, each underlay is expanded by lam times the violation so that the one
+element already mostly inside it (largest intersection / element area, the metric's own candidate, at least
+contain_min inside) is strictly inside with a 1% margin. Best checkpoint (ep 689), test split:
+
+| sampler | FID | Occ | Rea | Und_l | Und_s | Ove |
+|---|---|---|---|---|---|---|
+| plain | **1.53** | 0.148 | 0.023 | 0.933 | 0.784 | 0.0097 |
+| lam 0.3 from t = 0.5 | 2.72 | 0.151 | 0.022 | 0.966 | 0.927 | 0.0100 |
+| lam 1.0 from t = 0.5 | 3.86 | 0.153 | 0.021 | 0.970 | 0.965 | 0.0103 |
+| lam 0.5 from t = 0.9 | 1.91 | 0.150 | 0.022 | 0.967 | 0.955 | 0.0097 |
+| lam 1.0 from t = 0.9 | 2.15 | 0.150 | 0.022 | 0.967 | 0.962 | 0.0098 |
+| **lam 1.0, final step only (a projection)** | **1.54** | 0.149 | 0.022 | 0.959 | **0.950** | 0.0097 |
+| (all overlapping elements instead of the best candidate, lam 0.3 from 0.5) | 57.6 | 0.185 | 0.013 | 0.994 | 0.990 | 0.0118 |
+
+A single projection at the last step lifts strict underlay from 0.78 to 0.95 with FID, occlusion and overlap
+unchanged; guiding earlier buys a little more Und_s at a real FID cost (the enlarged underlays drift off the size
+distribution). The naive version (contain everything the underlay touches) reaches 0.99 but destroys FID -- the
+0.99 numbers in the literature are cheap to reach if FID is not reported. We report the projection row, labelled.
+Running: the same recipe trained with a containment hinge loss on the predicted clean layout
+(`model.relation_loss_weight=1.0`, with and without retrieval), to get the effect natively. The early ep-239 checkpoint of the
 same run scored FID 1.94 / Und_s 0.66, so the underlay metric is the one that needs the long training. What remains
 between us and RALF is the underlay/occlusion/count triple, i.e. how well the canvas is *used*, not the layout prior.
 
