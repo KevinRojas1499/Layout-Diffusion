@@ -647,3 +647,14 @@ text-length / box-size relation are not learned at 40 epochs (correlations ~0). 
 v2 trained (epoch 22 of 200); `crello-text-v3` continues from its checkpoint (3 GPUs, 180 epochs). For the run after
 that, the text -> layout feature now carries explicit length counts (tokens present, masks pending, newlines;
 commit above), the direct route to the size relation.
+
+**Correction (2026-09-20 16:00).** Runs v1-v3 never trained the text factor: `configure_optimizers` (base class) optimises
+`self.model` -- the layout backbone -- only, so the LoRA, the insertion head and the prompt / pool heads stayed at
+their initial values. v1's text quality (NLL 4.20) is therefore the *pretrained* FlexMDM prompted through the layout
+backbone's hidden states, and its improvement over training came from the layout backbone bending those states to
+serve the prompt -- which is what degraded the boxes in v3 (flow loss 0.27 -> 0.40). Fixes (commits 8d5a11a,
+86bb7e0, 79160b1): the text factor reads the layout through its own 2-layer encoder over the element states
+(trained by the text loss only; the shared backbone is trained by the layout losses only, and stays text-aware
+through the pooled text feature), and all trainable tensors are in the optimizer (LoRA / insertion head at lr 1e-4,
+the rest at the layout lr). `crello-text-v4` (joint) and `crello-caption-v1` (layout-then-caption baseline) relaunched
+with this, 220 epochs each, from the blind layout init.
