@@ -134,7 +134,8 @@ class TextFactor(nn.Module):
             return xt, attn
         # unmask: sample clean tokens, reveal Poisson(masked_count * hazard * dt) of them by confidence
         if self.temperature > 0:
-            g = -torch.log(-torch.log(torch.rand_like(unmask_logits).clamp(min=1e-20)).clamp(min=1e-20))
+            u = torch.rand_like(unmask_logits).clamp(min=1e-20)
+            g = -torch.log((-torch.log(u)).clamp(min=1e-20))                      # Gumbel(0, 1)
             sampled = (unmask_logits / self.temperature + g).argmax(-1)
         else:
             sampled = unmask_logits.argmax(-1)
