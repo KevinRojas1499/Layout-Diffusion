@@ -328,6 +328,7 @@ class LayoutFlowVarLen(BaseGenModel):
         contain_guide=0.0, # > 0: containment guidance -- each step moves the predicted clean layout down the hinge
                            # "every non-underlay element overlapping an underlay lies strictly inside it" (see contain_step)
         contain_from=0.5,  # apply the guidance once every element's clock is past this value
+        contain_min=0.5,   # only for the underlay's best candidate element with at least this fraction of its area inside
         clock='sync',      # oneflow clock policy: 'sync' (all boxes clean at t = 1, ds = dt / (1 - tau)) | 'unit'
                            # (ds = dt, the run continues past t = 1 until every box is clean, OneFlow-style) |
                            # 'insert_first' (clocks frozen until kappa = 1, then everything is denoised together)
@@ -349,9 +350,14 @@ class LayoutFlowVarLen(BaseGenModel):
         m = self.relation_margin
         xc = self.sampler.preprocess(x, reverse=True)                                   # canvas space: edges are meaningful here
         l, tp, r, bt = (xc[..., 0] - xc[..., 2] / 2), (xc[..., 1] - xc[..., 3] / 2), (xc[..., 0] + xc[..., 2] / 2), (xc[..., 1] + xc[..., 3] / 2)
-        # pairwise overlap (B, S_u, S_k)
-        ov = (l[:, :, None] < r[:, None, :]) & (l[:, None, :] < r[:, :, None]) & (tp[:, :, None] < bt[:, None, :]) & (tp[:, None, :] < bt[:, :, None])
-        pair = (under[:, :, None] & other[:, None, :] & ov).float()
+        # for every underlay, the single element that is already mostly inside it (largest intersection / area_k,
+        # the metric's own candidate); an underlay grazing a large element is not made to swallow it
+        iw = (torch.minimum(r[:, :, None], r[:, None, :]) - torch.maximum(l[:, :, None], l[:, None, :])).clamp(min=0)
+        ih = (torch.minimum(bt[:, :, None], bt[:, None, :]) - torch.maximum(tp[:, :, None], tp[:, None, :])).clamp(min=0)
+        ratio = iw * ih / (xc[..., 2] * xc[..., 3]).clamp(min=1e-6)[:, None, :]                           # (B, u, k)
+        ratio = ratio * (under[:, :, None] & other[:, None, :]).float()
+        best = ratio.argmax(2, keepdim=True)
+        pair = (torch.zeros_like(ratio).scatter_(2, best, 1.0) * (ratio >= s_min).float()) if (s_min := self.sampling.get('contain_min', 0.5)) is not None else None
         # required expansion of the underlay's four edges (positive = move outward), max over its overlapping elements
         dl = (F.relu(m + l[:, :, None] - l[:, None, :]) * pair).amax(2)
         dt_ = (F.relu(m + tp[:, :, None] - tp[:, None, :]) * pair).amax(2)
