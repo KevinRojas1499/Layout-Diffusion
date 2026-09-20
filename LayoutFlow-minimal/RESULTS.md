@@ -604,3 +604,35 @@ amplifies that residual without bound in the last steps (more steps = worse). Fe
 "nothing is missing at t = 1" exactly and turns 63 into 3.3 -- one FID point behind our per-element-clock model
 (2.29 / 2.35) and 0.8 behind our masked-reveal model (2.55); more sampling steps hurt it (5.31 at 1,000), the
 usual sign of a slightly mis-calibrated insertion rate integrated over a longer path. Ablation complete.
+
+## Crello: layout + text (in progress, 2026-09-20)
+
+Data: HF `cyberagent/crello` -> `scripts/prepare_crello.py` (18,414 / 1,754 / 1,869 templates with <= 20 elements, 5.5%
+dropped; 5 element types; boxes normalised by the canvas and clipped to it, 11% of elements bleed outside; text
+strings per element: 40% of elements are text, 4.2 per template, median 12 chars / 2 words, p90 44 / 7).
+`src.data.Crello`, `conf/dataset/Crello.yaml`. No pretrained FID network exists for Crello; layout runs select on
+val_loss.
+
+Model (`src/models/layout_flow_text.py`, `src/text_factor.py`, `conf/model/LayoutFlowText.yaml`): the per-element-clock
+layout model (RICO recipe) with a FlexMDM text factor on every text element -- the released Dream-Coder-7B FlexMDM
+(`yuyuanchen0/flexmdm`, insertion + unmasking masked diffusion, power schedules 1.7 / 2.89), LoRA r = 16 on q/k/v/o +
+its insertion head + a soft-prompt projection and a pooling head (~100M trainable), loaded through the authors'
+package in a separate venv (`$LAB/repos/venv-text`: py3.10, torch 2.8 cu128, transformers 4.46.2, peft). Each text
+element is a sequence [4 soft-prompt positions | <= 24 answer tokens]; the prompt is built from the element's hidden
+state and the layout's global token; the pooled embeddings of the current text tokens feed back into the element
+token; the text clock is the element's clock (empty at insertion, clean with the box). Sampling ports FlexMDM's
+Algorithm 1 (confidence top-k unmasking, Poisson insertion) to per-sequence step sizes, one text step per layout step.
+
+Runs (4 x A100 DDP, batch 64 / GPU, ~80 s / epoch): `crello-varlen-blind` (layout only, 1000 epochs, the
+initialisation), `crello-text-v1` (40 epochs from it; teacher-forced text CE on the test split 6.7 / 4.4 / 2.9 at
+clocks 0.3 / 0.6 / 0.9 vs 11.9 uniform, top-1 accuracy 0.10 / 0.30 / 0.54), `crello-text-v2` (200 epochs continuing
+v1, running). First samples (v1, temperature 0.1): "Join us for the / birthday / party!" in a 0.18 x 0.08 box,
+"Get connected / with us on / Facebook / and / Twitter" in 0.30 x 0.15, "Design / and / Development", "FREE / CLOSING",
+"IS / COMING!", "Free Day of Art", "$10", "2021"; failure modes: empty strings and runs of newlines (the insertion
+channel), the odd nonsense phrase, degenerate boxes from the young layout model. A precedence bug in the Gumbel
+noise (commit a378942) made every sampled token id 0 ("!") before this.
+
+Evaluation (`scripts/eval_crello.py`, test split): layout alignment / overlap / count MAE / class histogram, and for
+the text: empty fraction, chars and words, distinct-1/2, NLL per token under Qwen2.5-0.5B, and the text-length vs
+box-size relation (Pearson of chars with box width and area, lines with box height) -- the joint model's specific
+claim, which a layout-then-caption pipeline cannot produce. Numbers to follow when v2 finishes.
