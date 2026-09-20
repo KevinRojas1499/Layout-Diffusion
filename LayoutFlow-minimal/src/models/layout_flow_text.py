@@ -9,15 +9,43 @@ text tokens added to the element token (`elem_extra`); layout -> text through th
 element's hidden state and the layout's global token. Losses: the layout losses + FlexMDM's unmasking and
 insertion losses on the text elements.
 '''
+import math
 import torch
+import torch.nn as nn
 
 from src.models.layout_flow_varlen import LayoutFlowVarLen
 
 
+class PromptEncoder(nn.Module):
+    '''
+    The text factor's own view of the layout: a small transformer over the current element states (box at its noise
+    level, class, clock) plus a global token. Trained by the text loss only, so the shared layout backbone is never
+    pulled by the text objective. Returns per-element states (B,S,d) and the global state (B,d).
+    '''
+    def __init__(self, num_cat, d=512, nhead=8, layers=2):
+        super().__init__()
+        self.box = nn.Linear(4, d); self.cls = nn.Embedding(num_cat + 1, d); self.clock = nn.Linear(1, d)
+        self.glob = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, 0.1, batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, layers); self.norm = nn.LayerNorm(d)
+
+    def forward(self, x, y, visible, clocks):
+        B, S = y.shape
+        tok = self.box(x) + self.cls(y.clamp(min=0)) + self.clock(clocks.unsqueeze(-1).float())
+        tok = torch.cat([self.glob.expand(B, -1, -1), tok], 1)
+        pad = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=x.device), ~visible], 1)
+        h = self.norm(self.enc(tok, src_key_padding_mask=pad))
+        return h[:, 1:], h[:, 0]
+
+
 class LayoutFlowText(LayoutFlowVarLen):
     def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None,
-                 text_mode='joint', text_grad_to_layout=False, **kwargs):
+                 text_mode='joint', text_grad_to_layout=False, prompt_encoder=True, **kwargs):
         super().__init__(*args, **kwargs)
+        # prompt_encoder: the text factor reads the layout through its own encoder (PromptEncoder) instead of the
+        # shared backbone's hidden states
+        d = text_factor.pool[-1].out_features if text_factor is not None else 512
+        self.prompt_enc = PromptEncoder(kwargs.get('num_cat', 6), d) if prompt_encoder else None
         # the text loss is ~60x the layout losses; letting its gradient reach the shared layout backbone (through the
         # soft prompt) slowly degrades the boxes (v3: flow loss 0.27 -> 0.40 over 50 epochs). Off: the prompt sees a
         # detached layout state; the layout stays text-aware through the pooled feature, trained by the layout losses.
@@ -58,11 +86,18 @@ class LayoutFlowText(LayoutFlowVarLen):
         c = torch.cat([h[b, i], h_glob[b]], -1)
         return c if self.text_grad_to_layout else c.detach()
 
+    def _prompt_states(self, x, y, visible, clocks, h, h_glob):
+        '''per-element / global states the prompt is built from: the prompt encoder's, or the backbone's (detached)'''
+        if self.prompt_enc is not None:
+            return self.prompt_enc(x, y, visible, clocks)
+        return h, h_glob
+
     # ---------------- training ----------------
-    def _text_pre(self, batch, visible, y, clocks):
+    def _text_pre(self, batch, visible, y, clocks, x=None):
         '''sample the FlexMDM state of every visible text element at its clock; return the layout-side feature'''
         tf = self.text_factor
         sel = visible & (y == self.text_id)
+        self._prompt_in = (x, y, visible, clocks)
         if not sel.any():
             return None, None
         b_idx, i_idx = torch.nonzero(sel, as_tuple=True)
@@ -84,6 +119,8 @@ class LayoutFlowText(LayoutFlowVarLen):
         tf = self.text_factor
         if self.text_mode == 'caption':               # condition on the clean layout
             h, h_glob = self._clean_layout_states(state['batch'])
+        else:
+            h, h_glob = self._prompt_states(*self._prompt_in, h, h_glob)
         cond = self._cond(h, h_glob, state['b'], state['i'])
         unmask_loss = ins_loss = 0.0
         n = state['xt'].shape[0]
@@ -102,6 +139,8 @@ class LayoutFlowText(LayoutFlowVarLen):
         if x1 is None:
             active = batch['mask'].squeeze(-1); y1 = batch['type'].long(); x1 = active.unsqueeze(-1) * self.sampler.preprocess(batch['bbox'])
         B = x1.shape[0]
+        if self.prompt_enc is not None:
+            return self.prompt_enc(x1, y1, active, active.float())
         t = torch.ones(B, device=self.device); t_elem = active.float() if self.oneflow else None
         _, _, h, _, extra = self(x1, y1, active, t, batch.get('ctx'), None, t_elem, None, batch.get('ret'), None, batch.get('sal'))
         return h, extra['h_glob']
@@ -132,7 +171,7 @@ class LayoutFlowText(LayoutFlowVarLen):
         feat[sel] = tf.pooled(state['xt'][sel], state['attn'][sel]).to(feat.dtype)
         return feat
 
-    def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last):
+    def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last, x=None):
         if self.text_mode == 'caption':
             return state
         tf = self.text_factor
@@ -140,6 +179,7 @@ class LayoutFlowText(LayoutFlowVarLen):
         if not sel.any():
             return state
         b_idx, i_idx = torch.nonzero(sel, as_tuple=True)
+        h, h_glob = self._prompt_states(x, y, visible, clocks, h, h_glob)
         cond = self._cond(h, h_glob, b_idx, i_idx)
         t = clocks[b_idx, i_idx].clamp(0, 1 - 1e-4)
         d = ds[b_idx, i_idx]

@@ -99,7 +99,7 @@ class LayoutFlowVarLen(BaseGenModel):
         return self.model(xt, yt, exists, t, ctx, cmask, t_elem, ctx_hide, ret, ret_hide, sal, elem_extra)
 
     # ---- hooks for a per-element text factor (src/models/layout_flow_text.py); no-ops here ----
-    def _text_pre(self, batch, visible, y, clocks):
+    def _text_pre(self, batch, visible, y, clocks, x=None):
         return None, None
     def _text_post(self, state, h, h_glob):
         return None
@@ -107,7 +107,7 @@ class LayoutFlowVarLen(BaseGenModel):
         return None
     def _text_infer_pre(self, state, visible, y, clocks):
         return None
-    def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last):
+    def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last, x=None):
         return state
     def _text_infer_finish(self, state, exists, order, x=None, y=None, ctx=None, ret=None, sal=None):
         return None
@@ -243,7 +243,7 @@ class LayoutFlowVarLen(BaseGenModel):
         if batch.get('ret') is not None and self.ret_drop > 0:
             ret_hide = torch.rand(xt.shape[0], device=self.device) < self.ret_drop
         clocks = self._t_elem if self.oneflow else t.view(-1, 1).expand_as(visible)
-        elem_extra, text_state = self._text_pre(batch, visible, yt, clocks)
+        elem_extra, text_state = self._text_pre(batch, visible, yt, clocks, xt)
         vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None, ctx_hide, batch.get('ret'), ret_hide, batch.get('sal'), elem_extra)
 
         vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
@@ -512,7 +512,7 @@ class LayoutFlowVarLen(BaseGenModel):
             ds_elem = ds if self.oneflow else torch.full((B, S), dt, device=dev)
             elem_extra = self._text_infer_pre(text_state, visible, y, clocks)
             v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem, ret=ret, sal=sal, elem_extra=elem_extra)
-            text_state = self._text_infer_step(text_state, h, extra['h_glob'], visible, y, clocks, ds_elem, i == N_tot - 1)
+            text_state = self._text_infer_step(text_state, h, extra['h_glob'], visible, y, clocks, ds_elem, i == N_tot - 1, x)
             vis = visible.unsqueeze(-1)
             dt_elem = ds.unsqueeze(-1) if self.oneflow else dt              # own clock
             if s['cfg_w'] != 1.0:
