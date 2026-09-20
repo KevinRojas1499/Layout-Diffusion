@@ -46,13 +46,15 @@ def layout_metrics(layouts, name):
     S = max(len(l['type']) for l in layouts)
     bbox = torch.zeros(len(layouts), S, 4); mask = torch.zeros(len(layouts), S, dtype=torch.bool)
     for i, l in enumerate(layouts):
-        n = len(l['type']); bbox[i, :n] = torch.tensor(l['bbox']); mask[i, :n] = True
+        n = len(l['type'])
+        if n:
+            bbox[i, :n] = torch.tensor(l['bbox']).view(n, 4); mask[i, :n] = True
     keep = mask.sum(1) > 1
-    align = compute_alignment(bbox[keep], mask[keep]).mean().item() * 100
-    overlap = compute_overlap(bbox[keep], mask[keep]).mean().item()
+    align = compute_alignment(bbox[keep], mask[keep]) * 100
+    overlap = compute_overlap(bbox[keep], mask[keep])
     counts = np.array([len(l['type']) for l in layouts])
-    hist = np.bincount(np.concatenate([l['type'] for l in layouts]), minlength=6)[1:6]
-    return {'n': len(layouts), 'alignment_x100': align, 'overlap': overlap, 'count_mean': counts.mean(), 'class_hist': (hist / hist.sum()).round(3).tolist()}
+    hist = np.bincount(np.concatenate([np.asarray(l['type'], dtype=int) for l in layouts if len(l['type'])]), minlength=6)[1:6]
+    return {'n': len(layouts), 'empty_layouts': int((mask.sum(1) == 0).sum()), 'alignment_x100': align, 'overlap': overlap, 'count_mean': counts.mean(), 'class_hist': (hist / hist.sum()).round(3).tolist()}
 
 
 def text_metrics(layouts, lm=None, text_id=2):

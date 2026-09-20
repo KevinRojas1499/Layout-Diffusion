@@ -22,6 +22,8 @@ class LayoutFlowText(LayoutFlowVarLen):
         self.save_hyperparameters(ignore=['backbone_model', 'sampler', 'text_factor'])
         if init_ckpt:                                 # continue from a previous layout + text run (all trainable tensors)
             sd = torch.load(init_ckpt, map_location='cpu', weights_only=False)['state_dict']
+            own = self.state_dict()
+            sd = {k: v for k, v in sd.items() if k not in own or own[k].shape == v.shape}       # skip re-shaped heads
             res = self.load_state_dict(sd, strict=False)
             print(f'[LayoutFlowText] initialised from {init_ckpt}: {len(sd)} tensors, missing {len(res.missing_keys)} (frozen backbone), unexpected {len(res.unexpected_keys)}')
         if init_layout_ckpt:                          # start from a layout-only run of the same backbone

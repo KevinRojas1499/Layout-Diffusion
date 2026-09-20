@@ -30,6 +30,7 @@ class TextFactor(nn.Module):
         self.L = n_prefix + max_tokens
         self.model, self.tok = load_model_and_tokenizer(checkpoint_dir=snapshot_download(ckpt), max_length=self.L, torch_dtype_name=dtype)
         self.mask_id, self.pad_id = self.tok.mask_token_id, self.tok.pad_token_id
+        self.newline_id = self.tok('\n', add_special_tokens=False)['input_ids'][0]
         H = self.model.hidden_size
         for p in self.model.parameters():
             p.requires_grad_(False)
@@ -41,7 +42,8 @@ class TextFactor(nn.Module):
             self.model.backbone.gradient_checkpointing_enable()
         # layout -> text: K soft prompt tokens from [h_elem, h_glob]; text -> layout: pooled token embeddings
         self.prefix = nn.Sequential(nn.Linear(2 * d_layout, H), nn.SiLU(), nn.Linear(H, n_prefix * H))
-        self.pool = nn.Sequential(nn.Linear(H, d_layout), nn.SiLU(), nn.Linear(d_layout, d_layout))
+        # pooled token embeddings + explicit length features (tokens present, masks pending, newlines) -> element feature
+        self.pool = nn.Sequential(nn.Linear(H + 3, d_layout), nn.SiLU(), nn.Linear(d_layout, d_layout))
         nn.init.zeros_(self.pool[-1].weight); nn.init.zeros_(self.pool[-1].bias)     # the layout side starts text-blind
         self.process = FlexMDMProcess(vocab_size=self.model.backbone.config.vocab_size, mask_id=self.mask_id, pad_id=self.pad_id,
                                       max_len=self.L, insertion_schedule='power', unmasking_schedule='power',
@@ -99,7 +101,10 @@ class TextFactor(nn.Module):
             emb = self.model.backbone.model.embed_tokens(xt).float()
         w = attn.float().clone(); w[:, :self.K] = 0
         mean = (emb * w.unsqueeze(-1)).sum(1) / w.sum(1, keepdim=True).clamp(min=1)
-        return self.pool(mean.to(self.pool[0].weight.dtype))
+        n_tok = w.sum(1, keepdim=True); n_mask = ((xt == self.mask_id).float() * w).sum(1, keepdim=True)
+        n_nl = ((xt == self.newline_id).float() * w).sum(1, keepdim=True)
+        feat = torch.cat([mean, torch.log1p(n_tok), torch.log1p(n_mask), torch.log1p(n_nl)], -1)
+        return self.pool(feat.to(self.pool[0].weight.dtype))
 
     # ---------------- training ----------------
     def noisy(self, x1, attn, t):
