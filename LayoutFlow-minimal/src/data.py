@@ -39,7 +39,7 @@ def collate_fn(batch, max_len=None, format='xywh'):
                 dummy_array[:total_elems[i]] = batch[i][key][:max_len]
             batch[i][key] = dummy_array
 
-    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id', 'ret', 'sal') if k in batch[0]}
+    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id', 'ret', 'sal', 'text') if k in batch[0]}
     out = default_collate(batch)
     if 'ctx' in extra:
         out['ctx'] = torch.stack(extra['ctx'])
@@ -49,6 +49,8 @@ def collate_fn(batch, max_len=None, format='xywh'):
         out['ret'] = torch.stack(extra['ret'])
     if 'sal' in extra:
         out['sal'] = torch.stack(extra['sal'])
+    if 'text' in extra:
+        out['text'] = extra['text']          # list (B) of lists of strings, one per element ('' for non-text)
     return out
 
 
@@ -177,4 +179,37 @@ class CGL(Dataset):
                 s['sal'] = s['sal'].clone(); s['sal'][0] = 1 - s['sal'][0]
         # collate_fn builds xywh from an (x, y, w, h) corner box; CGL boxes are already centred
         s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
+        return s
+
+
+class Crello(Dataset):
+    '''
+    Crello design templates (HF cyberagent/crello via scripts/prepare_crello.py): elements in z-order with type
+    (1..5: SvgElement, TextElement, ImageElement, ColoredBackground, SvgMaskElement; 0 = pad), box (cx, cy, w, h)
+    normalised by the canvas, and the text string of text elements. Boxes are clipped to the canvas (11% of
+    elements bleed outside it, mostly backgrounds).
+    '''
+    LABELS = ['SvgElement', 'TextElement', 'ImageElement', 'ColoredBackground', 'SvgMaskElement']
+    TEXT_ID = 2
+
+    def __init__(self, split='train', data_path='./crello/layout', num_cat=6, in_memory=True, clip=True, max_len=20):
+        super().__init__()
+        self.num_cat = num_cat
+        self.samples = []
+        for r in torch.load(f'{data_path}/{split}.pt'):
+            box = r['bbox'].clone()
+            if clip:
+                ltrb = torch.cat([box[:, :2] - box[:, 2:] / 2, box[:, :2] + box[:, 2:] / 2], 1).clamp(0, 1)
+                box = torch.cat([(ltrb[:, :2] + ltrb[:, 2:]) / 2, (ltrb[:, 2:] - ltrb[:, :2]).clamp(min=1e-3)], 1)
+            self.samples.append({'id': r['id'], 'type': r['type'], 'bbox': box, 'length': torch.tensor(len(r['type'])),
+                                 'text': r['text'], 'canvas': r['canvas']})
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        s = dict(self.samples[index])
+        s.pop('canvas')
+        s['bbox'] = s['bbox'].clone()
+        s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2          # collate_fn builds xywh from an (x, y, w, h) corner box
         return s
