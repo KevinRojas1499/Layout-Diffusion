@@ -40,8 +40,9 @@ class PromptEncoder(nn.Module):
 
 class LayoutFlowText(LayoutFlowVarLen):
     def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None,
-                 text_mode='joint', text_grad_to_layout=False, prompt_encoder=True, **kwargs):
+                 text_mode='joint', text_grad_to_layout=False, prompt_encoder=True, text_lr=1e-4, **kwargs):
         super().__init__(*args, **kwargs)
+        self.text_lr = text_lr                        # learning rate of the LM's LoRA / insertion head (the rest uses the layout lr)
         # prompt_encoder: the text factor reads the layout through its own encoder (PromptEncoder) instead of the
         # shared backbone's hidden states
         d = text_factor.pool[-1].out_features if text_factor is not None else 512
@@ -70,6 +71,17 @@ class LayoutFlowText(LayoutFlowVarLen):
             res = self.load_state_dict(sd, strict=False)
             print(f'[LayoutFlowText] layout backbone initialised from {init_layout_ckpt}: {len(sd)} tensors, unexpected {len(res.unexpected_keys)}')
 
+    def configure_optimizers(self):
+        # base.configure_optimizers optimises self.model (the layout backbone) only: the text factor's LoRA, insertion
+        # head, prompt/pool heads and the prompt encoder must be added, the LM parts at a lower learning rate
+        text_params = [p for n, p in self.named_parameters() if p.requires_grad and n.startswith('text_factor.model.')]
+        other = [p for n, p in self.named_parameters() if p.requires_grad and not n.startswith('text_factor.model.')]
+        lr = self.optimizer_partial.keywords.get('lr', 5e-4)
+        optimizer = self.optimizer_partial(params=[{'params': other}, {'params': text_params, 'lr': self.text_lr if self.text_lr else lr}], betas=(0.9, 0.98))
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+        freq = self._trainer.check_val_every_n_epoch if getattr(self, '_trainer', None) is not None else 1
+        return [optimizer], [{'scheduler': scheduler, 'monitor': 'val_loss', 'frequency': freq}]
+
     def state_dict(self, *args, **kwargs):
         # checkpoints carry only the trainable tensors (the frozen 7B backbone is re-loaded from the Hub)
         sd = super().state_dict(*args, **kwargs)
@@ -84,7 +96,9 @@ class LayoutFlowText(LayoutFlowVarLen):
 
     def _cond(self, h, h_glob, b, i):
         c = torch.cat([h[b, i], h_glob[b]], -1)
-        return c if self.text_grad_to_layout else c.detach()
+        # states from the prompt encoder are its own (trained by the text loss); states from the shared backbone are
+        # detached unless text_grad_to_layout
+        return c if (self.prompt_enc is not None or self.text_grad_to_layout) else c.detach()
 
     def _prompt_states(self, x, y, visible, clocks, h, h_glob):
         '''per-element / global states the prompt is built from: the prompt encoder's, or the backbone's (detached)'''
