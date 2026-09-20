@@ -39,12 +39,14 @@ def collate_fn(batch, max_len=None, format='xywh'):
                 dummy_array[:total_elems[i]] = batch[i][key][:max_len]
             batch[i][key] = dummy_array
 
-    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id') if k in batch[0]}
+    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id', 'ret') if k in batch[0]}
     out = default_collate(batch)
     if 'ctx' in extra:
         out['ctx'] = torch.stack(extra['ctx'])
     if 'id' in extra:
         out['id'] = extra['id']
+    if 'ret' in extra:
+        out['ret'] = torch.stack(extra['ret'])
     return out
 
 
@@ -104,8 +106,10 @@ class CGL(Dataset):
     LABELS = ['logo', 'text', 'underlay', 'embellishment']
     SPLITS = {'train': 'train', 'validation': 'val', 'test': 'test', 'unannotated': 'with_no_annotations_test'}
 
+    RETRIEVAL_NAMES = {'train': 'train', 'val': 'val', 'test': 'test', 'with_no_annotations_test': 'with_no_annotation'}
+
     def __init__(self, split='train', data_path='./cgl', feats_path='./canvas_feats/cgl', num_cat=5, in_memory=True,
-                 pad_empty=False, max_len=10, hflip=False, grid=8):
+                 pad_empty=False, max_len=10, hflip=False, grid=8, retrieval_k=0):
         import glob
         import pyarrow.parquet as pq
         super().__init__()
@@ -129,6 +133,22 @@ class CGL(Dataset):
                 lab = torch.cat([lab, torch.full((k,), num_cat - 1, dtype=torch.long)])
                 box = torch.cat([box, torch.zeros(k, 4)])
             self.samples.append({'id': i, 'type': lab, 'bbox': box, 'length': torch.tensor(len(lab)), 'ctx_idx': order[i]})
+        # retrieval augmentation (RALF): the K DreamSim-nearest *training* layouts of each canvas, from RALF's
+        # precomputed index tables (the train table excludes the query itself). ret (K, max_len, 5) = cx, cy, w, h, label.
+        self.retrieval_k = retrieval_k
+        if retrieval_k:
+            import os
+            cache = os.path.dirname(os.path.dirname(os.path.normpath(data_path)))
+            table = torch.load(f'{cache}/PRECOMPUTED_WEIGHT_DIR/retrieval_indexes/cgl_{self.RETRIEVAL_NAMES[name]}_dreamsim_wo_head_table_between_dataset_indexes_top_k32.pt', weights_only=False)
+            db = pq.ParquetDataset(sorted(glob.glob(f'{data_path}/train-*.parquet'))).read(columns=['label', 'center_x', 'center_y', 'width', 'height'])
+            dbc = {c: db.column(c).to_pylist() for c in db.column_names}
+            self.db = torch.zeros(len(dbc['label']), max_len, 5)
+            for n in range(len(dbc['label'])):
+                k = len(dbc['label'][n])
+                self.db[n, :k, :4] = torch.tensor([dbc[c][n] for c in ('center_x', 'center_y', 'width', 'height')], dtype=torch.float32).T.reshape(-1, 4)[:max_len]
+                self.db[n, :k, 4] = torch.tensor([self.LABELS.index(l) + 1 for l in dbc['label'][n]], dtype=torch.float32)[:max_len]
+            for smp in self.samples:
+                smp['ret_idx'] = torch.tensor(table[smp['id']][:retrieval_k])
 
     def __len__(self):
         return len(self.samples)
@@ -137,9 +157,13 @@ class CGL(Dataset):
         s = dict(self.samples[index])
         s['ctx'] = self.ctx[s.pop('ctx_idx')].float()
         s['bbox'] = s['bbox'].clone()
+        if self.retrieval_k:
+            s['ret'] = self.db[s.pop('ret_idx')].clone()
         if self.hflip and torch.rand(()) < 0.5:
             s['bbox'][:, 0] = 1 - s['bbox'][:, 0]                                   # mirror centres
             s['ctx'] = s['ctx'].view(self.grid, self.grid, -1).flip(1).reshape(self.grid * self.grid, -1)   # mirror the feature grid
+            if self.retrieval_k:
+                s['ret'][..., 0] = torch.where(s['ret'][..., 4] > 0, 1 - s['ret'][..., 0], s['ret'][..., 0])
         # collate_fn builds xywh from an (x, y, w, h) corner box; CGL boxes are already centred
         s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
         return s

@@ -45,7 +45,7 @@ class LayoutFlowVarLen(BaseGenModel):
         dataset='RICO', num_cat=6, inference_steps=100, insertion=False, t_max=1.0,
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
         geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', ralf_cache=None, fid_empty_id=None,
-        ctx_token_drop=0.0, ctx_drop=0.0, vis_dir=None, clock='coupled',
+        ctx_token_drop=0.0, ctx_drop=0.0, vis_dir=None, clock='coupled', ret_drop=0.0,
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
@@ -86,11 +86,12 @@ class LayoutFlowVarLen(BaseGenModel):
         self.ins_loss_weight = ins_loss_weight
         self.cat_drop = cat_drop
         self.ctx_token_drop, self.ctx_drop = ctx_token_drop, ctx_drop   # canvas regularisation (training only)
+        self.ret_drop = ret_drop                                          # hide the whole retrieved set for this fraction of samples
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
         self.sampling = dict(self.DEFAULT_SAMPLING)
 
-    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None, ctx_hide=None):
-        return self.model(xt, yt, exists, t, ctx, cmask, t_elem, ctx_hide)
+    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None, ctx_hide=None, ret=None, ret_hide=None):
+        return self.model(xt, yt, exists, t, ctx, cmask, t_elem, ctx_hide, ret, ret_hide)
 
     def kappa(self, t):
         return (t / self.t_max).clamp(max=1.0)
@@ -195,7 +196,10 @@ class LayoutFlowVarLen(BaseGenModel):
             B_, L_ = batch['ctx'].shape[:2]
             ctx_hide = torch.rand(B_, L_, device=self.device) < self.ctx_token_drop
             ctx_hide |= (torch.rand(B_, 1, device=self.device) < self.ctx_drop)
-        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None, ctx_hide)
+        ret_hide = None
+        if batch.get('ret') is not None and self.ret_drop > 0:
+            ret_hide = torch.rand(xt.shape[0], device=self.device) < self.ret_drop
+        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None, ctx_hide, batch.get('ret'), ret_hide)
 
         vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
         ut = x1 - x0
@@ -338,12 +342,12 @@ class LayoutFlowVarLen(BaseGenModel):
             tau[b_new, slot] = t_next
         return x, y, exists, tau
 
-    def velocity(self, x, y, exists, t, ctx=None, cmask=None):
-        v = self(x, y, exists, t, ctx, cmask)[0]
+    def velocity(self, x, y, exists, t, ctx=None, cmask=None, ret=None):
+        v = self(x, y, exists, t, ctx, cmask, ret=ret)[0]
         w = self.sampling['cfg_w']
         if w != 1.0:
             # "unconditional" = same boxes, every category hidden behind the mask token
-            v_u = self(x, torch.where(exists, torch.full_like(y, self.mask_id), y), exists, t, ctx, cmask)[0]
+            v_u = self(x, torch.where(exists, torch.full_like(y, self.mask_id), y), exists, t, ctx, cmask, ret=ret)[0]
             v = v_u + w * (v - v_u)
         return v
 
@@ -379,7 +383,7 @@ class LayoutFlowVarLen(BaseGenModel):
             x = given.unsqueeze(-1) * (held * x1 + (1 - held) * torch.randn_like(x))
         y = torch.where(given, batch['type'].long(), torch.full((B, S), self.mask_id, dtype=torch.long, device=dev))
         s = self.sampling
-        ctx = batch.get('ctx')
+        ctx, ret = batch.get('ctx'), batch.get('ret')
         tau = torch.zeros(B, S, device=dev)                                  # oneflow: insertion time per slot
         clock = s['clock'] if self.oneflow else None
         # per-element clocks (oneflow): given elements start at t_start on their own clock
@@ -411,18 +415,18 @@ class LayoutFlowVarLen(BaseGenModel):
             elif clock == 'insert_first':
                 ds = (1 - sc).clamp(max=(0.0 if t_next <= self.t_max else dt / (1 - self.t_max))) * exists
             t_elem = sc * exists if self.oneflow else None
-            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem)
+            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem, ret=ret)
             masked = exists & (y == self.mask_id)
             visible = exists & ~masked
             vis = visible.unsqueeze(-1)
             dt_elem = ds.unsqueeze(-1) if self.oneflow else dt              # own clock
             if s['cfg_w'] != 1.0:
-                v = self.velocity(x, y, exists, t, ctx, cmask)
+                v = self.velocity(x, y, exists, t, ctx, cmask, ret)
 
             # denoise (Euler; Heun once the layout is complete and nothing can change discontinuously)
             if s['solver'] == 'heun' and k >= 1.0 and i < N - 1:
                 x_e = torch.where(vis, x + v * dt, x)
-                v2 = self.velocity(x_e, y, exists, t + dt, ctx, cmask)
+                v2 = self.velocity(x_e, y, exists, t + dt, ctx, cmask, ret)
                 x = torch.where(vis, x + 0.5 * (v + v2) * dt, x)
             else:
                 x = torch.where(vis, x + v * dt_elem, x)

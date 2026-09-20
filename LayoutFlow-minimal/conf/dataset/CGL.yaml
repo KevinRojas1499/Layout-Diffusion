@@ -7,6 +7,7 @@ dataset:
   data_path: ???      # dir with {train,val,test,with_no_annotations_test}-*.parquet
   feats_path: ???     # dir with {train,val,test,with_no_annotations_test}.pt
   num_cat: 5
+  retrieval_k: 0      # RALF retrieval augmentation: K DreamSim-nearest training layouts per canvas (0 = off)
 
 batch_size: 512
 num_workers: 2

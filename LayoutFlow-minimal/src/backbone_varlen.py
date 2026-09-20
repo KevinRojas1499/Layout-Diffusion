@@ -27,7 +27,7 @@ class VarLenBackbone(nn.Module):
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
                  num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64,
-                 cond_input=False, elem_rates=False, ctx_mode='prepend', geo_bias=False):
+                 cond_input=False, elem_rates=False, ctx_mode='prepend', geo_bias=False, ret_k=0):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -52,6 +52,11 @@ class VarLenBackbone(nn.Module):
         # content-aware: canvas feature tokens (precomputed, frozen) prepended as always-visible context;
         # they carry a learned position embedding because, unlike the elements, the grid cells are ordered
         self.ctx_dim, self.ctx_mode = ctx_dim, ctx_mode      # 'prepend': canvas tokens join the self-attention; 'cross': separate cross-attention
+        # retrieval augmentation (RALF): the elements of the K retrieved layouts, embedded like the layout's own
+        # elements plus a per-retrieved-layout slot embedding, join the context tokens
+        self.ret_k = ret_k
+        if ret_k:
+            self.ret_slot = nn.Embedding(ret_k, d_model)
         if ctx_dim:
             self.ctx_embed = nn.Linear(ctx_dim, d_model)
             self.ctx_pos = nn.Parameter(torch.randn(1, ctx_len, d_model) * 0.02)
@@ -89,12 +94,13 @@ class VarLenBackbone(nn.Module):
         return f * both
 
     def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None,
-                t_elem: Tensor = None, ctx_hide: Tensor = None):
+                t_elem: Tensor = None, ctx_hide: Tensor = None, ret: Tensor = None, ret_hide: Tensor = None):
         '''
         geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None,
         cmask (B,S,5) conditioning mask over [x,y,w,h,cat] (1 = free, 0 = given) or None
         t_elem (B,S) per-element clock (OneFlow-style baseline) or None: the global/canvas tokens then use t
         ctx_hide (B,L) bool, canvas tokens to hide from attention (training-time canvas dropout) or None
+        ret (B,K,M,5) retrieved layouts (cx, cy, w, h in [0,1], label with 0 = pad) or None; ret_hide (B,) hide them all
         -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,), extra {h_glob (B,d_model), elem_rate (B,S) or None}
         '''
         x = self.elem_embed(torch.cat([self.geom_embed(geom), self.type_embed(cat)], dim=-1))
@@ -103,6 +109,18 @@ class VarLenBackbone(nn.Module):
             x = x + self.cond_embed(given)
         pre = [self.global_token.expand(x.shape[0], -1, -1)]
         ctx_tok = self.ctx_embed(ctx) + self.ctx_pos if self.ctx_dim else None
+        if self.ret_k and ret is not None:
+            assert self.ctx_dim, 'retrieval augmentation uses the context path: set ctx_dim > 0'
+            B_, K, M, _ = ret.shape
+            rgeom, rcat = 2 * ret[..., :4] - 1, ret[..., 4].long()                           # the layout's own box preprocessing
+            rtok = self.elem_embed(torch.cat([self.geom_embed(rgeom), self.type_embed(rcat)], -1)) + self.ret_slot.weight[:K].view(1, K, 1, -1)
+            rtok = rtok.reshape(B_, K * M, -1)
+            rpad = (rcat == 0).reshape(B_, K * M)
+            if ret_hide is not None:
+                rpad = rpad | ret_hide.view(-1, 1)
+            if ctx_hide is None:
+                ctx_hide = torch.zeros(B_, ctx_tok.shape[1], dtype=torch.bool, device=x.device)
+            ctx_tok, ctx_hide = torch.cat([ctx_tok, rtok], 1), torch.cat([ctx_hide, rpad], 1)
         if self.ctx_dim and self.ctx_mode == 'prepend':
             pre.append(ctx_tok)
         n_pre = sum(p.shape[1] for p in pre)
