@@ -49,3 +49,7 @@ model:
   ctx_token_drop: 0.0     # content-aware: hide this fraction of canvas tokens per sample during training
   ctx_drop: 0.0           # content-aware: hide the whole canvas for this fraction of samples during training
   ret_drop: 0.0           # retrieval: hide the whole retrieved set for this fraction of samples during training
+  relation_loss_weight: 0.0   # content-aware: hinge on strict (underlay contains text) for the data's pairs, on the predicted clean boxes
+  relation_text_id: 2
+  relation_underlay_id: 3
+  relation_margin: 0.01       # canvas units

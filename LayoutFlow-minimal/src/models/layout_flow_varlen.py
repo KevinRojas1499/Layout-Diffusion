@@ -46,6 +46,7 @@ class LayoutFlowVarLen(BaseGenModel):
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
         geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', ralf_cache=None, fid_empty_id=None,
         ctx_token_drop=0.0, ctx_drop=0.0, vis_dir=None, clock='coupled', ret_drop=0.0,
+        relation_loss_weight=0.0, relation_text_id=2, relation_underlay_id=3, relation_margin=0.01,
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
@@ -87,6 +88,10 @@ class LayoutFlowVarLen(BaseGenModel):
         self.cat_drop = cat_drop
         self.ctx_token_drop, self.ctx_drop = ctx_token_drop, ctx_drop   # canvas regularisation (training only)
         self.ret_drop = ret_drop                                          # hide the whole retrieved set for this fraction of samples
+        # containment relation loss (content-aware datasets): for every ground-truth (underlay contains text) pair, a hinge
+        # on the predicted clean boxes x1_hat = x_t + (1 - t) v so that the text stays strictly inside the underlay with a margin
+        self.relation_loss_weight, self.relation_text_id, self.relation_underlay_id, self.relation_margin = \
+            relation_loss_weight, relation_text_id, relation_underlay_id, relation_margin
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
         self.sampling = dict(self.DEFAULT_SAMPLING)
 
@@ -174,6 +179,30 @@ class LayoutFlowVarLen(BaseGenModel):
         yt = torch.where(visible, y1, torch.full_like(y1, self.mask_id))
         return xt, yt, exists, visible, x0, x1, y1, free
 
+    def relation_loss(self, xt, vt, x1, y1, visible, s):
+        '''
+        Hinge on strict containment of the predicted clean boxes, for the (underlay, text) pairs that are contained in
+        the data. Boxes are cx, cy, w, h in the preprocessed [-1, 1] space (an affine map, so containment is preserved;
+        the margin is given in canvas units and scaled by 2). Pairs are weighted by the elements' clocks (a prediction at
+        s ~ 0 is noise) and the loss is averaged over pairs.
+        '''
+        x1_hat = xt + (1 - s).unsqueeze(-1) * vt
+        ltrb = lambda b: torch.cat([b[..., :2] - b[..., 2:] / 2, b[..., :2] + b[..., 2:] / 2], -1)
+        p, g = ltrb(x1_hat), ltrb(x1)
+        under = visible & (y1 == self.relation_underlay_id)
+        text = visible & (y1 == self.relation_text_id)
+        # ground-truth containment (B, S_under, S_text)
+        inside = ((g[:, None, :, 0] >= g[:, :, None, 0]) & (g[:, None, :, 1] >= g[:, :, None, 1]) &
+                  (g[:, None, :, 2] <= g[:, :, None, 2]) & (g[:, None, :, 3] <= g[:, :, None, 3]))
+        pair = under[:, :, None] & text[:, None, :] & inside
+        if not pair.any():
+            return vt.sum() * 0
+        m = 2 * self.relation_margin
+        viol = (F.relu(m + p[:, :, None, 0] - p[:, None, :, 0]) + F.relu(m + p[:, :, None, 1] - p[:, None, :, 1]) +
+                F.relu(m + p[:, None, :, 2] - p[:, :, None, 2]) + F.relu(m + p[:, None, :, 3] - p[:, :, None, 3]))
+        w = (s[:, :, None] * s[:, None, :]).sqrt() * pair
+        return (viol * w).sum() / w.sum().clamp(min=1e-6)
+
     def training_step(self, batch, batch_idx):
         t = torch.rand(batch['bbox'].shape[0], device=self.device)
         cmask = self.cond_mask(batch, self.cond) if self.cond != 'uncond' else None
@@ -205,6 +234,10 @@ class LayoutFlowVarLen(BaseGenModel):
         ut = x1 - x0
         flow_loss = self.loss_fcn(vis * vt, vis * ut)
         loss = flow_loss
+        if self.relation_loss_weight > 0:
+            rel_loss = self.relation_loss(xt, vt, x1, y1, visible, self._t_elem if self.oneflow else t.view(-1, 1).expand_as(visible))
+            self.log('relation_loss', rel_loss, on_step=True, on_epoch=True, sync_dist=True)
+            loss = loss + self.relation_loss_weight * rel_loss
         self.log('flow_loss', flow_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         if self.add_loss:
             assert self.add_loss == 'geom_l1_loss'
