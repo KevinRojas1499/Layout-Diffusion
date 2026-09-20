@@ -18,6 +18,7 @@ model:
   text_chunk: 512             # text sequences per LM forward
   init_layout_ckpt: null      # layout-only checkpoint to start the layout backbone from
   init_ckpt: null             # previous layout + text checkpoint to continue from
+  text_mode: joint            # joint (the model) | caption (layout-then-caption baseline: same LM, text after the layout, no coupling)
   optimizer:
     _partial_: true
     _target_: torch.optim.AdamW

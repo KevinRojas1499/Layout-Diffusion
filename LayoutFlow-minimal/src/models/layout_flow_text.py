@@ -15,10 +15,16 @@ from src.models.layout_flow_varlen import LayoutFlowVarLen
 
 
 class LayoutFlowText(LayoutFlowVarLen):
-    def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None, **kwargs):
+    def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None,
+                 text_mode='joint', **kwargs):
         super().__init__(*args, **kwargs)
         self.text_factor = text_factor                # src.text_factor.TextFactor (hydra-instantiated)
         self.text_id, self.text_loss_weight, self.text_chunk = text_id, text_loss_weight, text_chunk
+        # 'joint': text and boxes co-evolve on the element clocks, coupled both ways (the model);
+        # 'caption': the layout-then-caption baseline -- the text factor is conditioned on the *clean* layout only, no
+        #            text -> layout feature, and the text is sampled after the layout is finished (same LM, same LoRA)
+        assert text_mode in ('joint', 'caption')
+        self.text_mode = text_mode
         self.save_hyperparameters(ignore=['backbone_model', 'sampler', 'text_factor'])
         if init_ckpt:                                 # continue from a previous layout + text run (all trainable tensors)
             sd = torch.load(init_ckpt, map_location='cpu', weights_only=False)['state_dict']
@@ -57,6 +63,10 @@ class LayoutFlowText(LayoutFlowVarLen):
         b_idx, i_idx = torch.nonzero(sel, as_tuple=True)
         strings = [batch['text'][b][i] for b, i in zip(b_idx.tolist(), i_idx.tolist())]
         x1, attn = tf.encode(strings, self.device)
+        if self.text_mode == 'caption':               # own time, independent of the layout; no feature into the layout
+            t = torch.rand(len(b_idx), device=self.device).clamp(1e-4, 1 - 1e-4)
+            xt, xt_attn, st, masked, gaps, ins_mask = tf.noisy(x1, attn, t)
+            return None, dict(b=b_idx, i=i_idx, x1=x1, xt=xt, attn=xt_attn, st=st, masked=masked, gaps=gaps, ins_mask=ins_mask, t=t, batch=batch)
         t = clocks[b_idx, i_idx].clamp(1e-4, 1 - 1e-4)
         xt, xt_attn, st, masked, gaps, ins_mask = tf.noisy(x1, attn, t)
         feat = torch.zeros(*visible.shape, tf.pool[-1].out_features, device=self.device)
@@ -67,6 +77,8 @@ class LayoutFlowText(LayoutFlowVarLen):
         if state is None:
             return None
         tf = self.text_factor
+        if self.text_mode == 'caption':               # condition on the clean layout
+            h, h_glob = self._clean_layout_states(state['batch'])
         cond = self._cond(h, h_glob, state['b'], state['i'])
         unmask_loss = ins_loss = 0.0
         n = state['xt'].shape[0]
@@ -80,14 +92,27 @@ class LayoutFlowText(LayoutFlowVarLen):
         self.log('text_ins_loss', ins_loss, on_step=True, on_epoch=True, sync_dist=True)
         return self.text_loss_weight * (unmask_loss + ins_loss)
 
+    def _clean_layout_states(self, batch, x1=None, y1=None, active=None):
+        '''layout backbone on the finished layout (t = 1, every element visible and clean)'''
+        if x1 is None:
+            active = batch['mask'].squeeze(-1); y1 = batch['type'].long(); x1 = active.unsqueeze(-1) * self.sampler.preprocess(batch['bbox'])
+        B = x1.shape[0]
+        t = torch.ones(B, device=self.device); t_elem = active.float() if self.oneflow else None
+        _, _, h, _, extra = self(x1, y1, active, t, batch.get('ctx'), None, t_elem, None, batch.get('ret'), None, batch.get('sal'))
+        return h, extra['h_glob']
+
     # ---------------- sampling ----------------
     def _text_infer_init(self, batch):
+        if self.text_mode == 'caption':
+            return {'batch': batch}
         B, S = batch['type'].shape
         tf = self.text_factor
         xt, attn = tf.empty_state(B * S, self.device)
         return dict(xt=xt.view(B, S, -1), attn=attn.view(B, S, -1), alive=torch.zeros(B, S, dtype=torch.bool, device=self.device))
 
     def _text_infer_pre(self, state, visible, y, clocks):
+        if self.text_mode == 'caption':
+            return None
         tf = self.text_factor
         sel = visible & (y == self.text_id)
         # elements that just became visible text elements start from the empty state
@@ -103,6 +128,8 @@ class LayoutFlowText(LayoutFlowVarLen):
         return feat
 
     def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last):
+        if self.text_mode == 'caption':
+            return state
         tf = self.text_factor
         sel = state['alive']
         if not sel.any():
@@ -115,9 +142,23 @@ class LayoutFlowText(LayoutFlowVarLen):
         state['xt'][sel] = xt; state['attn'][sel] = attn
         return state
 
-    def _text_infer_finish(self, state, exists, order):
+    def _text_infer_finish(self, state, exists, order, x=None, y=None, ctx=None, ret=None, sal=None):
         tf = self.text_factor
         B, S = exists.shape
+        if self.text_mode == 'caption':               # caption the finished layout: N text steps with a fixed condition
+            batch = dict(state['batch']); batch.update(ctx=ctx, ret=ret, sal=sal)
+            h, h_glob = self._clean_layout_states(batch, x, y, exists)
+            sel = exists & (y == self.text_id)
+            xt_all, attn_all = tf.empty_state(B * S, self.device); xt_all, attn_all = xt_all.view(B, S, -1), attn_all.view(B, S, -1)
+            if sel.any():
+                b_idx, i_idx = torch.nonzero(sel, as_tuple=True)
+                cond = self._cond(h, h_glob, b_idx, i_idx)
+                xt, attn = tf.empty_state(len(b_idx), self.device)
+                N = self.inference_steps; dt = torch.full((len(b_idx),), 1.0 / N, device=self.device)
+                for k in range(N):
+                    xt, attn = tf.step(xt, attn, torch.full((len(b_idx),), k / N, device=self.device), dt, cond, last=(k == N - 1))
+                xt_all[sel] = xt; attn_all[sel] = attn
+            state = dict(xt=xt_all, attn=attn_all, alive=sel)
         xt = state['xt'].gather(1, order.unsqueeze(-1).expand_as(state['xt']))
         attn = state['attn'].gather(1, order.unsqueeze(-1).expand_as(state['attn']))
         alive = state['alive'].gather(1, order)

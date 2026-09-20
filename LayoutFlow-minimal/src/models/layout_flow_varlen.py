@@ -109,7 +109,7 @@ class LayoutFlowVarLen(BaseGenModel):
         return None
     def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last):
         return state
-    def _text_infer_finish(self, state, exists, order):
+    def _text_infer_finish(self, state, exists, order, x=None, y=None, ctx=None, ret=None, sal=None):
         return None
 
     def kappa(self, t):
@@ -553,7 +553,7 @@ class LayoutFlowVarLen(BaseGenModel):
 
         # pack the generated elements to the front, as the dataset does
         order = exists.int().argsort(dim=1, descending=True, stable=True)
-        self.last_texts = self._text_infer_finish(text_state, exists, order)
+        self.last_texts = self._text_infer_finish(text_state, exists, order, x, y, ctx, ret, sal)
         x, y, exists = x.gather(1, order.unsqueeze(-1).expand_as(x)), y.gather(1, order), exists.gather(1, order)
         geom = exists.unsqueeze(-1) * self.sampler.preprocess(x, reverse=True)
         if s['snap_grid']:
