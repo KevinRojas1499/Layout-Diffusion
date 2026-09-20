@@ -468,7 +468,8 @@ split, best-by-val ep 689 / last ep 999):
 | RALF (their released outputs) | 1.32 | 0.126 | 0.018 | 0.992 | 0.978 | 0.0042 | 1.08 |
 | real test layouts (ceiling) | 0.80 | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
 
-| same recipe with per-element clocks (`insertion=oneflow`, `cgl-oneflow-canvas-crossg-regflip-geo`, ep 399 / 999) | 2.28 / 2.72 | 0.153 / 0.151 | 0.023 | 0.912 / 0.931 | 0.716 / 0.777 | 0.0102 / **0.0073** | 1.64 / 1.59 |
+| same recipe with per-element clocks (`insertion=oneflow`, `cgl-oneflow-canvas-crossg-regflip-geo`, ep 399 / 999) | 2.28 / 2.72 | 0.153 / 0.151 | 0.023 | 0.912 / 0.931 | 0.716 / 0.777 | 0.0102 / 0.0073 | 1.64 / 1.59 |
+| same recipe + RALF retrieval, 16 nearest training layouts (`...-geo-ret16`, `dataset.dataset.retrieval_k=16 backbone_model.ret_k=16 ret_drop=0.1`, ep 689 / 999) | 1.78 / 1.94 | 0.154 / 0.152 | 0.023 / 0.022 | 0.945 / **0.950** | 0.825 / **0.832** | 0.0070 / **0.0059** | 1.51 / **1.48** |
 
 The geometric bias closes most of the FID gap to RALF (2.41 -> 1.53, RALF 1.32) and gives the lowest overlap of any
 run, at a small cost in strict underlay (0.78 vs 0.80) and count (1.54 vs 1.47). Per-element clocks, which win by
@@ -477,7 +478,18 @@ vs 1.54 (only overlay improves, 0.0073 at the last checkpoint); its validation F
 the GMM-reveal run kept improving to 1.19. A plausible reason is that on CGL an element's box is strongly determined
 by the canvas and the other elements at the moment it is inserted (underlay under text, text beside the product),
 so revealing it from a posterior sample is a better start than pure noise; on RICO the box posterior at insertion is
-broad. GMM reveal stays the CGL recipe. The early ep-239 checkpoint of the
+broad. GMM reveal stays the CGL recipe.
+
+**Retrieval augmentation** (RALF's ingredient: the 16 DreamSim-nearest *training* layouts of each canvas, from
+RALF's precomputed index tables, embedded with the layout's own element embedder + a per-retrieved-layout slot
+embedding and appended to the canvas tokens on the cross-attention path; commit e7711a6). It fits more slowly (val
+FID 2.95 at ep 389 vs 1.36 without) and ends mixed: the graphic metrics improve to the best values of any trained
+model -- strict underlay 0.825 / 0.832 (vs 0.784), overlay 0.0070 / 0.0059 (vs 0.0097), count 1.51 / 1.48 (vs 1.54)
+-- while FID is 0.25-0.4 worse (1.78 / 1.94 vs 1.53) and occlusion unchanged. The retrieved layouts are used for
+the geometric conventions (underlay under text, non-overlap, how many elements) rather than as a copy source, and
+the count gain is far from RALF's (1.08). So retrieval does not bridge the gap on its own; the remaining
+difference to RALF (Und_s 0.98, count 1.08) is where its autoregressive 128-bin decoder copies exact coordinates
+and counts from the retrieved layouts, which a continuous set generator does not do. The early ep-239 checkpoint of the
 same run scored FID 1.94 / Und_s 0.66, so the underlay metric is the one that needs the long training. What remains
 between us and RALF is the underlay/occlusion/count triple, i.e. how well the canvas is *used*, not the layout prior.
 
