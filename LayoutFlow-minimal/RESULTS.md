@@ -698,3 +698,27 @@ data's, and lines/height most of the way. Weaknesses: the copy is repetitive (di
 *below* real text, the signature of generic phrasing) and the model over-generates elements (10.6 vs 9.6). This is the
 bar for the joint arms -- the concurrent one (v4) fails it structurally (length correlation -0.13, see above), and
 `crello-text-v5-lag` tests whether lagging the text clock recovers it.
+
+**Concurrent arm, full metrics (`crello-text-v4`, stopped at epoch 145).**
+
+| | concurrent (145 ep) | caption (220 ep) | real |
+|---|---|---|---|
+| elements per layout | **9.61** | 10.58 | 9.58 |
+| corr(chars, box width) | 0.041 | **0.258** | 0.211 |
+| corr(chars, box area) | 0.148 | 0.166 | 0.155 |
+| corr(lines, box height) | **0.648** | 0.253 | 0.340 |
+| empty strings | 0.026 | 0.013 | 0 |
+| chars per string | 12.7 | 17.6 | 19.0 |
+| distinct-1 / -2 | 0.040 / 0.118 | 0.109 / 0.317 | 0.262 / 0.589 |
+| NLL / token | 3.23 | 3.51 | 4.15 |
+
+More nuanced than the insertion-head probe alone suggested: the concurrent model gets the element count essentially
+exact (9.61 vs 9.58, where the caption baseline over-generates at 10.58) and ties lines to box height *more* strongly
+than the data (0.65 vs 0.34), but never learns the width relation (0.04 vs 0.21). That is exactly what the timing
+account predicts: the number of inserted tokens -- hence the line count -- is an early, coarse decision that the
+still-noisy box can inform, while chars-per-line depends on the precise width, which settles only late. Its copy is
+also the most repetitive of the three (distinct-1 0.04). Caveat: 145 epochs against the baseline's 220.
+
+**Content-aware Crello launched (2026-09-21 04:50).** `crello-canvas-text-v1`: plates -> DINOv2 (64, 384) per
+template, gated cross-attention + geometric bias + token dropout 0.5 / canvas dropout 0.1 + hflip (the CGL recipe),
+with the lagged text clock. 22,037 canvases, 71% real image plates and 29% flat colour.
