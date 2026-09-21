@@ -722,3 +722,42 @@ also the most repetitive of the three (distinct-1 0.04). Caveat: 145 epochs agai
 **Content-aware Crello launched (2026-09-21 04:50).** `crello-canvas-text-v1`: plates -> DINOv2 (64, 384) per
 template, gated cross-attention + geometric bias + token dropout 0.5 / canvas dropout 0.1 + hflip (the CGL recipe),
 with the lagged text clock. 22,037 canvases, 71% real image plates and 29% flat colour.
+
+**Lagged text clock (`crello-text-v5-lag`, 210 epochs, stopped for GPUs).** `model.text_lag=0.5`, canvas-blind:
+
+| | concurrent (v4) | lagged (v5) | caption | real |
+|---|---|---|---|---|
+| elements per layout | 9.61 | **9.58** | 10.58 | 9.58 |
+| corr(chars, box width) | 0.041 | **0.154** | 0.258 | 0.211 |
+| corr(chars, box area) | 0.148 | 0.312 | 0.166 | 0.155 |
+| corr(lines, box height) | 0.648 | 0.593 | 0.253 | 0.340 |
+| distinct-1 / -2 | 0.040 / 0.118 | 0.037 / 0.123 | 0.109 / 0.317 | 0.262 / 0.589 |
+| empty strings | 0.026 | 0.044 | 0.013 | 0 |
+| chars per string | 12.7 | 12.2 | 17.6 | 19.0 |
+
+Lagging the text clock restores the width relation (0.04 -> 0.15), confirming the timing account, and keeps the exact
+element count; but the copy is the most repetitive of all arms. The text factor, not the layout, is the weak link.
+
+## Reproducing MarkupDM (Kikuchi et al., ACM MM 2025) -- the reference for text in Crello designs
+
+User verdict on our canvas samples (https://claude.ai/artifact/CVx9hsZCWf5b9d1HMuYHUi): "terrible"; decision: step back
+and reproduce published work. No Crello repo uses diffusion for structured designs (FlexDM = masked-field prediction,
+CanvasVAE = VAE, MarkupDM = fill-in-the-middle AR over markup + VQ image tokens; OpenCOLE / CreatiDesign diffuse in
+image space). MarkupDM chosen: PyTorch, released weights (`cyberagent/markupdm`, StarCoderBase-7B base), and it
+completes *text* in Crello designs -- our failing component.
+
+Setup (all without root): repo at `$LAB/repos/MarkupDM`, env via its `uv.lock` (**Python >= 3.12**), weights in
+`$LAB/models/markupdm`; its renderer shells out to `google-chrome`, provided by Chrome for Testing's
+`chrome-headless-shell` + six Ubuntu 22.04 libraries unpacked with `apt-get download` / `dpkg -x` (`$LAB/tools`).
+The released repo is a single-sample demo with no evaluation; the loop (`$LAB/claude-work/eval_markupdm_text.py`) wraps
+the authors' own functions.
+
+Protocol (paper sec. 5.2.1 + FlexDM): Crello **v5.0.0** test split (2,107 templates; their loader pins the revision);
+every `<text ...>[MASK]</text>` span is a target; top-p 0.9, top_k 0, max 50 tokens; score = cosine similarity of
+768-d CLIP ViT-L/14 text features **mapped to [0,1] as (1+cos)/2** (FlexDM's `-0.5 * keras_cosine_loss + 0.5`).
+Target: **0.874** (MarkupDM, StarCoderBase-7B), FlexDM 0.813.
+
+Early warning from a 13-span smoke test: the shuffled-pair floor (each prediction scored against a random other
+target) is **0.867** -- CLIP text features of short strings are all close (raw cos ~0.73 for unrelated strings), so
+(1+cos)/2 compresses everything into ~0.85-0.93 and barely discriminates. To be confirmed on the full set; report
+exact match (and chrF / BERTScore) alongside. Full run launched 2026-09-21 10:15 on GPUs 0-1 (2 shards, ~5 h).
