@@ -658,3 +658,23 @@ serve the prompt -- which is what degraded the boxes in v3 (flow loss 0.27 -> 0.
 through the pooled text feature), and all trainable tensors are in the optimizer (LoRA / insertion head at lr 1e-4,
 the rest at the layout lr). `crello-text-v4` (joint) and `crello-caption-v1` (layout-then-caption baseline) relaunched
 with this, 220 epochs each, from the blind layout init.
+
+**The concurrent joint model cannot size its text (2026-09-20 23:30).** A sampling-free measurement: FlexMDM's insertion
+head predicts the expected number of missing tokens, so evaluated on an *empty* text whose prompt encodes the element,
+`exp(g)` is the model's predicted text length for that box. On 363 test text elements:
+
+| | predicted vs true length | corr with box width | corr with box area | corr with box height |
+|---|---|---|---|---|
+| joint, concurrent clocks (`crello-text-v4`, ep 145) | mean 6.1 vs 6.1, corr **-0.13** | 0.11 | 0.06 | -0.01 |
+| caption baseline (`crello-caption-v1`, ep 138) | mean 5.5 vs 6.1, corr **+0.37** | **0.27** | **0.17** | **0.13** |
+| real data | - | 0.15 | 0.17 | 0.11 |
+
+The caption model reproduces the data's box-size / text-length correlations almost exactly; the concurrent joint model
+does not learn the relation at all, though its average length is calibrated. Cause: under the power schedule
+(insertion exponent 1.7) half the insertions happen by clock 0.33, so the joint model commits to a length while its own
+box is still mostly noise -- the same mechanism behind the letter-stacking samples. It is structural, not a budget
+issue (the baseline reached +0.37 with the same budget). `crello-text-v4` was stopped at epoch 145 (checkpoint kept,
+resumable) and replaced by `crello-text-v5-lag` (`model.text_lag=0.5`: the text clock trails the box clock, so tokens
+commit only once the box has settled, while both still finish together and the text still feeds back into the layout).
+Note the concurrent arm's one win, which the lagged arm should keep: its layout loss improved over training
+(0.205 -> 0.190) while the caption baseline's stayed flat at 0.205, i.e. the text feature does help the boxes.
