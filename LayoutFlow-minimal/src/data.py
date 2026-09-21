@@ -39,12 +39,18 @@ def collate_fn(batch, max_len=None, format='xywh'):
                 dummy_array[:total_elems[i]] = batch[i][key][:max_len]
             batch[i][key] = dummy_array
 
-    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id') if k in batch[0]}
+    extra = {k: [b.pop(k) for b in batch] for k in ('ctx', 'id', 'ret', 'sal', 'text') if k in batch[0]}
     out = default_collate(batch)
     if 'ctx' in extra:
         out['ctx'] = torch.stack(extra['ctx'])
     if 'id' in extra:
         out['id'] = extra['id']
+    if 'ret' in extra:
+        out['ret'] = torch.stack(extra['ret'])
+    if 'sal' in extra:
+        out['sal'] = torch.stack(extra['sal'])
+    if 'text' in extra:
+        out['text'] = extra['text']          # list (B) of lists of strings, one per element ('' for non-text)
     return out
 
 
@@ -104,8 +110,10 @@ class CGL(Dataset):
     LABELS = ['logo', 'text', 'underlay', 'embellishment']
     SPLITS = {'train': 'train', 'validation': 'val', 'test': 'test', 'unannotated': 'with_no_annotations_test'}
 
+    RETRIEVAL_NAMES = {'train': 'train', 'val': 'val', 'test': 'test', 'with_no_annotations_test': 'with_no_annotation'}
+
     def __init__(self, split='train', data_path='./cgl', feats_path='./canvas_feats/cgl', num_cat=5, in_memory=True,
-                 pad_empty=False, max_len=10):
+                 pad_empty=False, max_len=10, hflip=False, grid=8, retrieval_k=0, salbox=False):
         import glob
         import pyarrow.parquet as pq
         super().__init__()
@@ -119,6 +127,7 @@ class CGL(Dataset):
         self.ctx = feats['feats']
         # padding baseline: every layout has max_len elements, the missing ones of an 'empty' class (id num_cat-1)
         self.pad_empty, self.max_len = pad_empty, max_len
+        self.hflip, self.grid = hflip and split == 'train', grid       # mirror canvas + layout w.p. 0.5 (training only)
         self.samples = []
         for n, i in enumerate(cols['id']):
             lab = torch.tensor([self.LABELS.index(l) + 1 for l in cols['label'][n]], dtype=torch.long)
@@ -128,6 +137,29 @@ class CGL(Dataset):
                 lab = torch.cat([lab, torch.full((k,), num_cat - 1, dtype=torch.long)])
                 box = torch.cat([box, torch.zeros(k, 4)])
             self.samples.append({'id': i, 'type': lab, 'bbox': box, 'length': torch.tensor(len(lab)), 'ctx_idx': order[i]})
+        # retrieval augmentation (RALF): the K DreamSim-nearest *training* layouts of each canvas, from RALF's
+        # precomputed index tables (the train table excludes the query itself). ret (K, max_len, 5) = cx, cy, w, h, label.
+        # saliency bounding box token (LayoutDiT / LayoutGD): scripts/precompute_salbox.py -> {split}_salbox.pt
+        self.salbox = salbox
+        if salbox:
+            sb = torch.load(f'{feats_path}/{name}_salbox.pt')
+            sb_order = {i: n for n, i in enumerate(sb['id'])}
+            for smp in self.samples:
+                smp['sal'] = sb['salbox'][sb_order[smp['id']]]
+        self.retrieval_k = retrieval_k
+        if retrieval_k:
+            import os
+            cache = os.path.dirname(os.path.dirname(os.path.normpath(data_path)))
+            table = torch.load(f'{cache}/PRECOMPUTED_WEIGHT_DIR/retrieval_indexes/cgl_{self.RETRIEVAL_NAMES[name]}_dreamsim_wo_head_table_between_dataset_indexes_top_k32.pt', weights_only=False)
+            db = pq.ParquetDataset(sorted(glob.glob(f'{data_path}/train-*.parquet'))).read(columns=['label', 'center_x', 'center_y', 'width', 'height'])
+            dbc = {c: db.column(c).to_pylist() for c in db.column_names}
+            self.db = torch.zeros(len(dbc['label']), max_len, 5)
+            for n in range(len(dbc['label'])):
+                k = len(dbc['label'][n])
+                self.db[n, :k, :4] = torch.tensor([dbc[c][n] for c in ('center_x', 'center_y', 'width', 'height')], dtype=torch.float32).T.reshape(-1, 4)[:max_len]
+                self.db[n, :k, 4] = torch.tensor([self.LABELS.index(l) + 1 for l in dbc['label'][n]], dtype=torch.float32)[:max_len]
+            for smp in self.samples:
+                smp['ret_idx'] = torch.tensor(table[smp['id']][:retrieval_k])
 
     def __len__(self):
         return len(self.samples)
@@ -135,6 +167,65 @@ class CGL(Dataset):
     def __getitem__(self, index):
         s = dict(self.samples[index])
         s['ctx'] = self.ctx[s.pop('ctx_idx')].float()
+        s['bbox'] = s['bbox'].clone()
+        if self.retrieval_k:
+            s['ret'] = self.db[s.pop('ret_idx')].clone()
+        if self.hflip and torch.rand(()) < 0.5:
+            s['bbox'][:, 0] = 1 - s['bbox'][:, 0]                                   # mirror centres
+            s['ctx'] = s['ctx'].view(self.grid, self.grid, -1).flip(1).reshape(self.grid * self.grid, -1)   # mirror the feature grid
+            if self.retrieval_k:
+                s['ret'][..., 0] = torch.where(s['ret'][..., 4] > 0, 1 - s['ret'][..., 0], s['ret'][..., 0])
+            if self.salbox:
+                s['sal'] = s['sal'].clone(); s['sal'][0] = 1 - s['sal'][0]
         # collate_fn builds xywh from an (x, y, w, h) corner box; CGL boxes are already centred
-        s['bbox'] = s['bbox'].clone(); s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
+        s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2
+        return s
+
+
+class Crello(Dataset):
+    '''
+    Crello design templates (HF cyberagent/crello via scripts/prepare_crello.py): elements in z-order with type
+    (1..5: SvgElement, TextElement, ImageElement, ColoredBackground, SvgMaskElement; 0 = pad), box (cx, cy, w, h)
+    normalised by the canvas, and the text string of text elements. Boxes are clipped to the canvas (11% of
+    elements bleed outside it, mostly backgrounds).
+    '''
+    LABELS = ['SvgElement', 'TextElement', 'ImageElement', 'ColoredBackground', 'SvgMaskElement']
+    TEXT_ID = 2
+
+    def __init__(self, split='train', data_path='./crello/layout', num_cat=6, in_memory=True, clip=True, max_len=20,
+                 feats_path=None, hflip=False, grid=8):
+        super().__init__()
+        self.num_cat = num_cat
+        self.samples = []
+        # content-aware: the canvas plate is element 0 of the template (scripts/prepare_crello_plates.py), so the
+        # layouts come from {split}_canvas.pt (plate removed) and the frozen DINOv2 features from feats_path
+        self.ctx = None
+        if feats_path:
+            f = torch.load(f'{feats_path}/{split}.pt')
+            self.ctx, order = f['feats'], {i: n for n, i in enumerate(f['id'])}
+        self.hflip, self.grid = hflip and split == 'train', grid
+        for r in torch.load(f'{data_path}/{split}_canvas.pt' if feats_path else f'{data_path}/{split}.pt'):
+            box = r['bbox'].clone()
+            if clip:
+                ltrb = torch.cat([box[:, :2] - box[:, 2:] / 2, box[:, :2] + box[:, 2:] / 2], 1).clamp(0, 1)
+                box = torch.cat([(ltrb[:, :2] + ltrb[:, 2:]) / 2, (ltrb[:, 2:] - ltrb[:, :2]).clamp(min=1e-3)], 1)
+            smp = {'id': r['id'], 'type': r['type'], 'bbox': box, 'length': torch.tensor(len(r['type'])),
+                   'text': r['text'], 'canvas': r['canvas']}
+            if self.ctx is not None:
+                smp['ctx_idx'] = order[r['id']]
+            self.samples.append(smp)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        s = dict(self.samples[index])
+        s.pop('canvas')
+        s['bbox'] = s['bbox'].clone()
+        if self.ctx is not None:
+            s['ctx'] = self.ctx[s.pop('ctx_idx')].float()
+            if self.hflip and torch.rand(()) < 0.5:
+                s['bbox'][:, 0] = 1 - s['bbox'][:, 0]                                # mirror centres
+                s['ctx'] = s['ctx'].view(self.grid, self.grid, -1).flip(1).reshape(self.grid * self.grid, -1)
+        s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2          # collate_fn builds xywh from an (x, y, w, h) corner box
         return s

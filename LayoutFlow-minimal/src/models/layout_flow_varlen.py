@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,7 +45,8 @@ class LayoutFlowVarLen(BaseGenModel):
         dataset='RICO', num_cat=6, inference_steps=100, insertion=False, t_max=1.0,
         unmask_geom='gmm', add_loss='', add_loss_weight=1, cat_loss_weight=0.25,
         geom_unmask_weight=0.05, ins_loss_weight=0.1, cat_drop=0.0, cond='uncond', ralf_cache=None, fid_empty_id=None,
-        vis_dir=None,
+        ctx_token_drop=0.0, ctx_drop=0.0, vis_dir=None, clock='coupled', ret_drop=0.0,
+        relation_loss_weight=0.0, relation_text_id=2, relation_underlay_id=3, relation_margin=0.01,
     ):
         self.format = format
         self.fid_calc_every_n = fid_calc_every_n
@@ -69,6 +71,11 @@ class LayoutFlowVarLen(BaseGenModel):
         # baseline: per-element rates, the new element arrives with its class and a box at the current noise level)
         self.editflow = insertion in ('editflow', 'oneflow')
         self.oneflow = insertion == 'oneflow'      # + per-element clocks: an inserted box starts from pure noise at its own t = 0
+        # oneflow clocks at training time: 'coupled' = s_i is a function of t and the insertion time (the synchronised
+        # sampling path); 'decoupled' = s_i ~ U(0,1) independently of t (Diffuse-Everything-style product of times:
+        # every monotone clock policy at sampling time is then on-distribution, see DEFAULT_SAMPLING['clock'])
+        assert clock in ('coupled', 'decoupled')
+        self.clock = clock
         self.insertion = bool(insertion)
         self.t_max = t_max
         self.unmask_geom = unmask_geom
@@ -79,11 +86,31 @@ class LayoutFlowVarLen(BaseGenModel):
         self.geom_unmask_weight = geom_unmask_weight
         self.ins_loss_weight = ins_loss_weight
         self.cat_drop = cat_drop
+        self.ctx_token_drop, self.ctx_drop = ctx_token_drop, ctx_drop   # canvas regularisation (training only)
+        self.ret_drop = ret_drop                                          # hide the whole retrieved set for this fraction of samples
+        # containment relation loss (content-aware datasets): for every ground-truth (underlay contains text) pair, a hinge
+        # on the predicted clean boxes x1_hat = x_t + (1 - t) v so that the text stays strictly inside the underlay with a margin
+        self.relation_loss_weight, self.relation_text_id, self.relation_underlay_id, self.relation_margin = \
+            relation_loss_weight, relation_text_id, relation_underlay_id, relation_margin
         self.save_hyperparameters(ignore=['backbone_model', 'sampler'])
         self.sampling = dict(self.DEFAULT_SAMPLING)
 
-    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None):
-        return self.model(xt, yt, exists, t, ctx, cmask, t_elem)
+    def forward(self, xt, yt, exists, t, ctx=None, cmask=None, t_elem=None, ctx_hide=None, ret=None, ret_hide=None, sal=None, elem_extra=None):
+        return self.model(xt, yt, exists, t, ctx, cmask, t_elem, ctx_hide, ret, ret_hide, sal, elem_extra)
+
+    # ---- hooks for a per-element text factor (src/models/layout_flow_text.py); no-ops here ----
+    def _text_pre(self, batch, visible, y, clocks, x=None):
+        return None, None
+    def _text_post(self, state, h, h_glob):
+        return None
+    def _text_infer_init(self, batch):
+        return None
+    def _text_infer_pre(self, state, visible, y, clocks):
+        return None
+    def _text_infer_step(self, state, h, h_glob, visible, y, clocks, ds, last, x=None):
+        return state
+    def _text_infer_finish(self, state, exists, order, x=None, y=None, ctx=None, ret=None, sal=None):
+        return None
 
     def kappa(self, t):
         return (t / self.t_max).clamp(max=1.0)
@@ -121,11 +148,12 @@ class LayoutFlowVarLen(BaseGenModel):
             m[s] = torch.where(given.unsqueeze(-1), torch.zeros_like(m[s]), m[s])
         return m * active.unsqueeze(-1).float() + (1 - active.unsqueeze(-1).float())
 
-    def sample_state(self, batch, t, cmask=None):
+    def sample_state(self, batch, t, cmask=None, s_lo=None):
         '''
         Draw (x_t, y_t, exists, visible) from the conditional path at time t (B,). A conditioned
         element (its category given, cmask[..., 4] == 0) is visible from t = 0; its given
         coordinates are held at their clean values. Returns the free-coordinate mask too.
+        s_lo (B,): lower bound of the decoupled per-element clocks (the refinement fifth of random5).
         '''
         active = batch['mask'].squeeze(-1)
         x1 = batch['mask'] * self.sampler.preprocess(batch['bbox'])
@@ -146,7 +174,13 @@ class LayoutFlowVarLen(BaseGenModel):
         exists, visible = exists | given, visible | given
 
         tpad = t.view(-1, 1, 1)
-        if self.oneflow:
+        if self.oneflow and self.clock == 'decoupled':
+            # every element's clock is its own time variable, independent of t and of when it was inserted
+            lo = s_lo.view(-1, 1) if s_lo is not None else torch.zeros_like(t).view(-1, 1)
+            s = (lo + (1 - lo) * torch.rand_like(u1)) * visible
+            self._t_elem = s
+            tpad = s.unsqueeze(-1)
+        elif self.oneflow:
             # insertion time tau_i = t_max (1 - u1) <= t for existing elements; own clock s_i = (t - tau_i) / (1 - tau_i)
             tau = (self.t_max * (1 - u1)).clamp(max=t.view(-1, 1)) * (~given) # given elements: tau = 0
             s = ((t.view(-1, 1) - tau) / (1 - tau)).clamp(0, 1) * visible
@@ -159,25 +193,67 @@ class LayoutFlowVarLen(BaseGenModel):
         yt = torch.where(visible, y1, torch.full_like(y1, self.mask_id))
         return xt, yt, exists, visible, x0, x1, y1, free
 
+    def relation_loss(self, xt, vt, x1, y1, visible, s):
+        '''
+        Hinge on strict containment of the predicted clean boxes, for the (underlay, text) pairs that are contained in
+        the data. Edges are computed in canvas space (the sampler's preprocessing maps w, h too, so edges must not be
+        taken in the model space); the margin is in canvas units. Pairs are weighted by the elements' clocks (a
+        prediction at s ~ 0 is noise) and the loss is averaged over pairs.
+        '''
+        x1_hat = xt + (1 - s).unsqueeze(-1) * vt
+        ltrb = lambda b: torch.cat([b[..., :2] - b[..., 2:] / 2, b[..., :2] + b[..., 2:] / 2], -1)
+        p, g = ltrb(self.sampler.preprocess(x1_hat, reverse=True)), ltrb(self.sampler.preprocess(x1, reverse=True))
+        under = visible & (y1 == self.relation_underlay_id)
+        text = visible & (y1 == self.relation_text_id)
+        # ground-truth containment (B, S_under, S_text)
+        inside = ((g[:, None, :, 0] >= g[:, :, None, 0]) & (g[:, None, :, 1] >= g[:, :, None, 1]) &
+                  (g[:, None, :, 2] <= g[:, :, None, 2]) & (g[:, None, :, 3] <= g[:, :, None, 3]))
+        pair = under[:, :, None] & text[:, None, :] & inside
+        if not pair.any():
+            return vt.sum() * 0
+        m = self.relation_margin
+        viol = (F.relu(m + p[:, :, None, 0] - p[:, None, :, 0]) + F.relu(m + p[:, :, None, 1] - p[:, None, :, 1]) +
+                F.relu(m + p[:, None, :, 2] - p[:, :, None, 2]) + F.relu(m + p[:, None, :, 3] - p[:, :, None, 3]))
+        w = (s[:, :, None] * s[:, None, :]).sqrt() * pair
+        return (viol * w).sum() / w.sum().clamp(min=1e-6)
+
     def training_step(self, batch, batch_idx):
         t = torch.rand(batch['bbox'].shape[0], device=self.device)
         cmask = self.cond_mask(batch, self.cond) if self.cond != 'uncond' else None
+        s_lo = None
         if self.cond == 'random5':      # refinement fifth: nearly clean layouts, the state the refinement task starts from
             q = t.shape[0] // 5
             t[3 * q:4 * q] = 0.9 + 0.1 * t[3 * q:4 * q]
-        xt, yt, exists, visible, x0, x1, y1, free = self.sample_state(batch, t, cmask)
+            s_lo = torch.zeros_like(t); s_lo[3 * q:4 * q] = 0.9
+        xt, yt, exists, visible, x0, x1, y1, free = self.sample_state(batch, t, cmask, s_lo)
         masked = exists & ~visible
         if self.cat_drop > 0:
             # classifier-free guidance training: hide every category of a layout w.p. cat_drop, so the
             # model also learns the category-unconditional velocity (the boxes stay visible)
             drop = (torch.rand(xt.shape[0], device=self.device) < self.cat_drop).unsqueeze(1)
             yt = torch.where(drop & visible, torch.full_like(yt, self.mask_id), yt)
-        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None)
+        ctx_hide = None
+        if batch.get('ctx') is not None and (self.ctx_token_drop > 0 or self.ctx_drop > 0):
+            # hide a random subset of canvas tokens, and the whole canvas for some samples: the layout must not be
+            # keyed on the exact canvas (the un-regularised model memorises the 48k training canvases)
+            B_, L_ = batch['ctx'].shape[:2]
+            ctx_hide = torch.rand(B_, L_, device=self.device) < self.ctx_token_drop
+            ctx_hide |= (torch.rand(B_, 1, device=self.device) < self.ctx_drop)
+        ret_hide = None
+        if batch.get('ret') is not None and self.ret_drop > 0:
+            ret_hide = torch.rand(xt.shape[0], device=self.device) < self.ret_drop
+        clocks = self._t_elem if self.oneflow else t.view(-1, 1).expand_as(visible)
+        elem_extra, text_state = self._text_pre(batch, visible, yt, clocks, xt)
+        vt, logits, h, ins_rate, extra = self(xt, yt, exists, t, batch.get('ctx'), cmask, self._t_elem if self.oneflow else None, ctx_hide, batch.get('ret'), ret_hide, batch.get('sal'), elem_extra)
 
         vis = visible.unsqueeze(-1) * free           # no velocity target on given coordinates
         ut = x1 - x0
         flow_loss = self.loss_fcn(vis * vt, vis * ut)
         loss = flow_loss
+        if self.relation_loss_weight > 0:
+            rel_loss = self.relation_loss(xt, vt, x1, y1, visible, self._t_elem if self.oneflow else t.view(-1, 1).expand_as(visible))
+            self.log('relation_loss', rel_loss, on_step=True, on_epoch=True, sync_dist=True)
+            loss = loss + self.relation_loss_weight * rel_loss
         self.log('flow_loss', flow_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         if self.add_loss:
             assert self.add_loss == 'geom_l1_loss'
@@ -211,6 +287,9 @@ class LayoutFlowVarLen(BaseGenModel):
             self.log('ins_loss', ins_loss, on_step=True, on_epoch=True, sync_dist=True)
             self.log('ins_mae', (ins_rate - missing).abs().mean(), on_step=False, on_epoch=True, sync_dist=True)
 
+        text_loss = self._text_post(text_state, h, extra['h_glob'])
+        if text_loss is not None:
+            loss = loss + text_loss
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return loss
 
@@ -265,7 +344,48 @@ class LayoutFlowVarLen(BaseGenModel):
         solver='euler',    # 'heun': second-order steps once everything is revealed (kappa = 1)
         cfg_w=1.0,         # classifier-free guidance on the categories: v_u + w (v_c - v_u); 1 = off
         snap_grid=0,       # > 0: round the final ltrb edges to multiples of 1/snap_grid
+        contain_guide=0.0, # > 0: containment guidance -- each step moves the predicted clean layout down the hinge
+                           # "every non-underlay element overlapping an underlay lies strictly inside it" (see contain_step)
+        contain_from=0.5,  # apply the guidance once every element's clock is past this value
+        contain_min=0.5,   # only for the underlay's best candidate element with at least this fraction of its area inside
+        clock='sync',      # oneflow clock policy: 'sync' (all boxes clean at t = 1, ds = dt / (1 - tau)) | 'unit'
+                           # (ds = dt, the run continues past t = 1 until every box is clean, OneFlow-style) |
+                           # 'insert_first' (clocks frozen until kappa = 1, then everything is denoised together)
     )
+
+    @torch.no_grad()
+    def contain_step(self, x, y, visible, lam):
+        '''
+        Containment guidance (sampling only, no retraining): for every pair (underlay u, non-underlay element k) whose
+        boxes overlap, push the *underlay* to contain k with margin relation_margin -- a gradient step of size lam on the
+        hinge, taken on the underlay's ltrb edges (lam = 1 is a full projection; smaller values let the velocity
+        field react to the corrected state over the remaining steps).
+        '''
+        B, S, _ = x.shape
+        under = visible & (y == self.relation_underlay_id)
+        other = visible & ~under
+        if not (under.any() and other.any()):
+            return x
+        m = self.relation_margin
+        xc = self.sampler.preprocess(x, reverse=True)                                   # canvas space: edges are meaningful here
+        l, tp, r, bt = (xc[..., 0] - xc[..., 2] / 2), (xc[..., 1] - xc[..., 3] / 2), (xc[..., 0] + xc[..., 2] / 2), (xc[..., 1] + xc[..., 3] / 2)
+        # for every underlay, the single element that is already mostly inside it (largest intersection / area_k,
+        # the metric's own candidate); an underlay grazing a large element is not made to swallow it
+        iw = (torch.minimum(r[:, :, None], r[:, None, :]) - torch.maximum(l[:, :, None], l[:, None, :])).clamp(min=0)
+        ih = (torch.minimum(bt[:, :, None], bt[:, None, :]) - torch.maximum(tp[:, :, None], tp[:, None, :])).clamp(min=0)
+        ratio = iw * ih / (xc[..., 2] * xc[..., 3]).clamp(min=1e-6)[:, None, :]                           # (B, u, k)
+        ratio = ratio * (under[:, :, None] & other[:, None, :]).float()
+        best = ratio.argmax(2, keepdim=True)
+        pair = (torch.zeros_like(ratio).scatter_(2, best, 1.0) * (ratio >= s_min).float()) if (s_min := self.sampling.get('contain_min', 0.5)) is not None else None
+        # required expansion of the underlay's four edges (positive = move outward), max over its overlapping elements
+        dl = (F.relu(m + l[:, :, None] - l[:, None, :]) * pair).amax(2)
+        dt_ = (F.relu(m + tp[:, :, None] - tp[:, None, :]) * pair).amax(2)
+        dr = (F.relu(m + r[:, None, :] - r[:, :, None]) * pair).amax(2)
+        db = (F.relu(m + bt[:, None, :] - bt[:, :, None]) * pair).amax(2)
+        step = lam * under.float()
+        l2, t2, r2, b2 = l - step * dl, tp - step * dt_, r + step * dr, bt + step * db
+        new = self.sampler.preprocess(torch.stack([(l2 + r2) / 2, (t2 + b2) / 2, r2 - l2, b2 - t2], -1))
+        return torch.where(under.unsqueeze(-1), new, x)
 
     @torch.no_grad()
     def editflow_insert(self, x, y, exists, h, extra, ins_rate, p, t_next, s, tau):
@@ -312,12 +432,12 @@ class LayoutFlowVarLen(BaseGenModel):
             tau[b_new, slot] = t_next
         return x, y, exists, tau
 
-    def velocity(self, x, y, exists, t, ctx=None, cmask=None):
-        v = self(x, y, exists, t, ctx, cmask)[0]
+    def velocity(self, x, y, exists, t, ctx=None, cmask=None, ret=None, sal=None):
+        v = self(x, y, exists, t, ctx, cmask, ret=ret, sal=sal)[0]
         w = self.sampling['cfg_w']
         if w != 1.0:
             # "unconditional" = same boxes, every category hidden behind the mask token
-            v_u = self(x, torch.where(exists, torch.full_like(y, self.mask_id), y), exists, t, ctx, cmask)[0]
+            v_u = self(x, torch.where(exists, torch.full_like(y, self.mask_id), y), exists, t, ctx, cmask, ret=ret, sal=sal)[0]
             v = v_u + w * (v - v_u)
         return v
 
@@ -353,35 +473,62 @@ class LayoutFlowVarLen(BaseGenModel):
             x = given.unsqueeze(-1) * (held * x1 + (1 - held) * torch.randn_like(x))
         y = torch.where(given, batch['type'].long(), torch.full((B, S), self.mask_id, dtype=torch.long, device=dev))
         s = self.sampling
-        ctx = batch.get('ctx')
+        ctx, ret, sal = batch.get('ctx'), batch.get('ret'), batch.get('sal')
+        text_state = self._text_infer_init(batch)
         tau = torch.zeros(B, S, device=dev)                                  # oneflow: insertion time per slot
+        clock = s['clock'] if self.oneflow else None
+        # per-element clocks (oneflow): given elements start at t_start on their own clock
+        sc = torch.zeros(B, S, device=dev)
+        if clock == 'unit':
+            sc = t_start * given.float()
+        elif clock == 'insert_first':
+            sc = max(0.0, (t_start - self.t_max) / (1 - self.t_max)) * given.float()
 
         N = self.inference_steps
         dt = (1.0 - t_start) / N
-        for i in range(N):
+        # unit-rate clocks: a box inserted at tau needs 1/dt more steps, so the run goes on past t = 1
+        N_tot = N + (math.ceil(self.t_max / dt) if clock == 'unit' and not given_length else 0)
+        for i in range(N_tot):
             t_i = t_start + i * dt
-            t = torch.full((B,), t_i, device=dev)
+            t = torch.full((B,), min(t_i, 1.0), device=dev)
             t_next = t_start + (i + 1) * dt
             k, k_next = min(t_i / self.t_max, 1.0), min(t_next / self.t_max, 1.0)
             # exact per-step jump probability of the hazard kappa'/(1-kappa)
             p = 1.0 if (k_next >= 1.0 or i == N - 1) else (k_next - k) / (1 - k)
+            if i >= N:
+                p = 0.0                                                      # tail: no more insertions
 
-            t_elem = (((t_i - tau) / (1 - tau)).clamp(0, 1) * exists) if self.oneflow else None
-            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem)
+            if clock == 'sync':
+                sc = ((t_i - tau) / (1 - tau)).clamp(0, 1) * exists
+                ds = (dt / (1 - tau)) * exists
+            elif clock == 'unit':
+                ds = (1 - sc).clamp(max=dt) * exists
+            elif clock == 'insert_first':
+                ds = (1 - sc).clamp(max=(0.0 if t_next <= self.t_max else dt / (1 - self.t_max))) * exists
+            t_elem = sc * exists if self.oneflow else None
             masked = exists & (y == self.mask_id)
             visible = exists & ~masked
+            clocks = sc if self.oneflow else torch.full((B, S), t_i, device=dev)
+            ds_elem = ds if self.oneflow else torch.full((B, S), dt, device=dev)
+            elem_extra = self._text_infer_pre(text_state, visible, y, clocks)
+            v, logits, h, ins_rate, extra = self(x, y, exists, t, ctx, cmask, t_elem, ret=ret, sal=sal, elem_extra=elem_extra)
+            text_state = self._text_infer_step(text_state, h, extra['h_glob'], visible, y, clocks, ds_elem, i == N_tot - 1, x)
             vis = visible.unsqueeze(-1)
-            dt_elem = (dt / (1 - tau)).unsqueeze(-1) if self.oneflow else dt          # own clock runs faster
+            dt_elem = ds.unsqueeze(-1) if self.oneflow else dt              # own clock
             if s['cfg_w'] != 1.0:
-                v = self.velocity(x, y, exists, t, ctx, cmask)
+                v = self.velocity(x, y, exists, t, ctx, cmask, ret, sal)
 
             # denoise (Euler; Heun once the layout is complete and nothing can change discontinuously)
             if s['solver'] == 'heun' and k >= 1.0 and i < N - 1:
                 x_e = torch.where(vis, x + v * dt, x)
-                v2 = self.velocity(x_e, y, exists, t + dt, ctx, cmask)
+                v2 = self.velocity(x_e, y, exists, t + dt, ctx, cmask, ret, sal)
                 x = torch.where(vis, x + 0.5 * (v + v2) * dt, x)
             else:
                 x = torch.where(vis, x + v * dt_elem, x)
+            if self.oneflow:
+                sc = ((sc + ds).clamp(max=1.0)) * exists
+            if s['contain_guide'] > 0 and t_next >= s['contain_from']:
+                x = self.contain_step(x, y, visible, s['contain_guide'])
             if task != 'uncond':
                 x = held * x1 + (1 - held) * x
 
@@ -397,7 +544,7 @@ class LayoutFlowVarLen(BaseGenModel):
                 y[reveal] = cls
 
             # insert: Poisson number of new masked elements into free slots
-            if self.editflow and not given_length and p < 1.0:
+            if self.editflow and not given_length and 0.0 < p < 1.0:
                 x, y, exists, tau = self.editflow_insert(x, y, exists, h, extra, ins_rate, p, t_next, s, tau)
             elif self.insertion and not given_length and p < 1.0:
                 n_new = torch.poisson(ins_rate * p)
@@ -406,6 +553,7 @@ class LayoutFlowVarLen(BaseGenModel):
 
         # pack the generated elements to the front, as the dataset does
         order = exists.int().argsort(dim=1, descending=True, stable=True)
+        self.last_texts = self._text_infer_finish(text_state, exists, order, x, y, ctx, ret, sal)
         x, y, exists = x.gather(1, order.unsqueeze(-1).expand_as(x)), y.gather(1, order), exists.gather(1, order)
         geom = exists.unsqueeze(-1) * self.sampler.preprocess(x, reverse=True)
         if s['snap_grid']:

@@ -65,6 +65,17 @@ The output is a structured design. Text reaches the image through a deterministi
 
 Use **RALF's splits and preprocessed data** (inpainted canvases + saliency maps) for PKU/CGL. Other papers use different splits (e.g., Scan-and-Print).
 
+**Crello statistics (computed 2026-09-19, train split, HF `cyberagent/crello`, cached at `$LAB/datasets/hf_cache`):**
+- elements per template: mean 10.7, median 10, p90 17, max 50; 57% have <= 10, 95% <= 20, 99% <= 30;
+- element types: SvgElement 48%, TextElement 40%, ImageElement 9%, ColoredBackground 2%, SvgMaskElement 2%;
+- text elements per template: mean 4.2, median 4, p90 8, max 41; 99% of templates have at least one;
+- text length: mean 20.8 chars / 3.5 words, median 12 chars / 2 words, p90 44 / 7, p99 137 / 22 (short: mostly headlines, dates, CTAs);
+- canvas: 80% of templates have a full-canvas first element (ColoredBackground or ImageElement) that can serve as the
+  background layer; 25% contain a ColoredBackground; aspect: 56% landscape, 32% portrait, 12% square; top formats
+  Instagram Story / Instagram / Facebook / Facebook cover / Twitter / Facebook AD;
+- per-element typography available: font (~250 classes), font_size, text_color, text_align, line_height, letter_spacing,
+  bold/italic per line, capitalize, angle, opacity.
+
 **Compute these statistics first (❓):**
 - element-count distribution per dataset;
 - fraction of text elements; text length per element;

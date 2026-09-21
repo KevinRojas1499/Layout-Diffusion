@@ -27,6 +27,46 @@ Published numbers (LayoutFlow, ECCV 2024, Table 1, unconditional): LayoutFlow RI
 PubLayNet **8.87**; LayoutDiffusion 2.49 / 8.63; LayoutDM (retrained) 4.43 / 36.85. The baselines are
 given the number of elements; ours (VarLen) generates it.
 
+## RICO ablation summary (paper protocol: test split, 2,000 samples, LayoutGAN++ FID net)
+
+Unconditional FID; "5 runs" = mean +/- std over 5 sampling seeds, otherwise a single run (noise ~0.1). Best-by-val
+checkpoint of a 2,000-epoch run unless stated. Details and the other metrics are in the sections below.
+
+| Axis | Setting | FID |
+|---|---|---|
+| **Reference** | LayoutFlow (paper / upstream checkpoint, our evaluator) | 2.37 / 2.24 |
+| | LayoutDM (paper), LayoutDiffusion (paper) | 4.43, 2.49 |
+| | validation data vs test (noise floor of the metric) | 2.10 |
+| **Baselines, strictly as published** | discrete Edit Flow, LayoutDM 32-bin tokens, 100 / 1,000 steps (5 runs) | 13.25 / 6.43 |
+| | discrete Edit Flow, 128-bin tokens, 100 / 1,000 steps (5 runs) | 14.90 / 8.80 |
+| | OneFlow (interleaved schedule, no time input, unweighted loss), 50 / 100 / 1,000 steps (5 runs) | 63.0 / 66.2 / 75.7 |
+| | OneFlow + t_text input (Edit Flows' original), 50 / 100 / 1,000 steps (5 runs) | **3.31** / 3.38 / 5.31 |
+| **Length** | fixed length (unmasking), GMM, t_max 0.5 (5 runs; single) | 2.41 +/- 0.08 (2.30) |
+| | variable length (insertion), GMM, t_max 0.5 (5 runs; single) | 2.55 +/- 0.08 (2.43) |
+| **Reveal head** (fixed length) | GMM / point-estimate mean / single Gaussian | 2.30 / 2.39 / 2.39 |
+| (variable length) | GMM / single Gaussian | 2.43 / 2.51 |
+| **Reveal horizon t_max** (fixed) | 0.5 / 1.0 (GMM) | 2.30 / 3.72 |
+| (variable) | 0.25 / 0.5 / 1.0 | 2.55 / 2.43 / 11.94 |
+| **Insertion mechanism** (variable length, 5 runs) | masked reveal, global Poisson count (ours v1) | 2.55 +/- 0.08 |
+| | Edit-Flow-style per-element rates, GMM reveal | 2.53 +/- 0.11 |
+| | per-element clocks: box born from N(0,I) at its own clock 0 (two seeds) | **2.29 +/- 0.14 / 2.35 +/- 0.07** |
+| **Clocks** (per-element clocks, 5 runs) | coupled training, sync / unit / insert_first sampling | 2.35 / 3.62 / 2.43 |
+| | decoupled training (product law of the times), sync / unit / insert_first | 4.17 / 4.32 / 3.76 |
+| **Conditional mix random5** (all tasks in one model, uncond column) | fixed length | **2.15 +/- 0.10** |
+| | variable length, masked reveal + cond_input | 3.15 +/- 0.17 |
+| | variable length, per-element clocks + cond_input (two seeds) | 2.53 +/- 0.17 / 2.48 +/- 0.13 |
+| **EMA 0.999** (5 runs) | fixed / variable length (vs 2.41 / 2.55 without) | 2.61 / 2.85 |
+| **Classifier-free guidance** on categories (cat_drop 0.1, 5 runs) | w = 1 (off) / 1.25 / 1.5 / 2.0, fixed length | 2.46 / 2.39 / 2.60 / 3.41 |
+| | same, variable length | 2.46 / 2.52 / 2.74 / 3.52 |
+| **Sampler** (variable length, 3 runs, vs 2.62 default) | gmm_temp 0.3 / heun / reveal_eps 0.7 / snap 32 | 2.54 / 2.44 / 5.12 / worse |
+
+Reading: the two things that matter are the reveal horizon (t_max <= 0.5) and how a new element's box enters
+(born at its own clock zero beats every learned reveal head on RICO); everything else -- head family, EMA,
+guidance, higher-order solvers, sampler temperatures -- is within noise or harmful. Generating the length costs
+~0.1 FID over the fixed-length model; the conditional mix costs another ~0.1-0.2 with per-element clocks (0.6 with
+the reveal head). The strictly-discrete baselines are 3-30x worse; OneFlow's recipe collapses on this data size
+unless the insertion heads see the time.
+
 ## RICO, unconditional, paper protocol
 
 Checkpoint = best in-training validation FID of each run (2000 epochs, validation every 25).
@@ -97,6 +137,12 @@ what the recipe does.
 | Unmasking, GMM, t_max=0.5 | 9.81 | 0.072 | 0.018 | `publaynet-elemmask-gmm-t050`, ep 257 |
 | Unmasking, mean, t_max=0.5 | 10.08 | 0.074 | 0.015 | `publaynet-elemmask-mean-t050`, ep 239 |
 | Variable length, GMM, t_max=0.25 | 10.30 | 0.142 | 0.014 | `publaynet-varlen-gmm-t025`, ep 236 |
+
+**Variable-length run completed (resumed from epoch 473 to 1000, EMA off, 2026-09-19):** paper protocol, 3 repeats:
+best-by-validation checkpoint (ep 680, val 0.650) **10.21 +/- 0.12** (alignment 0.152, overlap 0.013); last checkpoint
+(ep 999) **9.78 +/- 0.24** (alignment 0.127); the earlier epoch-299 checkpoint scored 9.05. LayoutFlow 8.87, floor 8.10.
+Validation FID kept improving while the test-split FID did not: the two splits differ (real val vs test = 8.10),
+so report the selection-free last checkpoint and say so. Not closed for the paper.
 
 In-training validation FID at the stop (best): ElemMask gmm 0.54, mean 0.57, VarLen t050 0.65,
 t025 0.84; t_max=1.0 runs 2.8 (ElemMask gmm), 6.5 (ElemMask mean), 25.6 (VarLen). Epochs are 609
@@ -265,3 +311,414 @@ against the test split (the FID net is extremely sensitive to sub-grid jitter).
 Start-time sweep on the unmasking checkpoint (test split, so *not* used for selection): t_start 0.90 -> 1.25 / 0.546,
 0.95 -> 0.98 / 0.632, 0.97 -> 1.10 / 0.679, 0.985 -> 2.47 / 0.708, 0.995 -> 27.3 / 0.703. FID and fidelity trade
 off; no setting dominates LayoutFlow's point.
+
+## All tasks from one model: `model.cond=random5` (RICO, paper protocol, full test set, max-IoU)
+
+random5 = random4's four quarters plus a refinement fifth (t drawn in [0.9, 1], the noisy-layout start state), so the
+refinement task is trained rather than inherited. Best-by-val checkpoints; uncond over 5 runs, the rest single.
+
+| Model | uncond | refinement | C->S+P | C+S->P | completion |
+|---|---|---|---|---|---|
+| LayoutFlow paper | 2.37 | **0.77** / **0.700** | 1.48 / 0.322 | **1.03** / 0.470 | 1.51 / **0.741** |
+| Fixed length (unmasking), random5 (`rico-elemmask-gmm-t050-random5`, ep 1149) | **2.15 +/- 0.10** | 0.78 / 0.690 | **1.27** / 0.335 | 1.15 / 0.441 | **1.66** / 0.613 |
+| Variable length, random5 + cond_input (`rico-varlen-gmm-t050-random5-condin`, ep 1524) | 3.15 +/- 0.17 | 0.90 / 0.689 | 1.42 / 0.333 | 1.12 / 0.443 | 2.91 / 0.524 (own length) |
+| Variable length, OneFlow-style insertion, random5 + cond_input (`rico-oneflow-random5-condin`, ep 1424) | 2.53 +/- 0.17 | 0.84 / 0.688 | 1.36 / 0.339 | 1.11 / 0.453 | 2.92 / 0.532 (own length) |
+
+The refinement fifth is free: the fixed-length random5 model is better than the uncond-only one on *every* task
+(uncond 2.15 vs 2.41, refinement 0.78 vs 1.10) and matches LayoutFlow's refinement point. For the variable-length
+model, per-element clocks (OneFlow-style insertion from pure noise, see the ablation below) remove most of the
+conditional-mix penalty: uncond 3.15 -> 2.53 (the uncond-only variable-length model is 2.55), refinement 0.90 ->
+0.84, C->S+P 1.42 -> 1.36, C+S->P and completion unchanged. Completion with the model's own length (2.9 vs
+LayoutFlow's 1.51 with the length given) stays the weakest variable-length task.
+
+## Clock ablation (RICO, paper protocol, uncond x 5 runs): coupled vs decoupled per-element clocks, three sampling policies
+
+Per-element clocks (`insertion=oneflow`): an inserted box starts from pure noise on its own clock `u_i`. *Coupled*
+training (`model.clock=coupled`, default) sets `u_i = (t - tau_i)/(1 - tau_i)`, i.e. the states of the synchronised
+sampler; *decoupled* training (`model.clock=decoupled`) draws `u_i ~ U(0,1)` independently of `t` (the product law
+of the times), so every monotone clock policy is on-distribution. Sampling policies (`+sampling.clock=`): `sync`
+(all boxes clean at t = 1), `unit` (unit-rate clocks, the run continues past t = 1 until every box is clean,
+OneFlow's numerics), `insert_first` (clocks frozen until kappa = 1, then all boxes denoised together). Commit 8f09388.
+
+| training | sync | unit | insert_first |
+|---|---|---|---|
+| coupled, uncond-only (`rico-oneflow-continuous`, ep 1274) | **2.35 +/- 0.07** (earlier seed 2.29) | 3.62 +/- 0.08 | 2.43 +/- 0.18 |
+| coupled, random5 + cond_input (`rico-oneflow-random5-condin`, ep 1424) | 2.48 +/- 0.13 (earlier 2.53) | 4.17 +/- 0.29 | **2.33 +/- 0.09** |
+| decoupled, uncond-only (`rico-oneflow-decoupled`, ep 1924) | 4.17 +/- 0.05 | 4.32 +/- 0.06 | 3.76 +/- 0.14 |
+| decoupled, random5 + cond_input (`rico-oneflow-decoupled-random5-condin`, ep 1424) | 2.59 +/- 0.16 | 2.67 +/- 0.12 | 2.57 +/- 0.04 |
+
+Conditional tasks of the decoupled random5 model (sync clocks): refinement 0.88 / 0.688, C->S+P 1.47 / 0.328,
+C+S->P 1.26 / 0.42, completion 2.93 / 0.5 (coupled: 0.84, 1.36, 1.11, 2.92).
+
+Reading: (1) the coupled model is licensed only on its own surface -- unit-rate clocks (never seen in training) lose
+1.3-1.7 FID, while `insert_first` sits on the boundary of the trained states and is fine (best number for the
+random5 model, within noise). (2) The decoupled model supports all three policies with at most 0.1 between them,
+as the theory says, but pays for the generality: the unconditional model is far worse (4.2 vs 2.35; its
+validation FID was still creeping down at 2,000 epochs -- the training budget is spent on states the synchronised
+sampler never visits), the random5 model is only slightly worse (2.59 vs 2.48; its conditional quarters already put
+elements at heterogeneous clocks). No policy beats `sync` on the decoupled models. Conclusion: coupled clocks are
+the method; the grid is the experimental content of the "the clock policy is a training-time choice" statement.
+
+## Content-aware generation on CGL (RALF release, RALF's evaluator, test split)
+
+Setup: `src.data.CGL` + frozen DINOv2-small canvas tokens (8x8 grid + saliency, `scripts/precompute_canvas_feats.py`)
+prepended to the element set; scored by exporting samples in RALF's format (`scripts/export_ralf_samples.py`) and
+running their untouched `eval.py` (reproduces their published scores to 4 decimals). LayoutGD (ICMR 2026) Table 1
+reports exactly these five columns. References on CGL: LayoutGD 0.120 / 0.0140 / 0.999 / 0.994 / 0.0004,
+LayoutDiT 0.124 / 0.0157 / 0.995 / 0.988 / 0.0016, RALF 0.126 / 0.0180 / 0.992 / 0.978 / 0.0042 (Occ / Rea / Und_l /
+Und_s / Ove); RALF FID 1.32 (real val vs test floor 0.80); count MAE from RALF's released outputs: RALF 1.08,
+autoregressive 1.27, canvas-blind histogram 2.13.
+
+### v2 runs (1000 epochs, val FID = ported FIDNetV3 vs RALF's val features, EMA on; the v1 runs had no FID signal)
+
+| checkpoint | FID | Occ | Rea | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|
+| variable length, canvas-blind, ep 649 | **1.63** | 0.318 | 0.041 | **0.877** | **0.006** | 2.13 |
+| variable length + canvas, ep 199 / 419 / 999 | 5.55 / 4.45 / 5.08 | 0.136 | 0.021 | 0.57 / 0.71 / 0.72 | 0.021 / 0.013 / 0.011 | 1.42 / 1.34 / 1.33 |
+| padding baseline + canvas, ep 489 / 999 | 4.61 / 5.20 | 0.136 | 0.021 | 0.74 / 0.76 | 0.011 / 0.012 | 1.29 / 1.28 |
+
+**Diagnosis: the canvas pathway memorises the training canvases.** Generated on 6,000 *training* canvases the canvas
+model scores FID 1.15 (vs train features) / 1.53 (vs test), better than the blind model (1.58 / 1.89); on unseen test
+canvases it collapses to 4.45 while occlusion and count stay good. The blind model learns an excellent layout prior
+(FID 1.6, underlay 0.88, overlap 0.006) but ignores the canvas (occlusion 0.32, chance-level count). The padding
+baseline shows the same collapse, so it is the conditioning, not insertion. EMA is not the cause (v1 without EMA:
+3.5-4.3). The validation FID was right all along; the v1 "blind 3.99" was an epoch-129 checkpoint.
+
+v3 (launched 2026-09-18 16:40, EMA off): `model.ctx_token_drop=0.5 model.ctx_drop=0.1` (hide half the canvas tokens per
+sample, the whole canvas for 10%), `dataset.dataset.hflip=true` (mirror canvas grid + layout), and both.
+
+### v3: canvas regularisation (test split, RALF's evaluator; ceilings = real test layouts scored the same way)
+
+| | FID | Occ | Rea | Und_l | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|---|
+| **Real test layouts (ceiling)** | 0 (0.80 vs val) | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
+| LayoutGD (paper) | - | 0.120 | 0.014 | 0.999 | 0.994 | 0.0004 | - |
+| RALF (released outputs) | 1.32 | 0.125 | 0.018 | 0.991 | 0.976 | 0.004 | 1.08 |
+| RALF's autoregressive model without retrieval (released) | 2.89 | 0.125 | 0.019 | 0.967 | 0.917 | 0.011 | 1.27 |
+| Ours, canvas-blind prior (v2, ep 649) | 1.63 | 0.318 | 0.041 | 0.960 | 0.877 | 0.006 | 2.13 |
+| Ours + canvas, no regularisation (v2, ep 419) | 4.45 | 0.135 | 0.021 | 0.900 | 0.710 | 0.013 | 1.34 |
+| Ours + canvas, token dropout 0.5 + canvas dropout 0.1 (ep 499) | 3.51 | 0.148 | 0.022 | 0.914 | 0.705 | 0.024 | 1.51 |
+| **Ours + canvas, dropout + hflip** (`cgl-varlen-canvas-regflip`, ep 329) | **3.32** | 0.144 | 0.022 | 0.917 | 0.734 | 0.020 | 1.49 |
+| ... + self-refinement pass (our refinement mode, t 0.97 -> 1, no heuristics) | 3.48 | 0.138 | 0.021 | 0.934 | 0.821 | 0.0145 | 1.49 |
+| ... + post-processing: snap edges to the 1/128 grid (RALF's resolution) | 3.44 | 0.145 | 0.022 | 0.917 | 0.793 | 0.020 | |
+| ... + post-processing: enlarge loosely-containing underlays to exact containment | 3.30 | 0.144 | 0.022 | 0.927 | 0.859 | 0.020 | |
+| ... + both post-processing steps | 3.41 | 0.144 | 0.022 | 0.927 | 0.869 | 0.020 | |
+
+Sampler-side knobs that did nothing or hurt on the same checkpoint: mixture temperature 0.5 / 0 (3.36 / 3.29, other
+metrics unchanged), Heun + 200 steps (3.91, underlay 0.69). Validation FID (ported FIDNetV3 vs val features)
+overstates canvas models by ~1.0 (2.36 val -> 3.32 test; the blind model 1.22 -> 1.63): use it for selection only.
+
+Reading: regularisation removes most of the memorisation (FID 4.45 -> 3.32) at a small cost in canvas use
+(occlusion 0.135 -> 0.144, count 1.34 -> 1.49): it moves along a canvas-use / layout-quality trade-off. What remains
+is geometric precision: underlays sit around the right elements (loose 0.92) but do not contain them exactly, and
+small overlaps persist (0.02 vs 0.0003 real). Self-refinement is the honest model-side gain (underlay 0.82,
+overlay 0.0145); snapping and containment post-processing reach 0.87 and must be reported as such.
+
+What RALF and LayoutGD have that we do not (checked in RALF's released config / code and LayoutGD's text):
+RALF discretises coordinates to 128 uniform bins (outputs are grid-exact) and, decisively, conditions on the 16
+DreamSim-nearest *training layouts* by cross-attention (their own no-retrieval model: FID 2.89, underlay 0.917 ->
+with retrieval 1.32, 0.976; the indices are shipped in `cache/.../retrieval_indexes`); it also decodes with top-k=5
+sampling. LayoutGD is a continuous DDPM but puts an explicit element-element graph (GNN with alignment features)
+in the architecture and feeds LayoutDiT's saliency bounding box as a fixed element. Neither reaches the ceiling
+with a plain transformer over raw boxes. Cheap next steps for us, in order: a "+retrieval" row (indices provided),
+a de-overlap counterpart to `contain`, and a pairwise-geometry term; a cross-attention canvas variant was tried and
+failed to train (flat flow loss; `cgl-varlen-canvas-cross-regflip-failed`).
+
+Final v3 checkpoints (best-by-validation-FID / last), test split:
+
+| | FID | Occ | Rea | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|
+| Variable length, dropout + hflip (ep 329 / 999) | 3.32 / 4.04 | 0.144 | 0.022 | 0.734 / 0.750 | 0.020 | 1.49 / 1.45 |
+| Variable length, dropout only (ep 499 / 999) | 3.51 / 4.28 | 0.148 | 0.022 | 0.705 / 0.718 | 0.024 / 0.022 | 1.51 / 1.49 |
+| Padding baseline (10 slots + empty class), dropout + hflip (ep 409 / 999) | 4.02 / 4.44 | 0.144 | 0.022 | 0.774 / 0.797 | 0.013 / 0.012 | 1.37 / 1.37 |
+
+Under equal regularisation the padding baseline matches or beats insertion on count MAE (1.37 vs 1.49) and on
+the graphic metrics, while insertion wins FID by 0.7: on CGL (<= 10 elements) the count is not where insertion
+shows its value, as CONTENT_AWARE.md's risk section anticipated. Late checkpoints are worse than mid-training
+ones for every run (residual memorisation), so validation-FID checkpoint selection is part of the recipe.
+Gated cross-attention (tanh gate, zero-init; the ungated version did not train) is running as
+`cgl-varlen-canvas-crossg-regflip`.
+
+**Gated cross-attention canvas** (`backbone_model.ctx_mode=cross`, tanh gate zero-initialised; elements self-attend
+among themselves only and read the canvas through a separate gated sub-layer, LayoutGD's structure), dropout +
+hflip, best-by-val epoch 559, test split: **FID 2.41**, Occ 0.150, Rea 0.023, Und_l 0.937, **Und_s 0.800**,
+**Ove 0.0115**, count MAE 1.47. Best canvas model so far (prepend: 3.32 / 0.734 / 0.020); slightly less canvas use
+(occlusion 0.150 vs 0.144). Ungated cross-attention did not train (flat flow loss); the zero-init gate fixed it.
+
+Final v3 rows for the remaining runs (test split, best-by-val / last): flip only (ep 319 / 999) FID 3.58 / 4.86,
+Occ 0.135 / 0.132, Rea 0.021, Und_s 0.723 / 0.741, Ove 0.013 / 0.012, count MAE 1.34 / 1.32; gated cross-attention +
+dropout + flip (ep 559 / 999) FID 2.41 / 2.77, Occ 0.150 / 0.149, Rea 0.023, Und_s 0.800 / 0.810, Ove 0.0115 / 0.0104,
+count 1.47 / 1.44. So hflip removes memorisation without costing canvas use, token dropout buys FID at the cost of
+canvas use, and gated cross-attention gives the geometric gains. Next run: gated cross-attention + hflip, no
+dropout (`cgl-varlen-canvas-crossg-flip`).
+
+Gated cross-attention + hflip without dropout (ep 449 / 999): FID 3.49 / 3.65, Occ 0.145, Und_s 0.683 / 0.712,
+Ove 0.018, count 1.42 / 1.38 -> dropout is needed for the cross design too. Same + **pairwise geometric attention
+bias** (`backbone_model.geo_bias=true`, LayoutGD's edge features; ep 359 / 999): FID 2.93 / 3.38, Occ 0.143,
+Und_s 0.726 / **0.777**, Ove 0.0113 / **0.0091** (lowest overlap of any run), count 1.42 / 1.40 -> the edge
+features help exactly the geometric metrics. Running the full recipe: cross + dropout + hflip + geo bias
+(`cgl-varlen-canvas-crossg-regflip-geo`).
+**Full recipe result** (`cgl-varlen-canvas-crossg-regflip-geo`, val FID kept improving to 1.19 at ep 689; test
+split, best-by-val ep 689 / last ep 999):
+
+| checkpoint | FID | Occ | Rea | Und_l | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|---|
+| cross + dropout + hflip + geo bias, ep 689 / 999 | **1.53** / 1.72 | 0.148 / 0.147 | 0.023 | 0.933 / 0.929 | 0.784 / 0.781 | **0.0097** / **0.0089** | 1.54 / 1.54 |
+| previous best canvas model (cross + dropout + hflip, ep 559) | 2.41 | 0.150 | 0.023 | 0.937 | 0.800 | 0.0115 | 1.47 |
+| RALF (their released outputs) | 1.32 | 0.126 | 0.018 | 0.992 | 0.978 | 0.0042 | 1.08 |
+| real test layouts (ceiling) | 0.80 | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
+
+| same recipe with per-element clocks (`insertion=oneflow`, `cgl-oneflow-canvas-crossg-regflip-geo`, ep 399 / 999) | 2.28 / 2.72 | 0.153 / 0.151 | 0.023 | 0.912 / 0.931 | 0.716 / 0.777 | 0.0102 / 0.0073 | 1.64 / 1.59 |
+| same recipe + RALF retrieval, 16 nearest training layouts (`...-geo-ret16`, `dataset.dataset.retrieval_k=16 backbone_model.ret_k=16 ret_drop=0.1`, ep 689 / 999) | 1.78 / 1.94 | 0.154 / 0.152 | 0.023 / 0.022 | 0.945 / **0.950** | 0.825 / **0.832** | 0.0070 / **0.0059** | 1.51 / **1.48** |
+
+The geometric bias closes most of the FID gap to RALF (2.41 -> 1.53, RALF 1.32) and gives the lowest overlap of any
+run, at a small cost in strict underlay (0.78 vs 0.80) and count (1.54 vs 1.47). Per-element clocks, which win by
+0.25 FID on RICO, do *not* transfer to CGL: same recipe, FID 2.28 vs 1.53, strict underlay 0.72 vs 0.78, count 1.64
+vs 1.54 (only overlay improves, 0.0073 at the last checkpoint); its validation FID plateaued at 1.68 (ep 399) where
+the GMM-reveal run kept improving to 1.19. A plausible reason is that on CGL an element's box is strongly determined
+by the canvas and the other elements at the moment it is inserted (underlay under text, text beside the product),
+so revealing it from a posterior sample is a better start than pure noise; on RICO the box posterior at insertion is
+broad. GMM reveal stays the CGL recipe.
+
+**Retrieval augmentation** (RALF's ingredient: the 16 DreamSim-nearest *training* layouts of each canvas, from
+RALF's precomputed index tables, embedded with the layout's own element embedder + a per-retrieved-layout slot
+embedding and appended to the canvas tokens on the cross-attention path; commit e7711a6). It fits more slowly (val
+FID 2.95 at ep 389 vs 1.36 without) and ends mixed: the graphic metrics improve to the best values of any trained
+model -- strict underlay 0.825 / 0.832 (vs 0.784), overlay 0.0070 / 0.0059 (vs 0.0097), count 1.51 / 1.48 (vs 1.54)
+-- while FID is 0.25-0.4 worse (1.78 / 1.94 vs 1.53) and occlusion unchanged. The retrieved layouts are used for
+the geometric conventions (underlay under text, non-overlap, how many elements) rather than as a copy source, and
+the count gain is far from RALF's (1.08). So retrieval does not bridge the gap on its own; the remaining
+difference to RALF (Und_s 0.98, count 1.08) is where its autoregressive 128-bin decoder copies exact coordinates
+and counts from the retrieved layouts, which a continuous set generator does not do.
+
+### Where the underlay gap actually is, and the containment projection
+
+Diagnostic on the exported test samples (any non-underlay element counts, as in RALF's / LayoutDiT's metric; here
+text only, which is slightly stricter): class histogram and underlays per layout match the data (1.07 vs 1.09;
+logo/text/underlay/embellishment 13.1/62.9/22.8/1.2% vs 13.3/62.2/22.6/1.9%); only 2.9% of our underlays have no
+text on them at all (real 1.0%, RALF 1.3%); but 24% have their text sticking out, by a **median of 1% of the
+canvas** (real 2.1%, RALF 3.6%, retrieval run 19%). The relation is learned; the strict-containment convention is
+not learned to the pixel by an MSE-trained flow. LayoutDiT's code (github yuli0103/LayoutDiT) confirms there is no
+architectural ingredient for this: a plain epsilon-prediction DDPM over 16 padded slots (one-hot class incl.
+empty + box), MSE only, deterministic DDIM with 100 steps, argmax/clamp decoding, no relation loss, no
+post-processing; its Und_s (0.988) equals the real data's and LayoutGD's (0.994) exceeds it, i.e. a mode-seeking
+deterministic sampler produces layouts more regular than the data (their table has no FID). Its image side differs
+(4-channel RGB+saliency ViT trained from scratch at 384x256, plus a saliency-*box* token), which is the plausible
+source of the occlusion gap (0.148 vs 0.124), not of the underlay gap.
+
+**Containment guidance / projection** (`+sampling.contain_guide=lam,contain_from=t0,contain_min=0.5`, commit
+787a134): at every sampler step past t0, each underlay is expanded by lam times the violation so that the one
+element already mostly inside it (largest intersection / element area, the metric's own candidate, at least
+contain_min inside) is strictly inside with a 1% margin. Best checkpoint (ep 689), test split:
+
+| sampler | FID | Occ | Rea | Und_l | Und_s | Ove |
+|---|---|---|---|---|---|---|
+| plain | **1.53** | 0.148 | 0.023 | 0.933 | 0.784 | 0.0097 |
+| lam 0.3 from t = 0.5 | 2.72 | 0.151 | 0.022 | 0.966 | 0.927 | 0.0100 |
+| lam 1.0 from t = 0.5 | 3.86 | 0.153 | 0.021 | 0.970 | 0.965 | 0.0103 |
+| lam 0.5 from t = 0.9 | 1.91 | 0.150 | 0.022 | 0.967 | 0.955 | 0.0097 |
+| lam 1.0 from t = 0.9 | 2.15 | 0.150 | 0.022 | 0.967 | 0.962 | 0.0098 |
+| **lam 1.0, final step only (a projection)** | **1.54** | 0.149 | 0.022 | 0.959 | **0.950** | 0.0097 |
+| (all overlapping elements instead of the best candidate, lam 0.3 from 0.5) | 57.6 | 0.185 | 0.013 | 0.994 | 0.990 | 0.0118 |
+
+A single projection at the last step lifts strict underlay from 0.78 to 0.95 with FID, occlusion and overlap
+unchanged; guiding earlier buys a little more Und_s at a real FID cost (the enlarged underlays drift off the size
+distribution). The naive version (contain everything the underlay touches) reaches 0.99 but destroys FID -- the
+0.99 numbers in the literature are cheap to reach if FID is not reported. We report the projection row, labelled.
+
+**Trained alternatives and the saliency-box token** (same recipe, 1000 epochs, best-by-val / last, test split):
+
+| run | FID | Occ | Rea | Und_l | Und_s | Ove | count |
+|---|---|---|---|---|---|---|---|
+| + containment hinge loss, weight 1.0 (`model.relation_loss_weight=1`, `...-geo-rel`, ep 389 / 999) | 5.61 / 5.87 | 0.154 / 0.153 | 0.020 / 0.021 | 0.983 / 0.988 | 0.931 / 0.943 | 0.0152 / 0.0132 | 1.56 / 1.53 |
+| + retrieval + containment loss (`...-geo-ret16-rel`, ep 469 / 999) | 4.88 / 5.31 | 0.149 / 0.151 | 0.020 | 0.986 / 0.988 | 0.945 / 0.946 | 0.0147 / 0.0130 | 1.59 / 1.56 |
+| + saliency-box token (LayoutDiT's threshold-25 largest-component box, `backbone_model.sal_token`, `...-geo-sal`, ep 639 / 999) | 2.33 / 2.62 | 0.158 / 0.155 | 0.023 | 0.938 / 0.945 | 0.808 / 0.825 | 0.0087 / **0.0063** | 1.47 / **1.43** |
+| retrieval run, last + projection | 1.99 | 0.152 | 0.021 | 0.969 | **0.962** | **0.0059** | 1.48 |
+| best recipe, last + projection | 1.72 | 0.147 | 0.022 | 0.958 | 0.949 | 0.0089 | 1.54 |
+
+The trained containment loss gets strict underlay to 0.93-0.95 natively but at weight 1.0 it distorts the layout
+distribution (FID 5-6, overlap up, slow convergence: val FID stalled at 5.0 from ep 389): the hinge on the
+predicted clean layout is active at every t and pulls underlays outward long before their content is decided. A
+smaller weight would trade this off, but the sampling-time projection already gives Und_s 0.95 at no FID cost,
+so we keep the projection and drop the loss. The saliency-box token does not help occlusion (0.158 vs 0.148; the
+box spans the full width for most posters and only locates the product vertically) and costs FID; it improves
+overlap and count slightly. Retrieval + projection is the best graphic-metric configuration (Und_s 0.962, Ove
+0.0059, count 1.48) at FID 1.99; the best recipe + projection is the best overall (FID 1.54, Und_s 0.950).
+
+**CGL summary for the paper** (test split, RALF's evaluator; FID against the real test layouts, floor 0.80):
+
+| | FID | Occ | Rea | Und_l | Und_s | Ove | count MAE |
+|---|---|---|---|---|---|---|---|
+| ours (cross + dropout + hflip + geo bias) | **1.53** | 0.148 | 0.023 | 0.933 | 0.784 | 0.0097 | 1.54 |
+| ours + containment projection | 1.54 | 0.149 | 0.022 | 0.959 | 0.950 | 0.0097 | 1.54 |
+| ours + retrieval + containment projection | 1.99 | 0.152 | 0.021 | 0.969 | 0.962 | 0.0059 | 1.48 |
+| RALF (released outputs) | 1.32 | 0.126 | 0.018 | 0.992 | 0.978 | 0.0042 | 1.08 |
+| LayoutDiT / LayoutGD (papers) | - | 0.124 / 0.120 | 0.016 / 0.014 | 0.995 / 0.999 | 0.988 / 0.994 | 0.0016 / 0.0004 | - |
+| real test layouts | 0.80 | 0.125 | 0.017 | 0.995 | 0.988 | 0.0003 | 0 |
+
+What remains behind is occlusion (0.15 vs 0.12-0.13) and overlap; neither the retrieved layouts, the saliency box
+nor the geometric bias moved occlusion, so it is most likely the image side (LayoutDiT/LayoutGD train a ViT on
+RGB + saliency at 384x256; we use 64 frozen DINOv2 tokens + one saliency token). The early ep-239 checkpoint of the
+same run scored FID 1.94 / Und_s 0.66, so the underlay metric is the one that needs the long training. What remains
+between us and RALF is the underlay/occlusion/count triple, i.e. how well the canvas is *used*, not the layout prior.
+
+
+### Edit Flows ablation on RICO (paper protocol)
+
+| Baseline | FID |
+|---|---|
+| Discrete Edit Flow, LayoutDM 32-bin tokens, 100 sampling steps (5 runs) | 13.25 +/- 0.43 |
+| same checkpoint, 1,000 sampling steps (the demo's default) | **6.43** |
+| Discrete Edit Flow, 128-bin tokens (RALF's resolution), 100 / 1,000 steps (5 runs) | 14.90 +/- 0.72 / 8.80 +/- 0.48 |
+| Continuous set Edit-Flow variant with our machinery (`insertion=editflow`, best-val ckpt ep 1899, 5 runs) | 2.53 +/- 0.11 |
+| Continuous set OneFlow-style variant with our machinery (`insertion=oneflow`, best-val ckpt ep 1274, 5 runs) | **2.29 +/- 0.14** |
+| LayoutDM (paper) / LayoutFlow (paper) / ours variable length | 4.43 / 2.37 / 2.55 +/- 0.08 |
+
+The CTMC Euler sampler needs many steps; the 1,000-step number is the fair one. The continuous Edit-Flow variant
+(per-element insert/delete rates instead of a global Poisson count, otherwise our backbone, GMM head and reveal
+schedule) matches our variable-length model within noise, so the gain over the discrete baseline comes from the
+continuous set formulation, not from the specific insertion mechanism. The OneFlow-style variant (same per-element
+rates, but an inserted box starts from pure noise on its own clock, `t_elem = (t - tau) / (1 - tau)`, instead of
+being revealed from the GMM head at insertion) is *better* than both, 2.29 vs 2.53 / 2.55 (noise ~0.1) -- so, as a
+finding rather than a baseline, per-element clocks are a design worth adopting (all three rows here are
+unconditional-only models; with the random5 mix the OneFlow-style model scores 2.53 vs 3.15, see the random5 table). 128-bin discrete
+tokens: finer bins make the discrete baseline *worse* (8.80 vs 6.43 at 1,000 steps), so 32 bins is its best setting.
+
+**OneFlow baseline** (`src/models/layout_oneflow.py`, commits 1272906 / 589c1d2; RICO, 2,000 epochs, best-by-val,
+uncond x 5 runs). A faithful port of Nguyen et al. 2025: a *sequence* of elements in dataset order, insertion-only
+Edit Flow with kappa_t = t, per-gap zero-inflated Poisson (pi by BCE, lambda_nonzero by Poisson NLL) and
+bag-of-tokens heads, each element's box a continuous latent born as N(0, I) at t_box = 0 on the interleaved time
+schedule (tau_text in [0, 2], tau_box = tau_text - kappa^{-1}(u)), unit-rate box clocks, Alg. 1-2 sampler (runs to
+t = 2). One layout-specific choice: every element is one mixed token (class + box latent) rather than a class token
+followed by a separate `<|box|>` token, which would only add malformed sequences.
+
+| variant | 50 steps (paper default) | 100 | 1,000 |
+|---|---|---|---|
+| as published: no time input to the insertion heads, unweighted loss (`rico-oneflow-baseline`) | 63.0 +/- 0.8 | 66.2 +/- 0.8 | 75.7 +/- 0.5 |
+| + t_text fed to the network, Edit Flows' original (`rico-oneflow-baseline-t`, `model.time_input=true`) | **3.31 +/- 0.17** | 3.38 +/- 0.09 | 5.31 +/- 0.18 |
+
+The published recipe collapses here: every sample saturates the 20-element cap. The insertion heads are calibrated
+on training states (predicted missing 6.6 vs true 6.6 at t = 0.3, 3.0 vs 2.8 at t = 0.7) but, seeing no time, keep
+a residual 0.47 expected missing at t = 1 where nothing is missing, and the hazard 1/(1-t) of the linear schedule
+amplifies that residual without bound in the last steps (more steps = worse). Feeding t lets the heads learn
+"nothing is missing at t = 1" exactly and turns 63 into 3.3 -- one FID point behind our per-element-clock model
+(2.29 / 2.35) and 0.8 behind our masked-reveal model (2.55); more sampling steps hurt it (5.31 at 1,000), the
+usual sign of a slightly mis-calibrated insertion rate integrated over a longer path. Ablation complete.
+
+## Crello: layout + text (in progress, 2026-09-20)
+
+Data: HF `cyberagent/crello` -> `scripts/prepare_crello.py` (18,414 / 1,754 / 1,869 templates with <= 20 elements, 5.5%
+dropped; 5 element types; boxes normalised by the canvas and clipped to it, 11% of elements bleed outside; text
+strings per element: 40% of elements are text, 4.2 per template, median 12 chars / 2 words, p90 44 / 7).
+`src.data.Crello`, `conf/dataset/Crello.yaml`. No pretrained FID network exists for Crello; layout runs select on
+val_loss.
+
+Model (`src/models/layout_flow_text.py`, `src/text_factor.py`, `conf/model/LayoutFlowText.yaml`): the per-element-clock
+layout model (RICO recipe) with a FlexMDM text factor on every text element -- the released Dream-Coder-7B FlexMDM
+(`yuyuanchen0/flexmdm`, insertion + unmasking masked diffusion, power schedules 1.7 / 2.89), LoRA r = 16 on q/k/v/o +
+its insertion head + a soft-prompt projection and a pooling head (~100M trainable), loaded through the authors'
+package in a separate venv (`$LAB/repos/venv-text`: py3.10, torch 2.8 cu128, transformers 4.46.2, peft). Each text
+element is a sequence [4 soft-prompt positions | <= 24 answer tokens]; the prompt is built from the element's hidden
+state and the layout's global token; the pooled embeddings of the current text tokens feed back into the element
+token; the text clock is the element's clock (empty at insertion, clean with the box). Sampling ports FlexMDM's
+Algorithm 1 (confidence top-k unmasking, Poisson insertion) to per-sequence step sizes, one text step per layout step.
+
+Runs (4 x A100 DDP, batch 64 / GPU, ~80 s / epoch): `crello-varlen-blind` (layout only, 1000 epochs, the
+initialisation), `crello-text-v1` (40 epochs from it; teacher-forced text CE on the test split 6.7 / 4.4 / 2.9 at
+clocks 0.3 / 0.6 / 0.9 vs 11.9 uniform, top-1 accuracy 0.10 / 0.30 / 0.54), `crello-text-v2` (200 epochs continuing
+v1, running). First samples (v1, temperature 0.1): "Join us for the / birthday / party!" in a 0.18 x 0.08 box,
+"Get connected / with us on / Facebook / and / Twitter" in 0.30 x 0.15, "Design / and / Development", "FREE / CLOSING",
+"IS / COMING!", "Free Day of Art", "$10", "2021"; failure modes: empty strings and runs of newlines (the insertion
+channel), the odd nonsense phrase, degenerate boxes from the young layout model. A precedence bug in the Gumbel
+noise (commit a378942) made every sampled token id 0 ("!") before this.
+
+Evaluation (`scripts/eval_crello.py`, test split): layout alignment / overlap / count MAE / class histogram, and for
+the text: empty fraction, chars and words, distinct-1/2, NLL per token under Qwen2.5-0.5B, and the text-length vs
+box-size relation (Pearson of chars with box width and area, lines with box height) -- the joint model's specific
+claim, which a layout-then-caption pipeline cannot produce. Numbers to follow when v2 finishes.
+
+**v1 numbers (40 epochs; test split, generated / real):** elements per layout 7.8 / 9.6, class histogram
+matched (0.46/0.40/0.10/0.03/0.01 vs 0.47/0.40/0.09/0.03/0.02), alignment x100 1.52 / 0.21, overlap 1.10 / 1.69;
+text: empty fraction 0.23 / 0.00, chars 11.8 / 19.0, words 2.5 / 3.2, distinct-1 0.10 / 0.26,
+distinct-2 0.33 / 0.59, Qwen2.5-0.5B NLL per token 4.20 / 4.15; text-length vs box-size:
+corr(chars, width) 0.06 / 0.21, corr(chars, area) 0.04 / 0.15, corr(lines, height) 0.00 / 0.34.
+The language side is at the data's fluency already; length, diversity and -- the point of the joint model -- the
+text-length / box-size relation are not learned at 40 epochs (correlations ~0). The session's job was lost while
+v2 trained (epoch 22 of 200); `crello-text-v3` continues from its checkpoint (3 GPUs, 180 epochs). For the run after
+that, the text -> layout feature now carries explicit length counts (tokens present, masks pending, newlines;
+commit above), the direct route to the size relation.
+
+**Correction (2026-09-20 16:00).** Runs v1-v3 never trained the text factor: `configure_optimizers` (base class) optimises
+`self.model` -- the layout backbone -- only, so the LoRA, the insertion head and the prompt / pool heads stayed at
+their initial values. v1's text quality (NLL 4.20) is therefore the *pretrained* FlexMDM prompted through the layout
+backbone's hidden states, and its improvement over training came from the layout backbone bending those states to
+serve the prompt -- which is what degraded the boxes in v3 (flow loss 0.27 -> 0.40). Fixes (commits 8d5a11a,
+86bb7e0, 79160b1): the text factor reads the layout through its own 2-layer encoder over the element states
+(trained by the text loss only; the shared backbone is trained by the layout losses only, and stays text-aware
+through the pooled text feature), and all trainable tensors are in the optimizer (LoRA / insertion head at lr 1e-4,
+the rest at the layout lr). `crello-text-v4` (joint) and `crello-caption-v1` (layout-then-caption baseline) relaunched
+with this, 220 epochs each, from the blind layout init.
+
+**The concurrent joint model cannot size its text (2026-09-20 23:30).** A sampling-free measurement: FlexMDM's insertion
+head predicts the expected number of missing tokens, so evaluated on an *empty* text whose prompt encodes the element,
+`exp(g)` is the model's predicted text length for that box. On 363 test text elements:
+
+| | predicted vs true length | corr with box width | corr with box area | corr with box height |
+|---|---|---|---|---|
+| joint, concurrent clocks (`crello-text-v4`, ep 145) | mean 6.1 vs 6.1, corr **-0.13** | 0.11 | 0.06 | -0.01 |
+| caption baseline (`crello-caption-v1`, ep 138) | mean 5.5 vs 6.1, corr **+0.37** | **0.27** | **0.17** | **0.13** |
+| real data | - | 0.15 | 0.17 | 0.11 |
+
+The caption model reproduces the data's box-size / text-length correlations almost exactly; the concurrent joint model
+does not learn the relation at all, though its average length is calibrated. Cause: under the power schedule
+(insertion exponent 1.7) half the insertions happen by clock 0.33, so the joint model commits to a length while its own
+box is still mostly noise -- the same mechanism behind the letter-stacking samples. It is structural, not a budget
+issue (the baseline reached +0.37 with the same budget). `crello-text-v4` was stopped at epoch 145 (checkpoint kept,
+resumable) and replaced by `crello-text-v5-lag` (`model.text_lag=0.5`: the text clock trails the box clock, so tokens
+commit only once the box has settled, while both still finish together and the text still feeds back into the layout).
+Note the concurrent arm's one win, which the lagged arm should keep: its layout loss improved over training
+(0.205 -> 0.190) while the caption baseline's stayed flat at 0.205, i.e. the text feature does help the boxes.
+
+**Caption baseline, trained (2026-09-21 04:07).** `crello-caption-v1`, 220 epochs, test split, generated / real:
+
+| | v1 (text factor frozen) | caption-v1 | real |
+|---|---|---|---|
+| empty strings | 0.233 | **0.013** | 0 |
+| chars / words per string | 11.8 / 2.5 | 17.6 / 4.2 | 19.0 / 3.2 |
+| corr(chars, box width) | 0.059 | **0.258** | 0.211 |
+| corr(chars, box area) | 0.039 | **0.166** | 0.155 |
+| corr(lines, box height) | 0.005 | **0.253** | 0.340 |
+| distinct-1 / distinct-2 | 0.102 / 0.335 | 0.109 / 0.317 | 0.262 / 0.589 |
+| Qwen2.5-0.5B NLL / token | 4.20 | 3.51 | 4.15 |
+| alignment x100 / overlap | 1.52 / 1.10 | 0.462 / 1.71 | 0.208 / 1.69 |
+| elements per layout | 7.8 | 10.6 | 9.6 |
+
+With the text factor actually optimised, the text fits its box: the length/width and length/area correlations reach the
+data's, and lines/height most of the way. Weaknesses: the copy is repetitive (distinct-1 0.11 vs 0.26, and an NLL
+*below* real text, the signature of generic phrasing) and the model over-generates elements (10.6 vs 9.6). This is the
+bar for the joint arms -- the concurrent one (v4) fails it structurally (length correlation -0.13, see above), and
+`crello-text-v5-lag` tests whether lagging the text clock recovers it.
+
+**Concurrent arm, full metrics (`crello-text-v4`, stopped at epoch 145).**
+
+| | concurrent (145 ep) | caption (220 ep) | real |
+|---|---|---|---|
+| elements per layout | **9.61** | 10.58 | 9.58 |
+| corr(chars, box width) | 0.041 | **0.258** | 0.211 |
+| corr(chars, box area) | 0.148 | 0.166 | 0.155 |
+| corr(lines, box height) | **0.648** | 0.253 | 0.340 |
+| empty strings | 0.026 | 0.013 | 0 |
+| chars per string | 12.7 | 17.6 | 19.0 |
+| distinct-1 / -2 | 0.040 / 0.118 | 0.109 / 0.317 | 0.262 / 0.589 |
+| NLL / token | 3.23 | 3.51 | 4.15 |
+
+More nuanced than the insertion-head probe alone suggested: the concurrent model gets the element count essentially
+exact (9.61 vs 9.58, where the caption baseline over-generates at 10.58) and ties lines to box height *more* strongly
+than the data (0.65 vs 0.34), but never learns the width relation (0.04 vs 0.21). That is exactly what the timing
+account predicts: the number of inserted tokens -- hence the line count -- is an early, coarse decision that the
+still-noisy box can inform, while chars-per-line depends on the precise width, which settles only late. Its copy is
+also the most repetitive of the three (distinct-1 0.04). Caveat: 145 epochs against the baseline's 220.
+
+**Content-aware Crello launched (2026-09-21 04:50).** `crello-canvas-text-v1`: plates -> DINOv2 (64, 384) per
+template, gated cross-attention + geometric bias + token dropout 0.5 / canvas dropout 0.1 + hflip (the CGL recipe),
+with the lagged text clock. 22,037 canvases, 71% real image plates and 29% flat colour.

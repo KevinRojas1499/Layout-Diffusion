@@ -1,0 +1,23 @@
+_target_: torch.utils.data.DataLoader
+
+# Crello design templates (scripts/prepare_crello.py). 5 element types -> ids 1..5, 0 = pad; max 20 elements;
+# text strings ride along in batch['text'] for the text factor.
+dataset:
+  _target_: src.data.Crello
+  data_path: ???      # dir with {train,validation,test}.pt
+  num_cat: 6
+  clip: true
+  feats_path: null    # content-aware: dir with {split}.pt DINOv2 plate features (scripts/precompute_crello_feats.py)
+  hflip: false
+
+batch_size: 512
+num_workers: 2
+pin_memory: True
+persistent_workers: True
+shuffle: True
+drop_last: False
+collate_fn:
+  _target_: src.data.collate_fn
+  _partial_: true
+  max_len: ${data.max_len}
+  format: ${data.format}

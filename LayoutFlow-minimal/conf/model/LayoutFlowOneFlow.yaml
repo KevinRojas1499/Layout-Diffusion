@@ -23,6 +23,10 @@ model:
     elem_rates: true
     cond_input: false       # true with cond=random4: feed the given/held mask to the network (needed by the insertion model)
     ctx_dim: 0              # content-aware: canvas feature dim (385 for scripts/precompute_canvas_feats.py), 0 = none
+    geo_bias: false         # LayoutGD-style pairwise geometric attention bias (a GAT with edge features)
+    ret_k: 0                # retrieval augmentation (RALF): number of retrieved training layouts joining the context (dataset.dataset.retrieval_k)
+    sal_token: false        # saliency bounding box token (LayoutDiT / LayoutGD; dataset.dataset.salbox=true)
+    ctx_mode: prepend       # content-aware: prepend canvas tokens to the set | cross: cross-attention to them
   sampler:
     _target_: src.sampler.GaussianSampler
     out_dim: 4
@@ -31,6 +35,7 @@ model:
   num_cat: ${dataset.dataset.num_cat}
   inference_steps: 100
   insertion: oneflow
+  clock: coupled          # coupled: s_i = (t - tau_i) / (1 - tau_i) | decoupled: s_i ~ U(0,1) independent of t (any sampling clock policy is then on-distribution)
   t_max: 0.5              # reveal schedule kappa(t) = min(t / t_max, 1); 1.0 is much worse (see README)
   unmask_geom: gmm        # gmm: sample the clean box from the mixture | mean: point estimate
   add_loss: geom_l1_loss
@@ -42,3 +47,10 @@ model:
   ralf_cache: null        # content-aware datasets: RALF cache dir -> validation FID with their FIDNetV3 (src/fid_ralf.py)
   fid_empty_id: null      # padding baseline: category id to drop before the FID
   cat_drop: 0.0           # > 0 trains the category-unconditional velocity too (for +sampling.cfg_w at test time)
+  ctx_token_drop: 0.0     # content-aware: hide this fraction of canvas tokens per sample during training
+  ctx_drop: 0.0           # content-aware: hide the whole canvas for this fraction of samples during training
+  ret_drop: 0.0           # retrieval: hide the whole retrieved set for this fraction of samples during training
+  relation_loss_weight: 0.0   # content-aware: hinge on strict (underlay contains text) for the data's pairs, on the predicted clean boxes
+  relation_text_id: 2
+  relation_underlay_id: 3
+  relation_margin: 0.01       # canvas units

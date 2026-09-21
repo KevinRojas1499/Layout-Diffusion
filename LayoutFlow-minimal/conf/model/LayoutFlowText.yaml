@@ -1,9 +1,29 @@
 # @package _global_
-# Edit-Flow-style variable-length baseline (Havasi et al. 2025 / OneFlow): per-element insertion rates,
-# and an inserted element arrives with its class and a box at the current noise level (no masked stage).
-# Same backbone, schedule and losses otherwise. See LayoutFlowVarLen.editflow_* in src/models/layout_flow_varlen.py.
+# Layout + text: per-element clocks (insertion=oneflow) with a FlexMDM text factor (Dream-Coder-7B, LoRA) on every
+# text element, coupled both ways each step. See src/models/layout_flow_text.py and src/text_factor.py.
 model:
-  _target_: src.models.layout_flow_varlen.LayoutFlowVarLen
+  _target_: src.models.layout_flow_text.LayoutFlowText
+  text_factor:
+    _target_: src.text_factor.TextFactor
+    ckpt: yuyuanchen0/flexmdm
+    d_layout: 512
+    n_prefix: 4
+    max_tokens: 24
+    lora_r: 16
+    lora_alpha: 32
+    temperature: 0.1          # FlexMDM's unmasking temperature (their published setting)
+    insertion_temperature: 1.0
+  text_id: 2                  # Crello: TextElement
+  text_loss_weight: 1.0
+  text_chunk: 512             # text sequences per LM forward
+  init_layout_ckpt: null      # layout-only checkpoint to start the layout backbone from
+  init_ckpt: null             # previous layout + text checkpoint to continue from
+  text_mode: joint            # joint (the model) | caption (layout-then-caption baseline: same LM, text after the layout, no coupling)
+  text_grad_to_layout: false  # true lets the text loss train the layout backbone through the prompt (degrades the boxes)
+  prompt_encoder: true        # the text factor reads the layout through its own 2-layer encoder (trained by the text loss only)
+  text_lr: 1e-4               # learning rate of the LM's LoRA and insertion head
+  text_sample_chunk: 96       # text sequences per LM forward while sampling
+  text_lag: 0.0               # >0: the text clock trails the box clock by this much (u_text = (u - a)/(1 - a)); 0 = concurrent
   optimizer:
     _partial_: true
     _target_: torch.optim.AdamW
@@ -34,7 +54,8 @@ model:
   fid_calc_every_n: ${trainer.check_val_every_n_epoch}
   num_cat: ${dataset.dataset.num_cat}
   inference_steps: 100
-  insertion: editflow
+  insertion: oneflow
+  clock: coupled          # coupled: s_i = (t - tau_i) / (1 - tau_i) | decoupled: s_i ~ U(0,1) independent of t (any sampling clock policy is then on-distribution)
   t_max: 0.5              # reveal schedule kappa(t) = min(t / t_max, 1); 1.0 is much worse (see README)
   unmask_geom: gmm        # gmm: sample the clean box from the mixture | mean: point estimate
   add_loss: geom_l1_loss

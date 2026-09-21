@@ -1,0 +1,23 @@
+# @package _global_
+# Edit Flows on LayoutDM-tokenized layouts: the strictly discrete variable-length baseline
+# (per-position insert / substitute / delete rates on a token sequence; empty source; 32-bin boxes).
+# See src/models/layout_editflow.py.
+model:
+  _target_: src.models.layout_editflow.LayoutEditFlow
+  optimizer:
+    _partial_: true
+    _target_: torch.optim.AdamW
+    lr: 0.0005
+  scheduler: reduce_on_plateau
+  pretrained_dir: ???
+  fid_calc_every_n: ${trainer.check_val_every_n_epoch}
+  num_cat: ${dataset.dataset.num_cat}
+  max_len: ${data.max_len}
+  num_bins: 32
+  inference_steps: 100
+  d_model: 512
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.1
+  ralf_cache: null

@@ -134,6 +134,12 @@ class BaseGenModel(pl.LightningModule):
         bbox = torch.cat(self.gen_data['bbox'])
         label = torch.cat(self.gen_data['label'])
         pad_mask = torch.cat(self.gen_data['pad_mask'])
+        if len(bbox) < 8:           # (almost) nothing generated, e.g. an untrained variable-length model: no metrics this round
+            self.fid_score = 1e3
+            self.log_dict({'FID_Layout': self.fid_score})
+            for key in self.gen_data:
+                self.gen_data[key] = []
+            return
 
         self.log_dict({'Alignment': compute_alignment(bbox.cpu(), pad_mask.cpu()) * 100})
         self.log_dict({'Overlap': compute_overlap(bbox.cpu(), pad_mask.cpu())})

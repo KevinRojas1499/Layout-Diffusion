@@ -27,7 +27,7 @@ class VarLenBackbone(nn.Module):
 
     def __init__(self, latent_dim=128, d_model=512, nhead=8, dim_feedforward=2048,
                  num_layers=4, dropout=0.1, num_cat=6, gmm_components=16, sigma_min=0.01, ctx_dim=0, ctx_len=64,
-                 cond_input=False, elem_rates=False):
+                 cond_input=False, elem_rates=False, ctx_mode='prepend', geo_bias=False, ret_k=0, sal_token=False):
         super().__init__()
         self.geom_dim = 4
         self.mask_id = num_cat
@@ -38,6 +38,12 @@ class VarLenBackbone(nn.Module):
         self.type_embed = nn.Embedding(num_cat + 1, latent_dim)      # num_cat = [MASK]
         self.elem_embed = nn.Linear(2 * latent_dim, d_model)
         self.global_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # LayoutGD-style edge features: the attention between two elements is biased by their relative geometry
+        # (offsets, size ratios, edge alignment, intersection, containment), computed from the current boxes
+        self.geo_bias, self.nhead = geo_bias, nhead
+        if geo_bias:
+            self.edge_mlp = nn.Sequential(nn.Linear(14, 64), nn.GELU(), nn.Linear(64, nhead))
+            nn.init.zeros_(self.edge_mlp[-1].weight); nn.init.zeros_(self.edge_mlp[-1].bias)    # starts as plain attention
         # conditional training (cond=random4): the network must see which elements / coordinates are given,
         # otherwise "all visible because given" and "all visible because insertion is done" are indistinguishable
         self.cond_input = cond_input
@@ -45,12 +51,21 @@ class VarLenBackbone(nn.Module):
             self.cond_embed = nn.Linear(5, d_model)
         # content-aware: canvas feature tokens (precomputed, frozen) prepended as always-visible context;
         # they carry a learned position embedding because, unlike the elements, the grid cells are ordered
-        self.ctx_dim = ctx_dim
+        self.ctx_dim, self.ctx_mode = ctx_dim, ctx_mode      # 'prepend': canvas tokens join the self-attention; 'cross': separate cross-attention
+        # retrieval augmentation (RALF): the elements of the K retrieved layouts, embedded like the layout's own
+        # elements plus a per-retrieved-layout slot embedding, join the context tokens
+        self.ret_k = ret_k
+        if ret_k:
+            self.ret_slot = nn.Embedding(ret_k, d_model)
+        # saliency bounding box token (LayoutDiT's sal_box MLP): one context token from the 4 box numbers
+        self.sal_token = sal_token
+        if sal_token:
+            self.sal_embed = nn.Sequential(nn.Linear(4, d_model), nn.SiLU(), nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model))
         if ctx_dim:
             self.ctx_embed = nn.Linear(ctx_dim, d_model)
             self.ctx_pos = nn.Parameter(torch.randn(1, ctx_len, d_model) * 0.02)
 
-        layer = Block(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
+        layer = Block(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, cross=bool(ctx_dim) and ctx_mode == 'cross')
         self.transformer = TransformerEncoder(layer, num_layers=num_layers, norm=nn.LayerNorm(d_model))
 
         self.geom_head = nn.Linear(d_model, self.geom_dim)
@@ -64,27 +79,82 @@ class VarLenBackbone(nn.Module):
         self.gmm_head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(),
                                       nn.Linear(d_model, self.K * (1 + 2 * self.geom_dim)))
 
+    def edge_features(self, geom: Tensor, visible: Tensor) -> Tensor:
+        '''geom (B,S,4) cx,cy,w,h in [-1,1] space, visible (B,S) -> (B,S,S,14) pairwise features (0 where either is not visible)'''
+        cx, cy, w, h = geom.unbind(-1)
+        l, r, tp, bt = cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+        d = lambda a: a.unsqueeze(2) - a.unsqueeze(1)                                     # (B,S,S): i minus j
+        eps = 1e-3
+        iw = (torch.minimum(r.unsqueeze(2), r.unsqueeze(1)) - torch.maximum(l.unsqueeze(2), l.unsqueeze(1))).clamp(min=0)
+        ih = (torch.minimum(bt.unsqueeze(2), bt.unsqueeze(1)) - torch.maximum(tp.unsqueeze(2), tp.unsqueeze(1))).clamp(min=0)
+        inter = iw * ih
+        area = (w.clamp(min=eps) * h.clamp(min=eps))
+        contain_ij = ((l.unsqueeze(2) <= l.unsqueeze(1)) & (r.unsqueeze(2) >= r.unsqueeze(1)) & (tp.unsqueeze(2) <= tp.unsqueeze(1)) & (bt.unsqueeze(2) >= bt.unsqueeze(1))).float()
+        f = torch.stack([d(cx), d(cy), torch.log(w.clamp(min=eps)).unsqueeze(2) - torch.log(w.clamp(min=eps)).unsqueeze(1),
+                         torch.log(h.clamp(min=eps)).unsqueeze(2) - torch.log(h.clamp(min=eps)).unsqueeze(1),
+                         d(l).abs(), d(r).abs(), d(tp).abs(), d(bt).abs(), d(cx).abs(), d(cy).abs(),
+                         inter / area.unsqueeze(1), inter / area.unsqueeze(2), contain_ij, contain_ij.transpose(1, 2)], -1)
+        both = (visible.unsqueeze(2) & visible.unsqueeze(1)).unsqueeze(-1)
+        return f * both
+
     def forward(self, geom: Tensor, cat: Tensor, exists: Tensor, t: Tensor, ctx: Tensor = None, cmask: Tensor = None,
-                t_elem: Tensor = None):
+                t_elem: Tensor = None, ctx_hide: Tensor = None, ret: Tensor = None, ret_hide: Tensor = None, sal: Tensor = None,
+                elem_extra: Tensor = None):
         '''
         geom (B,S,4), cat (B,S) long, exists (B,S) bool, t (B,), ctx (B,L,ctx_dim) canvas tokens or None,
         cmask (B,S,5) conditioning mask over [x,y,w,h,cat] (1 = free, 0 = given) or None
         t_elem (B,S) per-element clock (OneFlow-style baseline) or None: the global/canvas tokens then use t
+        ctx_hide (B,L) bool, canvas tokens to hide from attention (training-time canvas dropout) or None
+        ret (B,K,M,5) retrieved layouts (cx, cy, w, h in [0,1], label with 0 = pad) or None; ret_hide (B,) hide them all
         -> velocity (B,S,4), logits (B,S,num_cat), h (B,S,d_model), ins_rate (B,), extra {h_glob (B,d_model), elem_rate (B,S) or None}
         '''
         x = self.elem_embed(torch.cat([self.geom_embed(geom), self.type_embed(cat)], dim=-1))
+        if elem_extra is not None:                    # extra per-element features (e.g. the pooled text state), (B,S,d_model)
+            x = x + elem_extra
         if self.cond_input:
             given = torch.zeros(*cat.shape, 5, device=x.device) if cmask is None else 1 - cmask
             x = x + self.cond_embed(given)
         pre = [self.global_token.expand(x.shape[0], -1, -1)]
-        if self.ctx_dim:
-            pre.append(self.ctx_embed(ctx) + self.ctx_pos)
+        ctx_tok = self.ctx_embed(ctx) + self.ctx_pos if self.ctx_dim else None
+        if self.sal_token and sal is not None:
+            assert self.ctx_dim, 'the saliency-box token uses the context path: set ctx_dim > 0'
+            ctx_tok = torch.cat([ctx_tok, self.sal_embed(2 * sal - 1).unsqueeze(1)], 1)
+            if ctx_hide is not None:
+                ctx_hide = torch.cat([ctx_hide, torch.zeros(ctx_hide.shape[0], 1, dtype=torch.bool, device=x.device)], 1)
+        if self.ret_k and ret is not None:
+            assert self.ctx_dim, 'retrieval augmentation uses the context path: set ctx_dim > 0'
+            B_, K, M, _ = ret.shape
+            rgeom, rcat = 2 * ret[..., :4] - 1, ret[..., 4].long()                           # the layout's own box preprocessing
+            rtok = self.elem_embed(torch.cat([self.geom_embed(rgeom), self.type_embed(rcat)], -1)) + self.ret_slot.weight[:K].view(1, K, 1, -1)
+            rtok = rtok.reshape(B_, K * M, -1)
+            rpad = (rcat == 0).reshape(B_, K * M)
+            if ret_hide is not None:
+                rpad = rpad | ret_hide.view(-1, 1)
+            if ctx_hide is None:
+                ctx_hide = torch.zeros(B_, ctx_tok.shape[1], dtype=torch.bool, device=x.device)
+            ctx_tok, ctx_hide = torch.cat([ctx_tok, rtok], 1), torch.cat([ctx_hide, rpad], 1)
+        if self.ctx_dim and self.ctx_mode == 'prepend':
+            pre.append(ctx_tok)
         n_pre = sum(p.shape[1] for p in pre)
         x = torch.cat(pre + [x], dim=1)
         hidden = torch.cat([torch.zeros(x.shape[0], n_pre, dtype=torch.bool, device=x.device), ~exists], dim=1)
+        cross_ctx = cross_hide = None
+        if ctx_hide is not None and self.ctx_mode == 'prepend':
+            hidden[:, 1:1 + ctx_hide.shape[1]] = ctx_hide
+        if self.ctx_dim and self.ctx_mode == 'cross':
+            cross_ctx, cross_hide = ctx_tok, ctx_hide
+            if cross_hide is not None and cross_hide.all(1).any():        # a fully hidden canvas: keep one key so attention is defined
+                cross_hide = cross_hide.clone(); cross_hide[cross_hide.all(1), 0] = False
         if t_elem is not None:
             t = torch.cat([t.unsqueeze(1).expand(-1, n_pre), t_elem], dim=1)
-        h = self.transformer(x, timestep=t, key_padding_mask=hidden)
+        attn_bias = None
+        if self.geo_bias:
+            visible = exists & (cat != self.mask_id)
+            B, L = hidden.shape
+            bias = torch.zeros(B, L, L, self.nhead, device=x.device)
+            bias[:, n_pre:, n_pre:] = self.edge_mlp(self.edge_features(geom, visible))
+            attn_bias = bias.permute(0, 3, 1, 2).reshape(B * self.nhead, L, L)
+        h = self.transformer(x, timestep=t, key_padding_mask=hidden, ctx=cross_ctx, ctx_padding_mask=cross_hide, attn_bias=attn_bias)
         h_glob, h = h[:, 0], h[:, n_pre:]
         ins_rate = F.softplus(self.ins_head(h_glob)).squeeze(-1)
         extra = {'h_glob': h_glob, 'elem_rate': F.softplus(self.elem_ins_head(h)).squeeze(-1) if self.elem_rates else None}
