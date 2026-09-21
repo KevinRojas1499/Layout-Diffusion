@@ -678,3 +678,23 @@ resumable) and replaced by `crello-text-v5-lag` (`model.text_lag=0.5`: the text 
 commit only once the box has settled, while both still finish together and the text still feeds back into the layout).
 Note the concurrent arm's one win, which the lagged arm should keep: its layout loss improved over training
 (0.205 -> 0.190) while the caption baseline's stayed flat at 0.205, i.e. the text feature does help the boxes.
+
+**Caption baseline, trained (2026-09-21 04:07).** `crello-caption-v1`, 220 epochs, test split, generated / real:
+
+| | v1 (text factor frozen) | caption-v1 | real |
+|---|---|---|---|
+| empty strings | 0.233 | **0.013** | 0 |
+| chars / words per string | 11.8 / 2.5 | 17.6 / 4.2 | 19.0 / 3.2 |
+| corr(chars, box width) | 0.059 | **0.258** | 0.211 |
+| corr(chars, box area) | 0.039 | **0.166** | 0.155 |
+| corr(lines, box height) | 0.005 | **0.253** | 0.340 |
+| distinct-1 / distinct-2 | 0.102 / 0.335 | 0.109 / 0.317 | 0.262 / 0.589 |
+| Qwen2.5-0.5B NLL / token | 4.20 | 3.51 | 4.15 |
+| alignment x100 / overlap | 1.52 / 1.10 | 0.462 / 1.71 | 0.208 / 1.69 |
+| elements per layout | 7.8 | 10.6 | 9.6 |
+
+With the text factor actually optimised, the text fits its box: the length/width and length/area correlations reach the
+data's, and lines/height most of the way. Weaknesses: the copy is repetitive (distinct-1 0.11 vs 0.26, and an NLL
+*below* real text, the signature of generic phrasing) and the model over-generates elements (10.6 vs 9.6). This is the
+bar for the joint arms -- the concurrent one (v4) fails it structurally (length correlation -0.13, see above), and
+`crello-text-v5-lag` tests whether lagging the text clock recovers it.
