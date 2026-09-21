@@ -40,9 +40,14 @@ class PromptEncoder(nn.Module):
 
 class LayoutFlowText(LayoutFlowVarLen):
     def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None,
-                 text_mode='joint', text_grad_to_layout=False, prompt_encoder=True, text_lr=1e-4, **kwargs):
+                 text_mode='joint', text_grad_to_layout=False, prompt_encoder=True, text_lr=1e-4, text_lag=0.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.text_lr = text_lr                        # learning rate of the LM's LoRA / insertion head (the rest uses the layout lr)
+        # text_lag a: the text clock trails the element's box clock, u_text = clamp((u - a) / (1 - a), 0, 1), so tokens are
+        # committed only once the box has settled (our FlexMDM port inserts and unmasks but never substitutes, so an early
+        # commitment under a noisy layout is permanent). Both clocks still reach 1 together and the text still feeds back
+        # into the layout. a = 0 is the fully concurrent model.
+        self.text_lag = float(text_lag)
         # prompt_encoder: the text factor reads the layout through its own encoder (PromptEncoder) instead of the
         # shared backbone's hidden states
         d = text_factor.pool[-1].out_features if text_factor is not None else 512
@@ -94,6 +99,9 @@ class LayoutFlowText(LayoutFlowVarLen):
     def parameters(self, recurse=True):
         return (p for p in super().parameters(recurse) if p.requires_grad)
 
+    def _text_clock(self, clocks):
+        return clocks if self.text_lag <= 0 else ((clocks - self.text_lag) / (1 - self.text_lag)).clamp(0, 1)
+
     def _cond(self, h, h_glob, b, i):
         c = torch.cat([h[b, i], h_glob[b]], -1)
         # states from the prompt encoder are its own (trained by the text loss); states from the shared backbone are
@@ -121,7 +129,7 @@ class LayoutFlowText(LayoutFlowVarLen):
             t = torch.rand(len(b_idx), device=self.device).clamp(1e-4, 1 - 1e-4)
             xt, xt_attn, st, masked, gaps, ins_mask = tf.noisy(x1, attn, t)
             return None, dict(b=b_idx, i=i_idx, x1=x1, xt=xt, attn=xt_attn, st=st, masked=masked, gaps=gaps, ins_mask=ins_mask, t=t, batch=batch)
-        t = clocks[b_idx, i_idx].clamp(1e-4, 1 - 1e-4)
+        t = self._text_clock(clocks[b_idx, i_idx]).clamp(1e-4, 1 - 1e-4)
         xt, xt_attn, st, masked, gaps, ins_mask = tf.noisy(x1, attn, t)
         feat = torch.zeros(*visible.shape, tf.pool[-1].out_features, device=self.device)
         feat[b_idx, i_idx] = tf.pooled(xt, xt_attn).to(feat.dtype)
@@ -193,10 +201,14 @@ class LayoutFlowText(LayoutFlowVarLen):
         if not sel.any():
             return state
         b_idx, i_idx = torch.nonzero(sel, as_tuple=True)
+        t_all = self._text_clock(clocks)
+        if self.text_lag > 0 and not (t_all[sel] > 0).any():
+            return state                                    # the text has not started yet on any live element
         h, h_glob = self._prompt_states(x, y, visible, clocks, h, h_glob)
         cond = self._cond(h, h_glob, b_idx, i_idx)
-        t = clocks[b_idx, i_idx].clamp(0, 1 - 1e-4)
-        d = ds[b_idx, i_idx]
+        t = t_all[b_idx, i_idx].clamp(0, 1 - 1e-4)
+        d = ds[b_idx, i_idx] / (1 - self.text_lag) if self.text_lag > 0 else ds[b_idx, i_idx]
+        d = d * (t_all[b_idx, i_idx] > 0).float()           # no text steps before the lag
         xt, attn = tf.step(state['xt'][sel], state['attn'][sel], t, d, cond, last=last)
         state['xt'][sel] = xt; state['attn'][sel] = attn
         return state
