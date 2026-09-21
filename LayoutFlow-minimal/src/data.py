@@ -192,17 +192,28 @@ class Crello(Dataset):
     LABELS = ['SvgElement', 'TextElement', 'ImageElement', 'ColoredBackground', 'SvgMaskElement']
     TEXT_ID = 2
 
-    def __init__(self, split='train', data_path='./crello/layout', num_cat=6, in_memory=True, clip=True, max_len=20):
+    def __init__(self, split='train', data_path='./crello/layout', num_cat=6, in_memory=True, clip=True, max_len=20,
+                 feats_path=None, hflip=False, grid=8):
         super().__init__()
         self.num_cat = num_cat
         self.samples = []
-        for r in torch.load(f'{data_path}/{split}.pt'):
+        # content-aware: the canvas plate is element 0 of the template (scripts/prepare_crello_plates.py), so the
+        # layouts come from {split}_canvas.pt (plate removed) and the frozen DINOv2 features from feats_path
+        self.ctx = None
+        if feats_path:
+            f = torch.load(f'{feats_path}/{split}.pt')
+            self.ctx, order = f['feats'], {i: n for n, i in enumerate(f['id'])}
+        self.hflip, self.grid = hflip and split == 'train', grid
+        for r in torch.load(f'{data_path}/{split}_canvas.pt' if feats_path else f'{data_path}/{split}.pt'):
             box = r['bbox'].clone()
             if clip:
                 ltrb = torch.cat([box[:, :2] - box[:, 2:] / 2, box[:, :2] + box[:, 2:] / 2], 1).clamp(0, 1)
                 box = torch.cat([(ltrb[:, :2] + ltrb[:, 2:]) / 2, (ltrb[:, 2:] - ltrb[:, :2]).clamp(min=1e-3)], 1)
-            self.samples.append({'id': r['id'], 'type': r['type'], 'bbox': box, 'length': torch.tensor(len(r['type'])),
-                                 'text': r['text'], 'canvas': r['canvas']})
+            smp = {'id': r['id'], 'type': r['type'], 'bbox': box, 'length': torch.tensor(len(r['type'])),
+                   'text': r['text'], 'canvas': r['canvas']}
+            if self.ctx is not None:
+                smp['ctx_idx'] = order[r['id']]
+            self.samples.append(smp)
 
     def __len__(self):
         return len(self.samples)
@@ -211,5 +222,10 @@ class Crello(Dataset):
         s = dict(self.samples[index])
         s.pop('canvas')
         s['bbox'] = s['bbox'].clone()
+        if self.ctx is not None:
+            s['ctx'] = self.ctx[s.pop('ctx_idx')].float()
+            if self.hflip and torch.rand(()) < 0.5:
+                s['bbox'][:, 0] = 1 - s['bbox'][:, 0]                                # mirror centres
+                s['ctx'] = s['ctx'].view(self.grid, self.grid, -1).flip(1).reshape(self.grid * self.grid, -1)
         s['bbox'][:, :2] -= s['bbox'][:, 2:] / 2          # collate_fn builds xywh from an (x, y, w, h) corner box
         return s

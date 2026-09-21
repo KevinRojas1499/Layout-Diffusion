@@ -7,6 +7,8 @@ dataset:
   data_path: ???      # dir with {train,validation,test}.pt
   num_cat: 6
   clip: true
+  feats_path: null    # content-aware: dir with {split}.pt DINOv2 plate features (scripts/precompute_crello_feats.py)
+  hflip: false
 
 batch_size: 512
 num_workers: 2
