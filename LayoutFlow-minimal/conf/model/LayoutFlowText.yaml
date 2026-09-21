@@ -22,6 +22,7 @@ model:
   text_grad_to_layout: false  # true lets the text loss train the layout backbone through the prompt (degrades the boxes)
   prompt_encoder: true        # the text factor reads the layout through its own 2-layer encoder (trained by the text loss only)
   text_lr: 1e-4               # learning rate of the LM's LoRA and insertion head
+  text_sample_chunk: 96       # text sequences per LM forward while sampling
   text_lag: 0.0               # >0: the text clock trails the box clock by this much (u_text = (u - a)/(1 - a)); 0 = concurrent
   optimizer:
     _partial_: true

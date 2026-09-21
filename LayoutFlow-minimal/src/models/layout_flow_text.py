@@ -40,7 +40,8 @@ class PromptEncoder(nn.Module):
 
 class LayoutFlowText(LayoutFlowVarLen):
     def __init__(self, *args, text_factor=None, text_id=2, text_loss_weight=1.0, text_chunk=512, init_layout_ckpt=None, init_ckpt=None,
-                 text_mode='joint', text_grad_to_layout=False, prompt_encoder=True, text_lr=1e-4, text_lag=0.0, **kwargs):
+                 text_mode='joint', text_grad_to_layout=False, prompt_encoder=True, text_lr=1e-4, text_lag=0.0,
+                 text_sample_chunk=96, **kwargs):
         super().__init__(*args, **kwargs)
         self.text_lr = text_lr                        # learning rate of the LM's LoRA / insertion head (the rest uses the layout lr)
         # text_lag a: the text clock trails the element's box clock, u_text = clamp((u - a) / (1 - a), 0, 1), so tokens are
@@ -48,6 +49,8 @@ class LayoutFlowText(LayoutFlowVarLen):
         # commitment under a noisy layout is permanent). Both clocks still reach 1 together and the text still feeds back
         # into the layout. a = 0 is the fully concurrent model.
         self.text_lag = float(text_lag)
+        self.text_sample_chunk = text_sample_chunk    # text sequences per LM forward while sampling (the vocab-sized
+                                                      # logits are ~9 MB per sequence, so a whole batch does not fit)
         # prompt_encoder: the text factor reads the layout through its own encoder (PromptEncoder) instead of the
         # shared backbone's hidden states
         d = text_factor.pool[-1].out_features if text_factor is not None else 512
@@ -209,8 +212,12 @@ class LayoutFlowText(LayoutFlowVarLen):
         t = t_all[b_idx, i_idx].clamp(0, 1 - 1e-4)
         d = ds[b_idx, i_idx] / (1 - self.text_lag) if self.text_lag > 0 else ds[b_idx, i_idx]
         d = d * (t_all[b_idx, i_idx] > 0).float()           # no text steps before the lag
-        xt, attn = tf.step(state['xt'][sel], state['attn'][sel], t, d, cond, last=last)
-        state['xt'][sel] = xt; state['attn'][sel] = attn
+        xt_all, attn_all = state['xt'][sel], state['attn'][sel]
+        outs = []
+        for s0 in range(0, xt_all.shape[0], self.text_sample_chunk):
+            sl = slice(s0, s0 + self.text_sample_chunk)
+            outs.append(tf.step(xt_all[sl], attn_all[sl], t[sl], d[sl], cond[sl], last=last))
+        state['xt'][sel] = torch.cat([o[0] for o in outs]); state['attn'][sel] = torch.cat([o[1] for o in outs])
         return state
 
     def _text_infer_finish(self, state, exists, order, x=None, y=None, ctx=None, ret=None, sal=None):
@@ -224,11 +231,15 @@ class LayoutFlowText(LayoutFlowVarLen):
             if sel.any():
                 b_idx, i_idx = torch.nonzero(sel, as_tuple=True)
                 cond = self._cond(h, h_glob, b_idx, i_idx)
-                xt, attn = tf.empty_state(len(b_idx), self.device)
-                N = self.inference_steps; dt = torch.full((len(b_idx),), 1.0 / N, device=self.device)
-                for k in range(N):
-                    xt, attn = tf.step(xt, attn, torch.full((len(b_idx),), k / N, device=self.device), dt, cond, last=(k == N - 1))
-                xt_all[sel] = xt; attn_all[sel] = attn
+                N = self.inference_steps
+                parts = []
+                for s0 in range(0, len(b_idx), self.text_sample_chunk):
+                    sl = slice(s0, s0 + self.text_sample_chunk); m = min(self.text_sample_chunk, len(b_idx) - s0)
+                    xt, attn = tf.empty_state(m, self.device); dt = torch.full((m,), 1.0 / N, device=self.device)
+                    for k in range(N):
+                        xt, attn = tf.step(xt, attn, torch.full((m,), k / N, device=self.device), dt, cond[sl], last=(k == N - 1))
+                    parts.append((xt, attn))
+                xt_all[sel] = torch.cat([p[0] for p in parts]); attn_all[sel] = torch.cat([p[1] for p in parts])
             state = dict(xt=xt_all, attn=attn_all, alive=sel)
         xt = state['xt'].gather(1, order.unsqueeze(-1).expand_as(state['xt']))
         attn = state['attn'].gather(1, order.unsqueeze(-1).expand_as(state['attn']))
